@@ -1,0 +1,2938 @@
+pub mod profile_list;
+pub mod profile_modal;
+pub mod theme;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
+
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    input::{Input, InputEvent, InputState, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
+    *,
+};
+use gpui_kit::*;
+
+use crate::db::Database;
+use crate::launcher::{KernelInfo, RunningProcess, locate_chromium_kernel};
+use crate::models::{
+    BrowserBrand, BrowserExtension, PlatformType, Profile, ProfileStatus, ProxyConfig,
+    ProxyProtocol, SavedProxy,
+};
+use crate::proxy_tunnel::LocalProxyTunnel;
+use crate::ui::profile_list::{ColumnVisibility, render_profile_table};
+use crate::ui::profile_modal::{
+    ProfileModalState, ProxyEditMode, render_bulk_backup_view, render_edit_profile_view,
+    render_groups_subtab_view, render_popup_modal, render_proxies_view,
+};
+use crate::ui::theme::{BonTheme, SfSymbol};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceView {
+    Profiles,
+    Proxies,
+    EditProfile,
+    BulkBackup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSubTab {
+    Local,
+    Group,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePopupModal {
+    QuickAdd,
+    ColumnSettings,
+    AssignGroup,
+    AddGroup,
+    AddTag,
+    UpdateProxy,
+    UpdateProfiles,
+    AddProxy,
+    UploadExtension,
+    InputUrlExtension,
+    RemoveExtension,
+}
+pub struct BonLoginApp {
+    pub db: Arc<Mutex<Database>>,
+    pub profiles: Vec<Profile>,
+    pub saved_proxies: Vec<SavedProxy>,
+    pub saved_groups: Vec<String>,
+    pub saved_tags: Vec<String>,
+    pub extensions: Vec<BrowserExtension>,
+    pub ext_url_input: Entity<InputState>,
+    pub ext_file_input: Entity<InputState>,
+    pub pending_remove_ext_id: Option<String>,
+    pub downloading_ext: bool,
+    pub checked_proxy_ids: HashSet<String>,
+    pub checking_proxy_ids: HashSet<String>,
+    pub selected_proxy_group: String,
+    pub proxy_add_protocol: ProxyProtocol,
+    pub proxy_selected_tag: String,
+    pub proxy_raw_input: Entity<TextareaState>,
+    pub proxy_expire_input: Entity<InputState>,
+    pub statuses: HashMap<String, ProfileStatus>,
+    pub running_processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
+    pub tokio_handle: tokio::runtime::Handle,
+    pub proxy_check_sem: Arc<tokio::sync::Semaphore>,
+    pub kernel_info: Option<KernelInfo>,
+    pub installing_kernel: bool,
+    pub search_input: Entity<InputState>,
+    pub search_query: String,
+    pub selected_group: String,
+    pub selected_profile_id: Option<String>,
+    pub checked_profile_ids: HashSet<String>,
+    pub col_vis: ColumnVisibility,
+    pub profile_sub_tab: ProfileSubTab,
+    pub popup_modal: Option<ActivePopupModal>,
+    pub show_detail_drawer: bool,
+    pub batch_move_group_input: Entity<InputState>,
+    pub active_view: WorkspaceView,
+    pub modal: Option<ProfileModalState>,
+    pub batch_prefix_input: Entity<InputState>,
+    pub batch_selected_group: String,
+    pub batch_proxy_group: String,
+    pub batch_count_input: Entity<InputState>,
+    pub batch_os: PlatformType,
+    pub batch_brand: BrowserBrand,
+    pub banner_message: Option<String>,
+    banner_timer_for: Option<String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl BonLoginApp {
+    pub fn new(
+        db: Database,
+        tokio_handle: tokio::runtime::Handle,
+        running_processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let profiles = db.list_profiles().unwrap_or_default();
+        let saved_proxies = db.list_proxies().unwrap_or_default();
+        let saved_groups = db.list_groups().unwrap_or_else(|_| vec!["General".to_string()]);
+        let saved_tags = db.list_tags().unwrap_or_else(|_| vec!["General".to_string()]);
+        let extensions = db.list_extensions().unwrap_or_default();
+        for ext in extensions.iter().filter(|e| e.enabled) {
+            let _ = crate::launcher::ensure_extension_unpacked(ext);
+        }
+        let selected_profile_id = profiles.first().map(|p| p.id.clone());
+        let kernel_info = locate_chromium_kernel();
+
+        let search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("\u{1002ab}  Search..."));
+
+        let batch_prefix_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("e.g. Profile")
+                .default_value("Profile")
+        });
+
+        let batch_count_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("1–50")
+                .default_value("5")
+        });
+
+        let batch_move_group_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Enter new name...")
+        });
+
+        let proxy_raw_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(6)
+                .placeholder("One proxy per line (type:host:port:login:password:name)")
+        });
+
+        let proxy_expire_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("DD/MM/YYYY, YYYY-MM-DD, or days (e.g. 30)")
+                .default_value("30")
+        });
+
+        let ext_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Input URL")
+        });
+
+        let ext_file_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Path to .CRX or .ZIP file (or click Upload file to browse)")
+        });
+
+        let search_sub = cx.subscribe_in(&search_input, window, {
+            let search_input = search_input.clone();
+            move |this, _, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.search_query = search_input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            }
+        });
+
+        let monitor_procs = running_processes.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(800))
+                    .await;
+                let procs = monitor_procs.clone();
+                let exited = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut exited = Vec::new();
+                        if let Ok(mut map) = procs.lock() {
+                            map.retain(|id, proc| {
+                                if proc.is_alive() {
+                                    true
+                                } else {
+                                    proc.stop_gracefully();
+                                    exited.push(id.clone());
+                                    false
+                                }
+                            });
+                        }
+                        exited
+                    })
+                    .await;
+                let alive = this
+                    .update(cx, |app, cx| {
+                        if !exited.is_empty() {
+                            for id in &exited {
+                                app.statuses.insert(id.clone(), ProfileStatus::Stopped);
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        Self {
+            db: Arc::new(Mutex::new(db)),
+            profiles,
+            saved_proxies,
+            saved_groups,
+            saved_tags,
+            extensions,
+            ext_url_input,
+            ext_file_input,
+            pending_remove_ext_id: None,
+            downloading_ext: false,
+            checked_proxy_ids: HashSet::new(),
+            checking_proxy_ids: HashSet::new(),
+            selected_proxy_group: "All".to_string(),
+            proxy_add_protocol: ProxyProtocol::Http,
+            proxy_selected_tag: "General".to_string(),
+            proxy_raw_input,
+            proxy_expire_input,
+            statuses: HashMap::new(),
+            running_processes,
+            tokio_handle,
+            proxy_check_sem: Arc::new(tokio::sync::Semaphore::new(5)),
+            kernel_info,
+            installing_kernel: false,
+            search_input,
+            search_query: String::new(),
+            selected_group: "All".to_string(),
+            selected_profile_id,
+            checked_profile_ids: HashSet::new(),
+            col_vis: ColumnVisibility::default(),
+            profile_sub_tab: ProfileSubTab::Local,
+            popup_modal: None,
+            show_detail_drawer: true,
+            batch_move_group_input,
+            active_view: WorkspaceView::Profiles,
+            modal: None,
+            batch_prefix_input,
+            batch_selected_group: "General".to_string(),
+            batch_proxy_group: "None".to_string(),
+            batch_count_input,
+            batch_os: PlatformType::MacOS,
+            batch_brand: BrowserBrand::Chrome,
+            banner_message: None,
+            banner_timer_for: None,
+            _subscriptions: vec![search_sub],
+        }
+    }
+
+    pub fn reload_profiles(&mut self) {
+        if let Ok(db) = self.db.lock() {
+            if let Ok(list) = db.list_profiles() {
+                self.profiles = list;
+            }
+            if let Ok(plist) = db.list_proxies() {
+                let valid_ids: HashSet<String> = plist.iter().map(|p| p.id.clone()).collect();
+                self.checked_proxy_ids.retain(|id| valid_ids.contains(id));
+                self.saved_proxies = plist;
+            }
+            if let Ok(glist) = db.list_groups() {
+                self.saved_groups = glist;
+            }
+            if let Ok(tlist) = db.list_tags() {
+                self.saved_tags = tlist;
+            }
+            if let Ok(elist) = db.list_extensions() {
+                self.extensions = elist;
+            }
+        }
+    }
+
+    pub fn distinct_proxy_groups_with_counts(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = self
+            .saved_tags
+            .iter()
+            .map(|t| (t.clone(), 0))
+            .collect();
+        for sp in &self.saved_proxies {
+            let tag = sp.group_tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(entry) = out.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
+                entry.1 += 1;
+            } else {
+                out.push((tag.to_string(), 1));
+            }
+        }
+        out
+    }
+
+    pub fn filtered_saved_proxies(&self) -> Vec<SavedProxy> {
+        self.saved_proxies
+            .iter()
+            .filter(|sp| {
+                self.selected_proxy_group == "All"
+                    || sp.group_tag.eq_ignore_ascii_case(&self.selected_proxy_group)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn toggle_proxy_checked(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
+        if !self.checked_proxy_ids.remove(proxy_id) {
+            self.checked_proxy_ids.insert(proxy_id.to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_all_filtered_proxies_checked(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .filtered_saved_proxies()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        let all_checked = !ids.is_empty() && ids.iter().all(|id| self.checked_proxy_ids.contains(id));
+        if all_checked {
+            for id in ids {
+                self.checked_proxy_ids.remove(&id);
+            }
+        } else {
+            for id in ids {
+                self.checked_proxy_ids.insert(id);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn clear_checked_proxies(&mut self, cx: &mut Context<Self>) {
+        self.checked_proxy_ids.clear();
+        cx.notify();
+    }
+
+    pub fn copy_checked_saved_proxies(&mut self, cx: &mut Context<Self>) {
+        let lines: Vec<String> = self
+            .saved_proxies
+            .iter()
+            .filter(|sp| self.checked_proxy_ids.contains(&sp.id))
+            .map(|sp| sp.config.to_editable_string())
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let count = lines.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        self.banner_message = Some(format!("Copied {count} proxy(s) to clipboard"));
+        cx.notify();
+    }
+
+    pub fn delete_checked_saved_proxies(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.checked_proxy_ids.drain().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let count = ids.len();
+        if let Ok(db) = self.db.lock() {
+            for id in &ids {
+                let _ = db.delete_proxy(id);
+            }
+        }
+        self.reload_profiles();
+        self.banner_message = Some(format!("Deleted {count} proxy(s)"));
+        cx.notify();
+    }
+
+    pub fn extend_saved_proxy_days(&mut self, proxy_id: &str, days: i64, cx: &mut Context<Self>) {
+        let Some(mut sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
+            return;
+        };
+        let now = crate::models::unix_now();
+        sp.expired_at = if days <= 0 {
+            None
+        } else {
+            let base = sp.expired_at.unwrap_or(now).max(now);
+            Some(base + days * 86_400)
+        };
+        if let Ok(db) = self.db.lock() {
+            let _ = db.upsert_proxy(&sp);
+        }
+        self.reload_profiles();
+        self.banner_message = Some(if days <= 0 {
+            format!("Cleared expiration for '{}'", sp.name)
+        } else {
+            format!("Extended '{}' by +{days} days ({})", sp.name, sp.format_expired_at())
+        });
+        cx.notify();
+    }
+
+    pub fn extend_checked_saved_proxies_days(&mut self, days: i64, cx: &mut Context<Self>) {
+        let checked = self.checked_proxy_ids.clone();
+        if checked.is_empty() {
+            return;
+        }
+        let now = crate::models::unix_now();
+        let mut count = 0;
+        if let Ok(db) = self.db.lock() {
+            for sp in &self.saved_proxies {
+                if checked.contains(&sp.id) {
+                    let mut updated = sp.clone();
+                    let base = updated.expired_at.unwrap_or(now).max(now);
+                    updated.expired_at = Some(base + days * 86_400);
+                    let _ = db.upsert_proxy(&updated);
+                    count += 1;
+                }
+            }
+        }
+        self.reload_profiles();
+        self.banner_message = Some(format!("Extended {count} proxy(s) by +{days} days"));
+        cx.notify();
+    }
+
+    pub fn add_saved_proxies_from_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let group_tag = if self.proxy_selected_tag.trim().is_empty() {
+            "General".to_string()
+        } else {
+            self.proxy_selected_tag.trim().to_string()
+        };
+        let raw = self.proxy_raw_input.read(cx).value().to_string();
+        let tokens: Vec<&str> = raw
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            self.banner_message =
+                Some("Enter at least one proxy (e.g. http://192.168.1.1:3000:user:pass)".to_string());
+            cx.notify();
+            return;
+        }
+
+        let base_idx = self.saved_proxies.len() + 1;
+        let default_proto = self.proxy_add_protocol;
+        let expire_raw = self.proxy_expire_input.read(cx).value().to_string();
+        let parsed_expired_at = SavedProxy::parse_expiration_input(&expire_raw);
+        let mut added = Vec::new();
+        for (i, token) in tokens.into_iter().enumerate() {
+            match ProxyConfig::parse_with_optional_name(token, default_proto) {
+                Ok(Some((cfg, explicit_name))) => {
+                    let name = explicit_name
+                        .unwrap_or_else(|| format!("Proxy #{:02}", base_idx + i));
+                    let mut sp = SavedProxy::new(name, group_tag.clone(), cfg);
+                    sp.expired_at = parsed_expired_at;
+                    added.push(sp);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.banner_message = Some(format!("Invalid proxy '{token}': {e}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        if let Ok(db) = self.db.lock() {
+            for sp in &added {
+                let _ = db.upsert_proxy(sp);
+            }
+        }
+        let count = added.len();
+        self.proxy_raw_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(6)
+                .placeholder("One proxy per line (type:host:port:login:password:name)")
+        });
+        self.popup_modal = None;
+        self.reload_profiles();
+        self.selected_proxy_group = "All".to_string();
+        self.banner_message = Some(format!("Added {count} proxy(s) (Tag: #{group_tag})"));
+        cx.notify();
+    }
+
+    pub fn delete_saved_proxy(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
+        self.checked_proxy_ids.remove(proxy_id);
+        if let Ok(db) = self.db.lock() {
+            let _ = db.delete_proxy(proxy_id);
+        }
+        self.reload_profiles();
+        self.banner_message = Some("Deleted proxy".to_string());
+        cx.notify();
+    }
+
+
+    pub fn check_saved_proxy(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
+        let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
+            return;
+        };
+        let pid = sp.id.clone();
+        let proxy_name = sp.name.clone();
+        let cfg = sp.config.clone();
+        let cfg_for_profiles = cfg.clone();
+        self.checking_proxy_ids.insert(pid.clone());
+        self.banner_message = Some(format!("Checking proxy '{proxy_name}' ({})...", cfg.display_short()));
+        cx.notify();
+
+        let tokio_handle = self.tokio_handle.clone();
+        let sem = self.proxy_check_sem.clone();
+        let db = self.db.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res: anyhow::Result<crate::models::GeoInfo> = tokio_handle
+                .spawn(async move {
+                    // shortcut: cap concurrent GeoIP checks at 5 to avoid 429 rate-limits
+                    let _permit = sem.acquire_owned().await;
+                    let mut tunnel = LocalProxyTunnel::start(cfg).await?;
+                    let port = tunnel.local_port();
+                    let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+                    tunnel.stop();
+                    geo_res
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+
+            let _ = this.update(cx, |app, cx| {
+                app.checking_proxy_ids.remove(&pid);
+                match res {
+                    Ok(geo) => {
+                        if let Ok(db_guard) = db.lock() {
+                            let _ = db_guard.update_saved_proxy_check(&pid, Some(&geo), None);
+                            for prof in &app.profiles {
+                                if prof.proxy.as_ref().is_some_and(|p| {
+                                    p.host == cfg_for_profiles.host
+                                        && p.port == cfg_for_profiles.port
+                                        && p.protocol == cfg_for_profiles.protocol
+                                }) {
+                                    let _ = db_guard.update_resolved_geo(&prof.id, Some(&geo));
+                                }
+                            }
+                        }
+                        app.reload_profiles();
+                        app.banner_message =
+                            Some(format!("Proxy '{proxy_name}' OK: {}", geo.summary_badge()));
+                    }
+                    Err(e) => {
+                        let err_s = e.to_string();
+                        if let Ok(db_guard) = db.lock() {
+                            let _ = db_guard.update_saved_proxy_check(&pid, None, Some(&err_s));
+                        }
+                        app.reload_profiles();
+                        app.banner_message =
+                            Some(format!("Proxy '{proxy_name}' failed: {err_s}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn check_filtered_saved_proxies(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = if !self.checked_proxy_ids.is_empty() {
+            self.filtered_saved_proxies()
+                .into_iter()
+                .filter(|p| self.checked_proxy_ids.contains(&p.id))
+                .map(|p| p.id)
+                .collect()
+        } else {
+            self.filtered_saved_proxies()
+                .into_iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        for id in ids {
+            self.check_saved_proxy(&id, cx);
+        }
+    }
+
+    pub fn apply_saved_proxy_to_selected_profile(
+        &mut self,
+        proxy_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
+            return;
+        };
+        let Some(sel_id) = self.selected_profile_id.clone() else {
+            self.banner_message = Some("Select a profile first".to_string());
+            cx.notify();
+            return;
+        };
+        let Some(mut prof) = self.profiles.iter().find(|p| p.id == sel_id).cloned() else {
+            return;
+        };
+        prof.proxy = Some(sp.config.clone());
+        prof.resolved_geo = sp.resolved_geo.clone();
+        if let Ok(db) = self.db.lock() {
+            let _ = db.upsert_profile(&prof);
+        }
+        self.reload_profiles();
+        self.select_profile(&sel_id, window, cx);
+        self.banner_message = Some(format!(
+            "Assigned proxy '{}' (#{}) to profile '{}'",
+            sp.name, sp.group_tag, prof.name
+        ));
+        cx.notify();
+    }
+
+    pub fn assign_filtered_proxies_to_profiles(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pool = self.filtered_saved_proxies();
+        if pool.is_empty() {
+            return;
+        }
+        let target_profiles = self.filtered_profiles();
+        if target_profiles.is_empty() {
+            return;
+        }
+        if let Ok(db) = self.db.lock() {
+            for (idx, mut prof) in target_profiles.into_iter().enumerate() {
+                let chosen = &pool[idx % pool.len()];
+                prof.proxy = Some(chosen.config.clone());
+                prof.resolved_geo = chosen.resolved_geo.clone();
+                let _ = db.upsert_profile(&prof);
+            }
+        }
+        self.reload_profiles();
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        self.active_view = WorkspaceView::Profiles;
+        self.banner_message = Some(format!(
+            "Assigned '{}' proxy group round-robin across profiles",
+            self.selected_proxy_group
+        ));
+        cx.notify();
+    }
+
+    pub fn proxies_for_batch_group(&self) -> Vec<SavedProxy> {
+        if self.batch_proxy_group == "None" {
+            return Vec::new();
+        }
+        self.saved_proxies
+            .iter()
+            .filter(|sp| {
+                self.batch_proxy_group == "All"
+                    || sp.group_tag.eq_ignore_ascii_case(&self.batch_proxy_group)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn fill_modal_proxy_from_group(
+        &mut self,
+        group_name: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let chosen_sp = group_name.and_then(|grp| {
+            let candidates: Vec<&SavedProxy> = self
+                .saved_proxies
+                .iter()
+                .filter(|sp| sp.group_tag.eq_ignore_ascii_case(grp))
+                .collect();
+            if candidates.is_empty() {
+                None
+            } else {
+                let idx = (rand::random::<u32>() as usize) % candidates.len();
+                Some(candidates[idx].clone())
+            }
+        });
+        if let Some(m) = self.modal.as_mut() {
+            match chosen_sp {
+                Some(sp) => {
+                    m.proxy_mode = ProxyEditMode::SavedPool;
+                    m.selected_proxy = Some(sp.config.clone());
+                    m.resolved_geo = sp.resolved_geo;
+                    m.proxy_check_error = None;
+                    self.banner_message = Some(format!(
+                        "Picked proxy '{}' from group '#{}'",
+                        sp.name, sp.group_tag
+                    ));
+                }
+                None => {
+                    m.selected_proxy = None;
+                    m.resolved_geo = None;
+                    m.proxy_check_error = None;
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn set_modal_proxy_mode(
+        &mut self,
+        mode: ProxyEditMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(m) = self.modal.as_mut() {
+            m.proxy_mode = mode;
+            m.proxy_check_error = None;
+            if mode == ProxyEditMode::Direct {
+                m.selected_proxy = None;
+                m.resolved_geo = None;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn select_saved_proxy_for_modal(
+        &mut self,
+        proxy_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
+            return;
+        };
+        if let Some(m) = self.modal.as_mut() {
+            m.proxy_mode = ProxyEditMode::SavedPool;
+            m.selected_proxy = Some(sp.config);
+            m.resolved_geo = sp.resolved_geo;
+            m.proxy_check_error = None;
+            self.banner_message = Some(format!("Selected proxy '{}' (#{})", sp.name, sp.group_tag));
+            cx.notify();
+        }
+    }
+
+    pub fn set_modal_region_preset(
+        &mut self,
+        tz: &str,
+        loc: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(m) = self.modal.as_mut() {
+            let tz_s = tz.to_string();
+            let loc_s = loc.to_string();
+            m.custom_tz_input = cx.new(|cx| InputState::new(window, cx).default_value(tz_s));
+            m.custom_locale_input = cx.new(|cx| InputState::new(window, cx).default_value(loc_s));
+            cx.notify();
+        }
+    }
+
+    pub fn check_modal_proxy(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.modal.as_mut() else {
+            return;
+        };
+        let Some(cfg) = m.selected_proxy.clone() else {
+            m.proxy_check_error =
+                Some("Select a proxy from Proxy manager before checking".to_string());
+            cx.notify();
+            return;
+        };
+        m.checking_proxy = true;
+        m.proxy_check_error = None;
+        cx.notify();
+
+        let tokio_handle = self.tokio_handle.clone();
+        let sem = self.proxy_check_sem.clone();
+        let db = self.db.clone();
+        let cfg_for_db = cfg.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res: anyhow::Result<crate::models::GeoInfo> = tokio_handle
+                .spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    let mut tunnel = LocalProxyTunnel::start(cfg).await?;
+                    let port = tunnel.local_port();
+                    let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+                    tunnel.stop();
+                    geo_res
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+
+            let _ = this.update(cx, |app, cx| {
+                if let Some(m) = app.modal.as_mut() {
+                    m.checking_proxy = false;
+                    match res {
+                        Ok(geo) => {
+                            m.resolved_geo = Some(geo.clone());
+                            m.proxy_check_error = None;
+                            if let Some(sp) = app.saved_proxies.iter().find(|s| {
+                                s.config.protocol == cfg_for_db.protocol
+                                    && s.config.host == cfg_for_db.host
+                                    && s.config.port == cfg_for_db.port
+                            }) && let Ok(db_guard) = db.lock()
+                            {
+                                let _ =
+                                    db_guard.update_saved_proxy_check(&sp.id, Some(&geo), None);
+                            }
+                            app.reload_profiles();
+                            app.banner_message =
+                                Some(format!("Proxy OK: {}", geo.summary_badge()));
+                        }
+                        Err(e) => {
+                            m.resolved_geo = None;
+                            m.proxy_check_error = Some(e.to_string());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn select_profile(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_profile_id = Some(profile_id.to_string());
+        if self.active_view == WorkspaceView::EditProfile
+            && let Some(p) = self.profiles.iter().find(|p| p.id == profile_id).cloned()
+        {
+            self.modal = Some(ProfileModalState::from_profile(&p, true, window, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn open_edit_view(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_view = WorkspaceView::EditProfile;
+        self.select_profile(profile_id, window, cx);
+    }
+
+    pub fn randomize_profile_seed(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut p) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        p.seed = rand::random::<u32>().max(1000);
+        p.os_version = p.os_platform.os_version_for_seed(p.seed).to_string();
+        p.brand_version = p.brand.version_for_seed(p.seed).to_string();
+        p.hardware_concurrency = p.os_platform.optimal_cores_for_seed(p.seed);
+        p.gpu_spoofing = crate::models::GpuSpoofMode::SeedGenerated;
+        if let Ok(db) = self.db.lock() {
+            let _ = db.upsert_profile(&p);
+        }
+        self.reload_profiles();
+        self.select_profile(profile_id, window, cx);
+        self.banner_message = Some(format!("Reseeded '{}' -> #{}", p.name, p.seed));
+        cx.notify();
+    }
+
+    pub fn generate_batch_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prefix = {
+            let s = self.batch_prefix_input.read(cx).value().trim().to_string();
+            if s.is_empty() {
+                "Account".to_string()
+            } else {
+                s
+            }
+        };
+        let group = if self.batch_selected_group.trim().is_empty() {
+            "General".to_string()
+        } else {
+            self.batch_selected_group.trim().to_string()
+        };
+        let pool = self.proxies_for_batch_group();
+        let requested_count = self
+            .batch_count_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(5)
+            .clamp(1, 50);
+
+        let mut created = Vec::new();
+        let base_idx = self.profiles.len() + 1;
+
+        for i in 0..requested_count {
+            let mut p =
+                Profile::new_default(format!("{prefix}-{:02}", base_idx + i), self.batch_os);
+            p.brand = self.batch_brand;
+            p.brand_version = self.batch_brand.version_for_seed(p.seed).to_string();
+            p.os_version = self.batch_os.os_version_for_seed(p.seed).to_string();
+            p.group_tag = group.clone();
+            if !pool.is_empty() {
+                let chosen = &pool[i % pool.len()];
+                p.proxy = Some(chosen.config.clone());
+                p.resolved_geo = chosen.resolved_geo.clone();
+            }
+            created.push(p);
+        }
+
+        if let Ok(db) = self.db.lock() {
+            for p in &created {
+                let _ = db.upsert_profile(p);
+            }
+        }
+        let count = created.len();
+        let last_id = created.last().map(|p| p.id.clone());
+        self.reload_profiles();
+        if let Some(id) = last_id {
+            self.select_profile(&id, window, cx);
+        }
+        self.active_view = WorkspaceView::Profiles;
+        self.banner_message = Some(format!("Created {count} profiles in folder '{group}'"));
+        cx.notify();
+    }
+
+    pub fn export_all_profiles_backup(&mut self, cx: &mut Context<Self>) {
+        if let Ok(db) = self.db.lock() {
+            match db.export_profiles_json() {
+                Ok((path, json)) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(json));
+                    self.banner_message = Some(format!(
+                        "Exported all profiles JSON to clipboard & {}",
+                        path.display()
+                    ));
+                }
+                Err(e) => {
+                    self.banner_message = Some(format!("Export failed: {e}"));
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_extension(&mut self, ext_id: &str, cx: &mut Context<Self>) {
+        let Some(ext) = self.extensions.iter().find(|e| e.id == ext_id).cloned() else {
+            return;
+        };
+        let next_enabled = !ext.enabled;
+        if let Ok(db) = self.db.lock() {
+            let _ = db.set_extension_enabled(ext_id, next_enabled);
+        }
+        self.reload_profiles();
+
+        if next_enabled {
+            let ext_dir = crate::launcher::ensure_extension_unpacked(&ext).ok();
+            let is_placeholder = ext_dir.as_ref().is_none_or(|d| {
+                std::fs::read_to_string(d.join("content.js"))
+                    .is_ok_and(|c| c.contains("BonLogin Managed Extension"))
+            });
+            let src_trimmed = ext.source_url.trim();
+            let is_remote = BrowserExtension::extract_chrome_store_id(src_trimmed).is_some()
+                || src_trimmed.starts_with("http://")
+                || src_trimmed.starts_with("https://");
+            if is_placeholder && is_remote {
+                let store_url = src_trimmed.to_string();
+                let eid = ext.id.clone();
+                let ename = ext.name.clone();
+                let tokio_handle = self.tokio_handle.clone();
+                cx.spawn(async move |this, cx| {
+                    let res = tokio_handle
+                        .spawn(async move {
+                            let downloaded =
+                                crate::launcher::download_extension_from_url(&store_url).await?;
+                            if downloaded.id != eid {
+                                let src = crate::launcher::app_support_dir()
+                                    .join("extensions")
+                                    .join(&downloaded.id);
+                                let dst = crate::launcher::app_support_dir()
+                                    .join("extensions")
+                                    .join(&eid);
+                                if src.exists() && src != dst {
+                                    let _ = std::fs::remove_dir_all(&dst);
+                                    let _ = std::fs::rename(&src, &dst);
+                                }
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await;
+                    if let Ok(Ok(())) = res {
+                        let _ = this.update(cx, |app, cx| {
+                            app.banner_message =
+                                Some(format!("Activated & synced extension: {ename}"));
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            self.banner_message = Some(format!("Enabled extension: {}", ext.name));
+        } else {
+            self.banner_message = Some(format!("Disabled extension: {}", ext.name));
+        }
+        cx.notify();
+    }
+
+    pub fn pick_extension_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tokio_handle = self.tokio_handle.clone();
+        let input_entity = self.ext_file_input.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let chosen = tokio_handle
+                .spawn_blocking(|| {
+                    let out = std::process::Command::new("osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose file with prompt \"Choose Extension File (.CRX or .ZIP)\")",
+                        ])
+                        .output()
+                        .ok()?;
+                    if !out.status.success() {
+                        return None;
+                    }
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    (!s.is_empty()).then_some(s)
+                })
+                .await
+                .ok()
+                .flatten();
+
+            if let Some(path_str) = chosen {
+                let _ = this.update_in(cx, |app, window, cx| {
+                    let _ = input_entity;
+                    app.ext_file_input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .placeholder("Path to .CRX or .ZIP file")
+                            .default_value(path_str)
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn upload_extension_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw_path = self.ext_file_input.read(cx).value().trim().to_string();
+        let tokio_handle = self.tokio_handle.clone();
+        let db_arc = self.db.clone();
+        self.banner_message = Some("Installing extension...".to_string());
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || {
+                    let path_str = if raw_path.is_empty() {
+                        let out = std::process::Command::new("osascript")
+                            .args([
+                                "-e",
+                                "POSIX path of (choose file with prompt \"Choose Extension File (.CRX or .ZIP)\")",
+                            ])
+                            .output()?;
+                        if !out.status.success() {
+                            anyhow::bail!("Canceled file selection");
+                        }
+                        String::from_utf8_lossy(&out.stdout).trim().to_string()
+                    } else {
+                        raw_path
+                    };
+                    if path_str.is_empty() {
+                        anyhow::bail!("No extension file selected");
+                    }
+                    crate::launcher::install_extension_from_file(std::path::Path::new(&path_str))
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Upload task error: {e}")));
+
+            let _ = this.update_in(cx, |app, window, cx| {
+                match res {
+                    Ok(ext) => {
+                        let ext_name = ext.name.clone();
+                        if let Ok(db) = db_arc.lock() {
+                            let _ = db.upsert_extension(&ext);
+                        }
+                        app.reload_profiles();
+                        app.ext_file_input = cx.new(|cx| {
+                            InputState::new(window, cx).placeholder("Path to .CRX or .ZIP file")
+                        });
+                        app.popup_modal = None;
+                        app.banner_message = Some(format!("Uploaded extension: {ext_name}"));
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("Canceled") {
+                            app.banner_message = None;
+                        } else {
+                            app.banner_message = Some(format!("Upload Extension failed: {msg}"));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn download_extension_from_url_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.ext_url_input.read(cx).value().trim().to_string();
+        if url.is_empty() {
+            self.banner_message = Some("Please paste a Chrome Web Store or .CRX/.ZIP URL".to_string());
+            cx.notify();
+            return;
+        }
+        if self.downloading_ext {
+            return;
+        }
+        self.downloading_ext = true;
+        self.banner_message = Some("Downloading extension...".to_string());
+        cx.notify();
+
+        let db_arc = self.db.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        self.ext_url_input = cx.new(|cx| InputState::new(window, cx).placeholder("Input URL"));
+
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn(async move { crate::launcher::download_extension_from_url(&url).await })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.downloading_ext = false;
+                match res {
+                    Ok(Ok(ext)) => {
+                        let ext_name = ext.name.clone();
+                        if let Ok(db) = db_arc.lock() {
+                            let _ = db.upsert_extension(&ext);
+                        }
+                        app.reload_profiles();
+                        app.popup_modal = None;
+                        app.banner_message = Some(format!("Downloaded extension: {ext_name}"));
+                    }
+                    Ok(Err(e)) => {
+                        app.banner_message = Some(format!("Download Extension error: {e}"));
+                    }
+                    Err(e) => {
+                        app.banner_message = Some(format!("Download task error: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn confirm_remove_extension(&mut self, cx: &mut Context<Self>) {
+        let Some(ext_id) = self.pending_remove_ext_id.take() else {
+            self.popup_modal = None;
+            cx.notify();
+            return;
+        };
+        let ext_name = self
+            .extensions
+            .iter()
+            .find(|e| e.id == ext_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| ext_id.clone());
+        let removed = self
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| db.delete_extension(&ext_id).ok())
+            .unwrap_or(false);
+        if removed {
+            crate::launcher::remove_extension_files(&ext_id);
+            self.reload_profiles();
+            self.banner_message = Some(format!("Removed extension: {ext_name}"));
+        } else {
+            self.banner_message = Some("Default extensions cannot be deleted".to_string());
+        }
+        self.popup_modal = None;
+        cx.notify();
+    }
+
+    pub fn filtered_profiles(&self) -> Vec<Profile> {
+        let group_opt = (self.selected_group != "All").then_some(self.selected_group.as_str());
+        self.profiles
+            .iter()
+            .filter(|p| p.matches_filter(&self.search_query, group_opt))
+            .cloned()
+            .collect()
+    }
+
+    pub fn distinct_groups_with_counts(&self) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = self
+            .saved_groups
+            .iter()
+            .map(|g| (g.clone(), 0))
+            .collect();
+        for p in &self.profiles {
+            let tag = p.group_tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(entry) = out.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
+                entry.1 += 1;
+            } else {
+                out.push((tag.to_string(), 1));
+            }
+        }
+        out
+    }
+
+    pub fn open_create_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let default_name = format!("Profile-{:02}", self.profiles.len() + 1);
+        let template = Profile::new_default(default_name, PlatformType::MacOS);
+        self.modal = Some(ProfileModalState::from_profile(&template, false, window, cx));
+        self.active_view = WorkspaceView::EditProfile;
+        cx.notify();
+    }
+
+    pub fn save_modal_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(modal) = self.modal.as_ref() else {
+            return;
+        };
+        let cookies_raw = modal.cookies_input.read(cx).value().to_string();
+        match modal.build_profile(cx) {
+            Ok(profile) => {
+                if let Ok(db) = self.db.lock()
+                    && let Err(e) = db.upsert_profile(&profile)
+                {
+                    if let Some(m) = self.modal.as_mut() {
+                        m.validation_error = Some(format!("DB error: {e}"));
+                    }
+                    cx.notify();
+                    return;
+                }
+                let _ = crate::launcher::save_prelaunch_cookies(&profile.short_id(), &cookies_raw);
+                let saved_id = profile.id.clone();
+                let saved_name = profile.name.clone();
+                self.reload_profiles();
+                self.select_profile(&saved_id, window, cx);
+                self.active_view = WorkspaceView::Profiles;
+                self.banner_message = Some(format!("Saved profile '{saved_name}'"));
+                cx.notify();
+            }
+            Err(e) => {
+                if let Some(m) = self.modal.as_mut() {
+                    m.validation_error = Some(e.to_string());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn clone_profile(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(orig) = self.profiles.iter().find(|p| p.id == profile_id) else {
+            return;
+        };
+        let cloned = orig.cloned_with_new_seed();
+        let new_id = cloned.id.clone();
+        if let Ok(db) = self.db.lock() {
+            let _ = db.upsert_profile(&cloned);
+        }
+        self.reload_profiles();
+        self.select_profile(&new_id, window, cx);
+        self.banner_message = Some(format!(
+            "Cloned '{}' -> seed #{}",
+            cloned.name, cloned.seed
+        ));
+        cx.notify();
+    }
+
+
+    pub fn delete_profile(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(db) = self.db.lock() {
+            let _ = db.delete_profile(profile_id);
+        }
+        let _ = crate::launcher::wipe_profile_data(profile_id);
+        self.statuses.remove(profile_id);
+        self.checked_profile_ids.remove(profile_id);
+        self.reload_profiles();
+        if let Some(first) = self.profiles.first().map(|p| p.id.clone()) {
+            self.select_profile(&first, window, cx);
+        } else {
+            self.selected_profile_id = None;
+            self.modal = None;
+        }
+        self.banner_message = Some("Profile deleted".to_string());
+        cx.notify();
+    }
+
+
+    pub fn toggle_check_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        if !self.checked_profile_ids.remove(profile_id) {
+            self.checked_profile_ids.insert(profile_id.to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_check_all_filtered(&mut self, cx: &mut Context<Self>) {
+        let filtered_ids: Vec<String> = self
+            .filtered_profiles()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        if filtered_ids.is_empty() {
+            return;
+        }
+        let all_checked = filtered_ids
+            .iter()
+            .all(|id| self.checked_profile_ids.contains(id));
+        if all_checked {
+            for id in filtered_ids {
+                self.checked_profile_ids.remove(&id);
+            }
+        } else {
+            for id in filtered_ids {
+                self.checked_profile_ids.insert(id);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn clear_checked_profiles(&mut self, cx: &mut Context<Self>) {
+        self.checked_profile_ids.clear();
+        cx.notify();
+    }
+
+    pub fn launch_checked_profiles(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .filter(|p| !matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_))))
+            .map(|p| p.id.clone())
+            .collect();
+        for id in ids {
+            self.launch_profile(&id, cx);
+        }
+    }
+
+    pub fn stop_checked_profiles(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .checked_profile_ids
+            .iter()
+            .filter(|id| matches!(self.statuses.get(*id), Some(ProfileStatus::Running(_))))
+            .cloned()
+            .collect();
+        for id in ids {
+            self.stop_profile(&id, cx);
+        }
+    }
+
+    pub fn check_proxies_for_checked(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.checked_profile_ids.iter().cloned().collect();
+        for id in ids {
+            self.check_profile_proxy(&id, cx);
+        }
+    }
+
+    pub fn move_checked_profiles_from_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_group = if self.batch_selected_group.trim().is_empty() {
+            "General".to_string()
+        } else {
+            self.batch_selected_group.trim().to_string()
+        };
+        let mut moved = 0usize;
+        if let Ok(db) = self.db.lock() {
+            for mut prof in self
+                .profiles
+                .iter()
+                .filter(|p| self.checked_profile_ids.contains(&p.id))
+                .cloned()
+            {
+                prof.group_tag = target_group.clone();
+                if db.upsert_profile(&prof).is_ok() {
+                    moved += 1;
+                }
+            }
+        }
+        self.reload_profiles();
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        self.banner_message = Some(format!("Moved {moved} profile(s) to folder '{target_group}'"));
+        cx.notify();
+    }
+
+    pub fn copy_checked_ids_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let rows: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .map(|p| {
+                let proxy_str = p
+                    .proxy
+                    .as_ref()
+                    .map(|px| px.display_short())
+                    .unwrap_or_else(|| "direct".to_string());
+                format!("{}\t{}\t{}\t{}", p.id, p.name, p.group_tag, proxy_str)
+            })
+            .collect();
+        let count = rows.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(rows.join("\n")));
+        self.banner_message = Some(format!(
+            "Copied {count} profile row(s) (ID, Name, Folder, Proxy) to clipboard"
+        ));
+        cx.notify();
+    }
+
+    pub fn copy_checked_names_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let names: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .map(|p| p.name.clone())
+            .collect();
+        let count = names.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(names.join("\n")));
+        self.banner_message = Some(format!("Copied {count} profile name(s) to clipboard"));
+        cx.notify();
+    }
+
+    pub fn batch_update_checked_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets: Vec<Profile> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            self.banner_message = Some("Check at least 1 profile first".to_string());
+            cx.notify();
+            return;
+        }
+        let prefix = self.batch_prefix_input.read(cx).value().trim().to_string();
+        let group = self.batch_selected_group.trim().to_string();
+        let pool = self.proxies_for_batch_group();
+        let target_os = self.batch_os;
+        let target_brand = self.batch_brand;
+        let mut updated = 0usize;
+
+        if let Ok(db) = self.db.lock() {
+            for (idx, mut prof) in targets.into_iter().enumerate() {
+                prof.seed = rand::random::<u32>().max(1000);
+                prof.os_platform = target_os;
+                prof.os_version = target_os.os_version_for_seed(prof.seed).to_string();
+                prof.brand = target_brand;
+                prof.brand_version = target_brand.version_for_seed(prof.seed).to_string();
+                prof.gpu_spoofing = crate::models::GpuSpoofMode::SeedGenerated;
+                prof.hardware_concurrency = target_os.optimal_cores_for_seed(prof.seed);
+                prof.window_size = target_os.default_window_size().to_string();
+                if !prefix.is_empty() && prefix != "Profile" {
+                    prof.name = format!("{prefix}-{:02}", idx + 1);
+                }
+                if !group.is_empty() {
+                    prof.group_tag = group.clone();
+                }
+                if !pool.is_empty() {
+                    let chosen = &pool[idx % pool.len()];
+                    prof.proxy = Some(chosen.config.clone());
+                    prof.resolved_geo = chosen.resolved_geo.clone();
+                }
+                if db.upsert_profile(&prof).is_ok() {
+                    updated += 1;
+                }
+            }
+        }
+        self.reload_profiles();
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        self.active_view = WorkspaceView::Profiles;
+        self.banner_message = Some(format!(
+            "Batch updated {updated} checked profile(s) ({})",
+            target_os.label()
+        ));
+        cx.notify();
+    }
+
+    pub fn export_profile_cookies_json(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        if let Some((short_id, ws_url)) = self.running_session_pair(profile_id) {
+            let prof_name = prof.name.clone();
+            let tokio_handle = self.tokio_handle.clone();
+            self.banner_message = Some(format!("Exporting live cookies for '{prof_name}'..."));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let sid = short_id.clone();
+                let res = tokio_handle
+                    .spawn_blocking(move || crate::launcher::agent_export_state(&sid, &ws_url))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+                let _ = this.update(cx, |app, cx| {
+                    match res {
+                        Ok((path, json)) => {
+                            let _ = crate::launcher::save_prelaunch_cookies(&short_id, &json);
+                            cx.write_to_clipboard(ClipboardItem::new_string(json));
+                            app.banner_message = Some(format!(
+                                "Exported live cookies for '{prof_name}' to clipboard & {}",
+                                path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            app.banner_message = Some(format!("Export cookies failed: {e}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            let saved = crate::launcher::read_prelaunch_cookies(&prof.short_id());
+            let payload = if saved.trim().is_empty() {
+                "[]".to_string()
+            } else {
+                saved
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(payload));
+            self.banner_message = Some(format!(
+                "Exported cookies JSON for '{}' to clipboard",
+                prof.name
+            ));
+            cx.notify();
+        }
+    }
+
+    pub fn copy_single_profile_proxy(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id) else {
+            return;
+        };
+        let text = prof
+            .proxy
+            .as_ref()
+            .map(|p| p.to_editable_string())
+            .unwrap_or_else(|| "Local IP".to_string());
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        self.banner_message = Some(format!("Copied proxy: {text}"));
+        cx.notify();
+    }
+
+    pub fn copy_agent_browser_cli(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id) else {
+            return;
+        };
+        let short_id = prof.short_id();
+        let cmd = if let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id) {
+            info.agent_browser_cli(&short_id)
+        } else {
+            format!("agent-browser --session bon_{short_id} snapshot -i")
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
+        self.banner_message = Some(format!("Copied Agent CLI (session bon_{short_id})"));
+        cx.notify();
+    }
+
+    pub fn delete_group_and_reset(
+        &mut self,
+        group_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(db) = self.db.lock() {
+            let _ = db.delete_group(group_name);
+            for mut p in self
+                .profiles
+                .iter()
+                .filter(|p| p.group_tag.eq_ignore_ascii_case(group_name))
+                .cloned()
+            {
+                p.group_tag = "General".to_string();
+                let _ = db.upsert_profile(&p);
+            }
+        }
+        self.reload_profiles();
+        if self.selected_group.eq_ignore_ascii_case(group_name) {
+            self.selected_group = "All".to_string();
+        }
+        if self.batch_selected_group.eq_ignore_ascii_case(group_name) {
+            self.batch_selected_group = "General".to_string();
+        }
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        self.banner_message = Some(format!("Removed group '{group_name}'"));
+        cx.notify();
+    }
+
+    pub fn create_group_from_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let g = self.batch_move_group_input.read(cx).value().trim().to_string();
+        if g.is_empty() {
+            return;
+        }
+        if let Ok(db) = self.db.lock() {
+            let _ = db.insert_group(&g);
+        }
+        self.batch_move_group_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Enter new name..."));
+        self.reload_profiles();
+        self.batch_selected_group = g.clone();
+        if let Some(m) = self.modal.as_mut() {
+            m.selected_group = g.clone();
+        }
+        self.banner_message = Some(format!("Created group '{g}'"));
+        cx.notify();
+    }
+
+    pub fn create_tag_from_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let t = self.batch_move_group_input.read(cx).value().trim().to_string();
+        if t.is_empty() {
+            return;
+        }
+        if let Ok(db) = self.db.lock() {
+            let _ = db.insert_tag(&t);
+        }
+        self.batch_move_group_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Enter new name..."));
+        self.reload_profiles();
+        self.proxy_selected_tag = t.clone();
+        self.banner_message = Some(format!("Created proxy tag '#{t}'"));
+        cx.notify();
+    }
+
+    pub fn delete_tag_and_reset(&mut self, tag_name: &str, cx: &mut Context<Self>) {
+        if let Ok(db) = self.db.lock() {
+            let _ = db.delete_tag(tag_name);
+            for mut sp in self
+                .saved_proxies
+                .iter()
+                .filter(|p| p.group_tag.eq_ignore_ascii_case(tag_name))
+                .cloned()
+            {
+                sp.group_tag = "General".to_string();
+                let _ = db.upsert_proxy(&sp);
+            }
+        }
+        self.reload_profiles();
+        if self.selected_proxy_group.eq_ignore_ascii_case(tag_name) {
+            self.selected_proxy_group = "All".to_string();
+        }
+        if self.proxy_selected_tag.eq_ignore_ascii_case(tag_name) {
+            self.proxy_selected_tag = "General".to_string();
+        }
+        self.banner_message = Some(format!("Removed proxy tag '#{tag_name}'"));
+        cx.notify();
+    }
+
+    pub fn assign_single_saved_proxy_to_checked(
+        &mut self,
+        proxy_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
+            return;
+        };
+        let targets: Vec<Profile> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .cloned()
+            .collect();
+        let mut updated = 0usize;
+        if let Ok(db) = self.db.lock() {
+            for mut prof in targets {
+                prof.proxy = Some(sp.config.clone());
+                prof.resolved_geo = sp.resolved_geo.clone();
+                if db.upsert_profile(&prof).is_ok() {
+                    updated += 1;
+                }
+            }
+        }
+        self.reload_profiles();
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        self.banner_message = Some(format!(
+            "Assigned proxy '{}' (#{}) to {updated} profile(s)",
+            sp.name, sp.group_tag
+        ));
+        cx.notify();
+    }
+
+    pub fn batch_update_proxies_for_checked(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<Profile> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let pool = self.proxies_for_batch_group();
+        if self.batch_proxy_group != "None" && pool.is_empty() {
+            self.banner_message =
+                Some("No proxies in Proxy manager yet. Open Proxy manager to add proxies first.".to_string());
+            cx.notify();
+            return;
+        }
+        let mut updated = 0usize;
+        if let Ok(db) = self.db.lock() {
+            for (idx, mut prof) in targets.into_iter().enumerate() {
+                if self.batch_proxy_group == "None" {
+                    prof.proxy = None;
+                    prof.resolved_geo = None;
+                } else {
+                    let chosen = &pool[idx % pool.len()];
+                    prof.proxy = Some(chosen.config.clone());
+                    prof.resolved_geo = chosen.resolved_geo.clone();
+                }
+                if db.upsert_profile(&prof).is_ok() {
+                    updated += 1;
+                }
+            }
+        }
+        self.reload_profiles();
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        self.banner_message = Some(if self.batch_proxy_group == "None" {
+            format!("Cleared proxy (Without proxy) on {updated} profile(s)")
+        } else {
+            format!("Updated proxies from Proxy manager on {updated} profile(s)")
+        });
+        cx.notify();
+    }
+
+    pub fn delete_checked_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let deletable_ids: Vec<String> = self
+            .checked_profile_ids
+            .iter()
+            .filter(|id| !matches!(self.statuses.get(*id), Some(ProfileStatus::Running(_))))
+            .cloned()
+            .collect();
+        if deletable_ids.is_empty() {
+            self.banner_message =
+                Some("Stop running profiles before deleting them".to_string());
+            cx.notify();
+            return;
+        }
+        let count = deletable_ids.len();
+        if let Ok(db) = self.db.lock() {
+            for id in &deletable_ids {
+                let _ = db.delete_profile(id);
+            }
+        }
+        for id in &deletable_ids {
+            let _ = crate::launcher::wipe_profile_data(id);
+            self.statuses.remove(id);
+            self.checked_profile_ids.remove(id);
+        }
+        self.reload_profiles();
+        if let Some(first) = self.profiles.first().map(|p| p.id.clone()) {
+            self.select_profile(&first, window, cx);
+        } else {
+            self.selected_profile_id = None;
+            self.modal = None;
+        }
+        self.banner_message = Some(format!("Deleted {count} selected profile(s)"));
+        cx.notify();
+    }
+
+    pub fn check_profile_proxy(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let pid = profile.id.clone();
+        let was_running = matches!(self.statuses.get(&pid), Some(ProfileStatus::Running(_)));
+        if !was_running {
+            self.statuses.insert(
+                pid.clone(),
+                ProfileStatus::Starting("Checking proxy...".to_string()),
+            );
+        }
+        self.banner_message = Some(format!("Checking proxy for '{}'...", profile.name));
+        cx.notify();
+
+        let tokio_handle = self.tokio_handle.clone();
+        let sem = self.proxy_check_sem.clone();
+        let db = self.db.clone();
+        let proxy_for_sync = profile.proxy.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res: anyhow::Result<crate::models::GeoInfo> = tokio_handle
+                .spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    if let Some(proxy_cfg) = profile.proxy {
+                        let mut tunnel = LocalProxyTunnel::start(proxy_cfg).await?;
+                        let port = tunnel.local_port();
+                        let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+                        tunnel.stop();
+                        geo_res
+                    } else {
+                        crate::geoip::resolve_geo_via_port(None).await
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Task join error: {e}")));
+
+            let _ = this.update(cx, |app, cx| {
+                let still_running =
+                    matches!(app.statuses.get(&pid), Some(ProfileStatus::Running(_)));
+                match res {
+                    Ok(geo) => {
+                        if let Ok(db_guard) = db.lock() {
+                            let _ = db_guard.update_resolved_geo(&pid, Some(&geo));
+                            if let Some(cfg) = &proxy_for_sync {
+                                for sp in &app.saved_proxies {
+                                    if sp.config.protocol == cfg.protocol
+                                        && sp.config.host == cfg.host
+                                        && sp.config.port == cfg.port
+                                    {
+                                        let _ = db_guard.update_saved_proxy_check(
+                                            &sp.id,
+                                            Some(&geo),
+                                            None,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        app.reload_profiles();
+                        if !still_running {
+                            app.statuses.insert(pid.clone(), ProfileStatus::Stopped);
+                        }
+                        app.banner_message = Some(format!("Proxy OK: {}", geo.summary_badge()));
+                    }
+                    Err(e) => {
+                        let err_s = e.to_string();
+                        if !still_running {
+                            app.statuses
+                                .insert(pid.clone(), ProfileStatus::Error(err_s.clone()));
+                        }
+                        app.banner_message = Some(format!("Proxy check failed: {err_s}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn launch_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        if matches!(
+            self.statuses.get(profile_id),
+            Some(ProfileStatus::Running(_) | ProfileStatus::Starting(_))
+        ) {
+            return;
+        }
+        let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let pid = profile.id.clone();
+        let short_id = profile.short_id();
+        self.statuses.insert(
+            pid.clone(),
+            ProfileStatus::Starting("Starting...".to_string()),
+        );
+        cx.notify();
+
+        let tokio_handle = self.tokio_handle.clone();
+        let db = self.db.clone();
+
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn(async move { crate::launcher::launch_profile(&profile).await })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Launch task error: {e}")));
+
+            let _ = this.update(cx, |app, cx| {
+                match res {
+                    Ok((running_proc, maybe_geo)) => {
+                        let info = running_proc.info.clone();
+                        if let Ok(db_guard) = db.lock() {
+                            if let Some(geo) = &maybe_geo {
+                                let _ = db_guard.update_resolved_geo(&pid, Some(geo));
+                            }
+                            let _ = db_guard.touch_last_launched(&pid);
+                        }
+                        if let Ok(mut map) = app.running_processes.lock() {
+                            map.insert(pid.clone(), running_proc);
+                        }
+                        app.reload_profiles();
+                        app.statuses
+                            .insert(pid.clone(), ProfileStatus::Running(info.clone()));
+                        app.banner_message = Some(format!(
+                            "Launched PID {} • Agent session: bon_{short_id} (port {})",
+                            info.pid, info.cdp_port
+                        ));
+                    }
+                    Err(e) => {
+                        app.statuses
+                            .insert(pid.clone(), ProfileStatus::Error(e.to_string()));
+                        app.banner_message = Some(format!("Launch blocked: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn stop_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        if let Ok(mut map) = self.running_processes.lock()
+            && let Some(mut proc) = map.remove(profile_id)
+        {
+            self.tokio_handle.spawn_blocking(move || {
+                proc.stop_gracefully();
+            });
+        }
+        self.statuses
+            .insert(profile_id.to_string(), ProfileStatus::Stopped);
+        self.banner_message =
+            Some("Stopped browser session (cookies flushed)".to_string());
+        cx.notify();
+    }
+
+    fn running_session_pair(&self, profile_id: &str) -> Option<(String, String)> {
+        let profile = self.profiles.iter().find(|p| p.id == profile_id)?;
+        let ProfileStatus::Running(info) = self.statuses.get(profile_id)? else {
+            return None;
+        };
+        Some((profile.short_id(), info.ws_url.clone()))
+    }
+
+
+    pub fn install_kernel(&mut self, cx: &mut Context<Self>) {
+        if self.installing_kernel {
+            return;
+        }
+        self.installing_kernel = true;
+        self.banner_message = Some(
+            "Downloading & installing adryfish/fingerprint-chromium 148.0.7778.215 (~140MB)..."
+                .to_string(),
+        );
+        cx.notify();
+
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(crate::launcher::install_adryfish_kernel_blocking)
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Kernel install join error: {e}")));
+
+            let _ = this.update(cx, |app, cx| {
+                app.installing_kernel = false;
+                match res {
+                    Ok(info) => {
+                        app.banner_message = Some(format!(
+                            "Kernel installed & unquarantined: {}",
+                            info.path.display()
+                        ));
+                        app.kernel_info = Some(info);
+                    }
+                    Err(e) => {
+                        app.banner_message = Some(format!("Kernel install failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+impl Render for BonLoginApp {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.banner_message != self.banner_timer_for {
+            self.banner_timer_for = self.banner_message.clone();
+            if let Some(msg) = self.banner_message.clone()
+                && !msg.ends_with("...")
+            {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(3200))
+                        .await;
+                    let _ = this.update(cx, |app, cx| {
+                        if app.banner_message.as_deref() == Some(msg.as_str()) {
+                            app.banner_message = None;
+                            app.banner_timer_for = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
+        let total_count = self.profiles.len();
+        let filtered = self.filtered_profiles();
+        let folder_counts = self.distinct_groups_with_counts();
+        let group_count = folder_counts.len();
+        let proxy_group_counts = self.distinct_proxy_groups_with_counts();
+        let selected_group = self.selected_group.clone();
+        let selected_id = self.selected_profile_id.clone();
+        let active_view = self.active_view;
+        let sub_tab = self.profile_sub_tab;
+        let popup_modal = self.popup_modal;
+        let show_drawer = self.show_detail_drawer;
+        let (kernel_dot, kernel_label) = match &self.kernel_info {
+            Some(_) => (BonTheme::success(), "Chromium 148 Online".to_string()),
+            None => (BonTheme::warning(), "Engine Missing".to_string()),
+        };
+
+        let is_editing_existing = active_view == WorkspaceView::EditProfile
+            && self
+                .modal
+                .as_ref()
+                .and_then(|m| m.editing_id.as_ref())
+                .is_some();
+        let is_creating_profile =
+            active_view == WorkspaceView::EditProfile && !is_editing_existing;
+        let is_profiles_nav_active =
+            active_view == WorkspaceView::Profiles || is_editing_existing;
+
+        let page_title = match active_view {
+            WorkspaceView::Profiles => "Profiles",
+            WorkspaceView::Proxies => "Proxy management",
+            WorkspaceView::EditProfile => {
+                if is_editing_existing {
+                    "Setting Profile"
+                } else {
+                    "Create Profile"
+                }
+            }
+            WorkspaceView::BulkBackup => "Extensions",
+        };
+        let app_entity = cx.entity().clone();
+
+        div()
+            .relative()
+            .size_full()
+            .font_family("SF Pro")
+            .bg(BonTheme::bg_canvas())
+            .text_color(BonTheme::text_primary())
+            .child(
+                h_flex()
+                    .size_full()
+            // 1. GenLogin 3.0 Left Sidebar (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
+            // ================================================================
+            .child(
+                v_flex()
+                    .w(px(218.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .pt(px(44.))
+                    .pb_3p5()
+                    .px_3()
+                    .justify_between()
+                    .bg(BonTheme::bg_sidebar())
+                    .border_r_1()
+                    .border_color(BonTheme::border())
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_3p5()
+                            // BonLogin Brand Header under macOS Traffic Lights
+                            .child(
+                                h_flex()
+                                    .px_1p5()
+                                    .gap_2p5()
+                                    .items_center()
+                                    .child({
+                                        static LOGO_IMG: LazyLock<Arc<Image>> = LazyLock::new(|| {
+                                            Arc::new(Image::from_bytes(
+                                                ImageFormat::Svg,
+                                                include_bytes!("../../assets/bonlogin-logo.svg")
+                                                    .to_vec(),
+                                            ))
+                                        });
+                                        img(LOGO_IMG.clone())
+                                            .w(px(32.))
+                                            .h(px(32.))
+                                            .flex_shrink_0()
+                                    })
+                                    .child(
+                                        v_flex()
+                                            .gap_0()
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_bold()
+                                                            .text_color(BonTheme::text_primary())
+                                                            .child("Bon"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_bold()
+                                                            .text_color(BonTheme::info())
+                                                            .child("Login"),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(BonTheme::text_muted())
+                                                    .text_size(px(9.5))
+                                                    .font_semibold()
+                                                    .child("STEALTH • CHROMIUM 148"),
+                                            ),
+                                    ),
+                            )
+                            // macOS Prominent [+ New Profile] Action Pill
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .justify_between()
+                                    .items_center()
+                                    .bg(if is_creating_profile {
+                                        BonTheme::accent()
+                                    } else {
+                                        BonTheme::bg_elevated()
+                                    })
+                                    .border_1()
+                                    .border_color(if is_creating_profile {
+                                        BonTheme::accent()
+                                    } else {
+                                        BonTheme::border()
+                                    })
+                                    .hover(|s| {
+                                        if is_creating_profile {
+                                            s.bg(rgb(0x2997ff))
+                                        } else {
+                                            s.bg(rgb(0x36363b)).border_color(BonTheme::border_active())
+                                        }
+                                    })
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(BonTheme::text_primary())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|app, _, window, cx| {
+                                            app.popup_modal = None;
+                                            app.open_create_modal(window, cx);
+                                        }),
+                                    )
+                                    .child(format!("{}  New Profile", SfSymbol::PLUS))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(if is_creating_profile {
+                                                rgba(0xffffffcc).into()
+                                            } else {
+                                                BonTheme::text_muted()
+                                            })
+                                            .child("⌘N"),
+                                    )
+                                    .with_spring(
+                                        "sidebar-create-prof-spring",
+                                        SpringAnimation::new(BonTheme::snappy_spring())
+                                            .to(is_creating_profile),
+                                        |this, phase| {
+                                            this.bg(phase.interpolate_clamped(
+                                                BonTheme::bg_elevated(),
+                                                BonTheme::accent(),
+                                            ))
+                                        },
+                                    ),
+                            )
+                            // macOS Sidebar Navigation Section
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .px_2p5()
+                                            .pb_1()
+                                            .text_size(px(10.5))
+                                            .font_semibold()
+                                            .text_color(BonTheme::text_muted())
+                                            .child("WORKSPACE"),
+                                    )
+                                    .child(sidebar_nav_item(
+                                        "\u{100688}   Profiles",
+                                        is_profiles_nav_active,
+                                        WorkspaceView::Profiles,
+                                        cx,
+                                    ))
+                                    .child(sidebar_nav_item(
+                                        "\u{100906}   Proxies",
+                                        active_view == WorkspaceView::Proxies,
+                                        WorkspaceView::Proxies,
+                                        cx,
+                                    ))
+                                    .child(sidebar_nav_item(
+                                        "\u{10096e}   Extensions",
+                                        active_view == WorkspaceView::BulkBackup,
+                                        WorkspaceView::BulkBackup,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    // Sidebar Footer: Engine Status Pill
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .pt_2p5()
+                            .border_t_1()
+                            .border_color(BonTheme::border())
+                            .gap_2()
+                            .children(self.kernel_info.is_none().then(|| {
+                                let installing = self.installing_kernel;
+                                Button::new("btn-install-kernel")
+                                    .warning()
+                                    .small()
+                                    .disabled(installing)
+                                    .label(if installing {
+                                        "Installing..."
+                                    } else {
+                                        "Download Kernel"
+                                    })
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        app.install_kernel(cx);
+                                    }))
+                            }))
+                            .child(
+                                h_flex()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgba(0xffffff08))
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(7.))
+                                            .h(px(7.))
+                                            .rounded_full()
+                                            .bg(kernel_dot),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(BonTheme::text_secondary())
+                                            .child(kernel_label),
+                                    ),
+                            ),
+                    ),
+            )
+            // ================================================================
+            // 2. Main Workspace (GenLogin Flat Top Header + Active Screen)
+            // ================================================================
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .px_6()
+                    .py_4()
+                    .gap_3p5()
+                    .overflow_hidden()
+                    // GenLogin Top Header Bar (`Profiles` title on left, `[⚡ Quick add]` on right)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .flex_shrink_0()
+                            .pb_2p5()
+                            .border_b_1()
+                            .border_color(BonTheme::border())
+                            .justify_between()
+                            .items_center()
+                            .gap_3()
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .gap_4()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_lg()
+                                            .font_bold()
+                                            .text_color(BonTheme::text_primary())
+                                            .child(page_title),
+                                    )
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap_2p5()
+                                    .items_center()
+                                    .child(
+                                        Button::new("top-quick-add")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .small()
+                                            .label(format!("{}  Quick add", SfSymbol::BOLT_FILL))
+                                            .on_click(cx.listener(|app, _, _, cx| {
+                                                app.popup_modal = Some(ActivePopupModal::QuickAdd);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                    // (Popup modals render as a full-window backdrop overlay at the root level)
+                    // Main Screen Content
+                    .child(match active_view {
+                        WorkspaceView::Profiles => v_flex()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .gap_3()
+                            // 1. macOS Segmented Control Bar (`Local (N)` | `Groups (N)`)
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .flex_shrink_0()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        h_flex()
+                                            .p(px(3.))
+                                            .gap(px(2.))
+                                            .rounded_lg()
+                                            .bg(BonTheme::bg_well())
+                                            .border_1()
+                                            .border_color(BonTheme::border())
+                                            .child(genlogin_subtab_item(
+                                                "Local",
+                                                total_count,
+                                                sub_tab == ProfileSubTab::Local,
+                                                ProfileSubTab::Local,
+                                                cx,
+                                            ))
+                                            .child(genlogin_subtab_item(
+                                                "Groups",
+                                                group_count,
+                                                sub_tab == ProfileSubTab::Group,
+                                                ProfileSubTab::Group,
+                                                cx,
+                                            )),
+                                    )
+                                    .children((selected_group != "All").then(|| {
+                                        Button::new("clear-grp-filter")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .small()
+                                            .label(format!(
+                                                "{}  {selected_group}  {}",
+                                                SfSymbol::FOLDER_FILL,
+                                                SfSymbol::XMARK
+                                            ))
+                                            .on_click(cx.listener(|app, _, _, cx| {
+                                                app.selected_group = "All".to_string();
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                            .child(if sub_tab == ProfileSubTab::Group {
+                                render_groups_subtab_view(self, cx)
+                                    .with_animation(
+                                        "subtab-groups-enter",
+                                        Animation::new(Duration::from_millis(140))
+                                            .with_easing(ease_out_quint()),
+                                        |this, delta| this.opacity(delta),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                let checked_count = self.checked_profile_ids.len();
+                                let checked_running_count = self
+                                    .checked_profile_ids
+                                    .iter()
+                                    .filter(|id| {
+                                        matches!(
+                                            self.statuses.get(*id),
+                                            Some(
+                                                ProfileStatus::Running(_)
+                                                    | ProfileStatus::Starting(_)
+                                            )
+                                        )
+                                    })
+                                    .count();
+                                let checked_stopped_count =
+                                    checked_count.saturating_sub(checked_running_count);
+                                v_flex()
+                                    .w_full()
+                                    .flex_1()
+                                    .gap_2p5()
+                                    .overflow_hidden()
+                                    // Search Input Row (`🔍 Search...`)
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .w(px(270.))
+                                                    .child(Input::new(&self.search_input)),
+                                            )
+                                            .children((!self.show_detail_drawer).then(|| {
+                                                Button::new("reopen-detail-drawer")
+                                                    .with_variant(BonTheme::row_action(cx))
+                                                    .small()
+                                                    .label(format!(
+                                                        "{}  Show Detail Panel",
+                                                        SfSymbol::SIDEBAR_RIGHT
+                                                    ))
+                                                    .on_click(cx.listener(|app, _, _, cx| {
+                                                        app.show_detail_drawer = true;
+                                                        cx.notify();
+                                                    }))
+                                            })),
+                                    )
+                                    // GenLogin Top Menu Bar (Batch Action Row below Search when profiles are checked, `docs/genlogin-3.0/assets/menu-bar_profile_top-menu-bar_01.png`)
+                                    .children((checked_count > 0).then(|| {
+                                        v_flex()
+                                            .w_full()
+                                            .gap_1p5()
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .gap_2()
+                                                    .flex_wrap()
+                                                    .items_center()
+                                                    .children((checked_stopped_count > 0).then(
+                                                        || {
+                                                            Button::new("batch-launch-sel")
+                                                                .with_variant(
+                                                                    BonTheme::primary_cta(cx),
+                                                                )
+                                                                .small()
+                                                                .label(format!(
+                                                                    "{}  Start {checked_stopped_count} profile{}",
+                                                                    SfSymbol::PLAY_FILL,
+                                                                    if checked_stopped_count == 1 {
+                                                                        ""
+                                                                    } else {
+                                                                        "s"
+                                                                    }
+                                                                ))
+                                                                .on_click(cx.listener(
+                                                                    |app, _, _, cx| {
+                                                                        app.launch_checked_profiles(
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                        },
+                                                    ))
+                                                    .children((checked_running_count > 0).then(
+                                                        || {
+                                                            Button::new("batch-stop-sel")
+                                                                .with_variant(
+                                                                    BonTheme::outline_danger(cx),
+                                                                )
+                                                                .small()
+                                                                .label(format!(
+                                                                    "{}  Stop {checked_running_count} profile{}",
+                                                                    SfSymbol::STOP_FILL,
+                                                                    if checked_running_count == 1 {
+                                                                        ""
+                                                                    } else {
+                                                                        "s"
+                                                                    }
+                                                                ))
+                                                                .on_click(cx.listener(
+                                                                    |app, _, _, cx| {
+                                                                        app.stop_checked_profiles(
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                        },
+                                                    ))
+                                                    .child(
+                                                        Button::new("batch-assign-grp-btn")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label(format!(
+                                                                "{}  Assign to group",
+                                                                SfSymbol::FOLDER_FILL
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.popup_modal = Some(
+                                                                        ActivePopupModal::AssignGroup,
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                    // (Only real batch actions shown)
+                                                    .child(
+                                                        Button::new("batch-check-proxy-sel")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label(format!(
+                                                                "{}  Check proxy",
+                                                                SfSymbol::CHECKMARK_SHIELD
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.check_proxies_for_checked(
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("batch-update-proxy-btn")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label(format!(
+                                                                "{}  Update proxy",
+                                                                SfSymbol::ARROW_TRIANGLE_2_CIRCLEPATH
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.popup_modal = Some(
+                                                                        ActivePopupModal::UpdateProxy,
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("batch-update-profiles-btn")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label(format!(
+                                                                "{}  Update profiles",
+                                                                SfSymbol::SLIDER_HORIZONTAL_3
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.popup_modal = Some(
+                                                                        ActivePopupModal::UpdateProfiles,
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child({
+                                                        let app_ids = app_entity.clone();
+                                                        let app_names = app_entity.clone();
+                                                        let app_exp = app_entity.clone();
+                                                        let app_del = app_entity.clone();
+                                                        Button::new("batch-more-dots")
+                                                            .ghost()
+                                                            .small()
+                                                            .label(SfSymbol::ELLIPSIS)
+                                                            .dropdown_menu_with_anchor(
+                                                                Anchor::TopRight,
+                                                                move |menu, _window, _cx| {
+                                                                    let a1 = app_ids.clone();
+                                                                    let a2 = app_names.clone();
+                                                                    let a3 = app_exp.clone();
+                                                                    let a4 = app_del.clone();
+                                                                    menu.min_w(px(170.))
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{100241}   Copy IDs",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    a1.update(
+                                                                                        cx,
+                                                                                        |app, cx| {
+                                                                                            app.copy_checked_ids_to_clipboard(cx);
+                                                                                        },
+                                                                                    );
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{100241}   Copy names",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    a2.update(
+                                                                                        cx,
+                                                                                        |app, cx| {
+                                                                                            app.copy_checked_names_to_clipboard(cx);
+                                                                                        },
+                                                                                    );
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023d}   Export",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    a3.update(
+                                                                                        cx,
+                                                                                        |app, cx| {
+                                                                                            app.export_all_profiles_backup(cx);
+                                                                                        },
+                                                                                    );
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .separator()
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Delete ({checked_count})",
+                                                                                    SfSymbol::TRASH
+                                                                                ),
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    a4.update(
+                                                                                        cx,
+                                                                                        |app, cx| {
+                                                                                            app.delete_checked_profiles(window, cx);
+                                                                                        },
+                                                                                    );
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                },
+                                                            )
+                                                    }),
+                                            )
+                                            .with_animation(
+                                                "batch-action-bar-enter",
+                                                Animation::new(Duration::from_millis(140))
+                                                    .with_easing(ease_out_quint()),
+                                                |this, delta| this.opacity(delta),
+                                            )
+                                    }))
+                                    // GenLogin Table + Right-Hand `Detail` Drawer
+                                    .child(render_profile_table(
+                                        &filtered,
+                                        &self.statuses,
+                                        selected_id.as_deref(),
+                                        &self.checked_profile_ids,
+                                        self.col_vis,
+                                        show_drawer,
+                                        cx,
+                                    ))
+                                    .with_animation(
+                                        "subtab-local-enter",
+                                        Animation::new(Duration::from_millis(160))
+                                            .with_easing(ease_out_quint()),
+                                        |this, delta| this.opacity(delta),
+                                    )
+                                    .into_any_element()
+                            })
+                            .with_animation(
+                                "view-profiles-enter",
+                                Animation::new(Duration::from_millis(140))
+                                    .with_easing(ease_out_quint()),
+                                |this, delta| this.opacity(delta),
+                            )
+                            .into_any_element(),
+                        WorkspaceView::Proxies => render_proxies_view(self, cx)
+                            .with_animation(
+                                "view-proxies-enter",
+                                Animation::new(Duration::from_millis(140))
+                                    .with_easing(ease_out_quint()),
+                                |this, delta| this.opacity(delta),
+                            )
+                            .into_any_element(),
+                        WorkspaceView::EditProfile => {
+                            if let Some(modal) = self.modal.as_ref() {
+                                render_edit_profile_view(
+                                    modal,
+                                    &self.saved_groups,
+                                    &proxy_group_counts,
+                                    &self.saved_proxies,
+                                    cx,
+                                )
+                                .with_animation(
+                                    "view-edit-profile-enter",
+                                    Animation::new(Duration::from_millis(140))
+                                        .with_easing(ease_out_quint()),
+                                    |this, delta| this.opacity(delta),
+                                )
+                                .into_any_element()
+                            } else {
+                                div().child("No profile loaded").into_any_element()
+                            }
+                        }
+                        WorkspaceView::BulkBackup => render_bulk_backup_view(self, cx)
+                            .with_animation(
+                                "view-extensions-enter",
+                                Animation::new(Duration::from_millis(140))
+                                    .with_easing(ease_out_quint()),
+                                |this, delta| this.opacity(delta),
+                            )
+                            .into_any_element(),
+                    }),
+            )
+            )
+            // Full-Window Centered Modal Overlay (with dark backdrop)
+            .children(popup_modal.map(|kind| render_popup_modal(kind, self, cx)))
+            // Floating Bottom-Right Toast Notification (auto-dismisses after 3.2s)
+            .children(self.banner_message.as_ref().map(|msg| {
+                let lower = msg.to_ascii_lowercase();
+                let is_err = lower.contains("failed")
+                    || lower.contains("error")
+                    || lower.contains("blocked")
+                    || lower.contains("invalid")
+                    || lower.contains("cannot");
+                let is_loading = msg.ends_with("...");
+                let (accent_color, icon_bg, icon_str) = if is_err {
+                    (BonTheme::danger(), BonTheme::danger_bg(), SfSymbol::XMARK_CIRCLE_FILL)
+                } else if is_loading {
+                    (BonTheme::info(), BonTheme::info_bg(), SfSymbol::ARROW_TRIANGLE_2_CIRCLEPATH)
+                } else {
+                    (BonTheme::success(), BonTheme::success_bg(), SfSymbol::CHECKMARK_CIRCLE_FILL)
+                };
+                let banner_id = SharedString::from(format!("toast-banner-{msg}"));
+                h_flex()
+                    .id(banner_id.clone())
+                    .absolute()
+                    .bottom_5()
+                    .right_6()
+                    .max_w(px(440.))
+                    .px_3p5()
+                    .py_2p5()
+                    .gap_2p5()
+                    .items_center()
+                    .rounded_lg()
+                    .bg(BonTheme::bg_elevated())
+                    .border_1()
+                    .border_color(accent_color)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|app, _, _, cx| {
+                            app.banner_message = None;
+                            app.banner_timer_for = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(22.))
+                            .h(px(22.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(icon_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .font_bold()
+                            .text_color(accent_color)
+                            .child(icon_str),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(BonTheme::text_primary())
+                            .child(msg.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(BonTheme::text_muted())
+                            .child(SfSymbol::XMARK),
+                    )
+                    .with_animation(
+                        banner_id,
+                        Animation::new(Duration::from_millis(160))
+                            .with_easing(ease_out_quint()),
+                        |this, delta| {
+                            this.opacity(delta).bottom(px(12.0 + delta * 8.0))
+                        },
+                    )
+            }))
+    }
+}
+
+fn genlogin_subtab_item(
+    label: &'static str,
+    count: usize,
+    active: bool,
+    target_tab: ProfileSubTab,
+    cx: &mut Context<BonLoginApp>,
+) -> impl IntoElement {
+    h_flex()
+        .px_3()
+        .py_1()
+        .gap_1p5()
+        .items_center()
+        .cursor_pointer()
+        .rounded_md()
+        .bg(if active {
+            BonTheme::accent()
+        } else {
+            rgba(0x00000000).into()
+        })
+        .hover(|s| {
+            if active {
+                s.bg(rgb(0x2997ff))
+            } else {
+                s.bg(BonTheme::bg_hover())
+            }
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, cx| {
+                app.profile_sub_tab = target_tab;
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(if active {
+                    rgb(0xffffff).into()
+                } else {
+                    BonTheme::text_secondary()
+                })
+                .child(label),
+        )
+        .child(
+            div()
+                .px_1p5()
+                .py(px(1.))
+                .rounded_full()
+                .bg(if active {
+                    rgba(0xffffff2e)
+                } else {
+                    rgba(0xffffff0d)
+                })
+                .text_size(px(10.5))
+                .font_semibold()
+                .text_color(if active {
+                    rgb(0xffffff).into()
+                } else {
+                    BonTheme::text_muted()
+                })
+                .child(count.to_string()),
+        )
+        .with_spring(
+            SharedString::from(format!("subtab-spring-{label}")),
+            SpringAnimation::new(BonTheme::snappy_spring()).to(active),
+            |this, phase| {
+                this.bg(phase.interpolate_clamped(
+                    rgba(0x00000000).into(),
+                    BonTheme::accent(),
+                ))
+            },
+        )
+}
+
+fn sidebar_nav_item(
+    label: &'static str,
+    active: bool,
+    target_view: WorkspaceView,
+    cx: &mut Context<BonLoginApp>,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .px_2p5()
+        .py_1p5()
+        .rounded_lg()
+        .cursor_pointer()
+        .bg(if active {
+            BonTheme::accent()
+        } else {
+            Hsla::from(rgba(0x00000000))
+        })
+        .hover(|s| {
+            if active {
+                s.bg(rgb(0x2997ff))
+            } else {
+                s.bg(BonTheme::bg_hover())
+            }
+        })
+        .items_center()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, cx| {
+                app.popup_modal = None;
+                app.active_view = target_view;
+                cx.notify();
+            }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(if active {
+                    rgb(0xffffff).into()
+                } else {
+                    BonTheme::text_primary()
+                })
+                .child(label),
+        )
+        .with_spring(
+            SharedString::from(format!("nav-spring-{label}")),
+            SpringAnimation::new(BonTheme::snappy_spring()).to(active),
+            |this, phase| {
+                this.bg(phase.interpolate_clamped(
+                    Hsla::from(rgba(0x00000000)),
+                    BonTheme::accent(),
+                ))
+            },
+        )
+}

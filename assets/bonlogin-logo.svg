@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="16" y1="8" x2="240" y2="248" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#172036"/>
+      <stop offset="50%" stop-color="#0D1322"/>
+      <stop offset="100%" stop-color="#070A12"/>
+    </linearGradient>
+    <linearGradient id="rimGrad" x1="20" y1="16" x2="236" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="50%" stop-color="#4F6EF7"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <linearGradient id="bMainGrad" x1="64" y1="48" x2="196" y2="208" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC"/>
+      <stop offset="55%" stop-color="#93C5FD"/>
+      <stop offset="100%" stop-color="#4F6EF7"/>
+    </linearGradient>
+    <linearGradient id="visorCyan" x1="72" y1="92" x2="192" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00F5D4"/>
+      <stop offset="50%" stop-color="#22D3EE"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="accentWing" x1="56" y1="56" x2="188" y2="204" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+    <radialGradient id="ambientGlow" cx="52%" cy="46%" r="50%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.30"/>
+      <stop offset="65%" stop-color="#4F6EF7" stop-opacity="0.10"/>
+      <stop offset="100%" stop-color="#090D16" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Squircle Container -->
+  <rect x="10" y="10" width="236" height="236" rx="60" fill="url(#bgGrad)"/>
+  <rect x="14" y="14" width="228" height="228" rx="56" stroke="url(#rimGrad)" stroke-width="6"/>
+
+  <!-- Inner Ambient Glow -->
+  <circle cx="132" cy="124" r="98" fill="url(#ambientGlow)"/>
+
+  <!-- Fingerprint / Stealth Radar Arcs -->
+  <path d="M46 102C46 59 83 34 128 34C173 34 210 59 210 102" stroke="url(#rimGrad)" stroke-width="4" stroke-linecap="round" stroke-opacity="0.32" stroke-dasharray="12 10"/>
+  <path d="M52 162C63 197 93 220 128 220C163 220 193 197 204 162" stroke="url(#rimGrad)" stroke-width="4" stroke-linecap="round" stroke-opacity="0.28" stroke-dasharray="10 12"/>
+
+  <!-- Left Stealth Pillar / Blade of 'B' -->
+  <path d="M64 56L96 44V212L64 200V56Z" fill="url(#accentWing)"/>
+
+  <!-- Upper Loop of 'B' — Cyber Stealth Visor -->
+  <path d="M84 52H150C179 52 198 69 198 93C198 113 183 127 161 131H84V105H146C159 105 167 99 167 91C167 82 159 77 146 77H84V52Z" fill="url(#bMainGrad)"/>
+
+  <!-- Lower Loop of 'B' — Armored Shield & Fingerprint Core -->
+  <path d="M84 123H156C186 123 206 140 206 166C206 193 185 210 152 210H84V183H149C165 183 174 176 174 165C174 154 165 148 149 148H84V123Z" fill="url(#bMainGrad)"/>
+
+  <!-- Glowing Cyan Cyber Visor Slash Across Center -->
+  <path d="M54 114L194 96L184 124L64 138L54 114Z" fill="url(#visorCyan)"/>
+
+  <!-- Bright Core Spark -->
+  <circle cx="152" cy="166" r="9" fill="#22D3EE"/>
+</svg>

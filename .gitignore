@@ -1,0 +1,7 @@
+/target/
+.DS_Store
+**/.DS_Store
+.codegraph/
+*.swp
+docs/genlogin-3.0/
+*.swo
