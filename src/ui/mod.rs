@@ -20,10 +20,9 @@ use crate::models::{
     BrowserBrand, BrowserExtension, PlatformType, Profile, ProfileStatus, ProxyConfig,
     ProxyProtocol, SavedProxy,
 };
-use crate::proxy_tunnel::LocalProxyTunnel;
 use crate::ui::profile_list::{ColumnVisibility, render_profile_table};
 use crate::ui::profile_modal::{
-    ProfileModalState, ProxyEditMode, render_bulk_backup_view, render_edit_profile_view,
+    ProfileModalState, ProxyEditMode, render_edit_profile_view, render_extensions_view,
     render_groups_subtab_view, render_popup_modal, render_proxies_view,
 };
 use crate::ui::theme::{BonTheme, SfSymbol};
@@ -33,7 +32,7 @@ pub enum WorkspaceView {
     Profiles,
     Proxies,
     EditProfile,
-    BulkBackup,
+    Extensions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +92,6 @@ pub struct BonLoginApp {
     pub statuses: HashMap<String, ProfileStatus>,
     pub running_processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
     pub tokio_handle: tokio::runtime::Handle,
-    pub proxy_check_sem: Arc<tokio::sync::Semaphore>,
     pub kernel_info: Option<KernelInfo>,
     pub installing_kernel: bool,
     pub search_input: Entity<InputState>,
@@ -132,8 +130,17 @@ impl BonLoginApp {
         let saved_groups = db.list_groups().unwrap_or_default();
         let saved_tags = db.list_tags().unwrap_or_default();
         let extensions = db.list_extensions().unwrap_or_default();
-        for ext in extensions.iter().filter(|e| e.enabled) {
-            let _ = crate::launcher::ensure_extension_unpacked(ext);
+        let enabled_exts: Vec<BrowserExtension> = extensions
+            .iter()
+            .filter(|e| e.enabled)
+            .cloned()
+            .collect();
+        if !enabled_exts.is_empty() {
+            tokio_handle.spawn_blocking(move || {
+                for ext in &enabled_exts {
+                    let _ = crate::launcher::ensure_extension_unpacked(ext);
+                }
+            });
         }
         let selected_profile_id = profiles.first().map(|p| p.id.clone());
         let kernel_info = locate_chromium_kernel();
@@ -248,12 +255,12 @@ impl BonLoginApp {
                         let stale_ext: Vec<String> = app
                             .statuses
                             .iter()
-                            .filter_map(|(pid, st)| {
-                                (matches!(st, ProfileStatus::Running(_))
-                                    && !in_proc_keys.contains(pid)
-                                    && !external_live.contains_key(pid))
-                                .then(|| pid.clone())
+                            .filter(|(pid, st)| {
+                                matches!(st, ProfileStatus::Running(_))
+                                    && !in_proc_keys.contains(*pid)
+                                    && !external_live.contains_key(*pid)
                             })
+                            .map(|(pid, _)| pid.clone())
                             .collect();
                         for pid in stale_ext {
                             app.statuses.insert(pid, ProfileStatus::Stopped);
@@ -300,7 +307,6 @@ impl BonLoginApp {
             statuses: HashMap::new(),
             running_processes,
             tokio_handle,
-            proxy_check_sem: Arc::new(tokio::sync::Semaphore::new(5)),
             kernel_info,
             installing_kernel: false,
             search_input,
@@ -362,6 +368,27 @@ impl BonLoginApp {
             }
             if let Ok(elist) = db.list_extensions() {
                 self.extensions = elist;
+            }
+        }
+    }
+
+    pub fn reload_extensions_only(&mut self) {
+        if let Ok(db) = self.db.lock()
+            && let Ok(elist) = db.list_extensions()
+        {
+            self.extensions = elist;
+        }
+    }
+
+    pub fn reload_proxies_and_profiles(&mut self) {
+        if let Ok(db) = self.db.lock() {
+            if let Ok(list) = db.list_profiles() {
+                self.profiles = list;
+            }
+            if let Ok(plist) = db.list_proxies() {
+                let valid_ids: HashSet<String> = plist.iter().map(|p| p.id.clone()).collect();
+                self.checked_proxy_ids.retain(|id| valid_ids.contains(id));
+                self.saved_proxies = plist;
             }
         }
     }
@@ -457,9 +484,12 @@ impl BonLoginApp {
             }
         }
         if let Ok(db) = self.db.lock() {
-            for id in &ids {
-                let _ = db.delete_proxy(id);
-            }
+            let _ = db.with_transaction(|db| {
+                for id in &ids {
+                    let _ = db.delete_proxy(id);
+                }
+                Ok(())
+            });
         }
         self.reload_profiles();
         self.banner_message = Some(format!("Deleted {count} proxy(s)"));
@@ -497,15 +527,18 @@ impl BonLoginApp {
         let now = crate::models::unix_now();
         let mut count = 0;
         if let Ok(db) = self.db.lock() {
-            for sp in &self.saved_proxies {
-                if checked.contains(&sp.id) {
-                    let mut updated = sp.clone();
-                    let base = updated.expired_at.unwrap_or(now).max(now);
-                    updated.expired_at = Some(base + days * 86_400);
-                    let _ = db.upsert_proxy(&updated);
-                    count += 1;
+            let _ = db.with_transaction(|db| {
+                for sp in &self.saved_proxies {
+                    if checked.contains(&sp.id) {
+                        let mut updated = sp.clone();
+                        let base = updated.expired_at.unwrap_or(now).max(now);
+                        updated.expired_at = Some(base + days * 86_400);
+                        let _ = db.upsert_proxy(&updated);
+                        count += 1;
+                    }
                 }
-            }
+                Ok(())
+            });
         }
         self.reload_profiles();
         self.banner_message = Some(format!("Extended {count} proxy(s) by +{days} days"));
@@ -556,9 +589,12 @@ impl BonLoginApp {
         }
 
         if let Ok(db) = self.db.lock() {
-            for sp in &added {
-                let _ = db.upsert_proxy(sp);
-            }
+            let _ = db.with_transaction(|db| {
+                for sp in &added {
+                    let _ = db.upsert_proxy(sp);
+                }
+                Ok(())
+            });
         }
         let count = added.len();
         self.proxy_raw_input = cx.new(|cx| {
@@ -603,17 +639,10 @@ impl BonLoginApp {
         cx.notify();
 
         let tokio_handle = self.tokio_handle.clone();
-        let sem = self.proxy_check_sem.clone();
         let db = self.db.clone();
 
         let join_handle = tokio_handle.spawn(async move {
-            // shortcut: cap concurrent GeoIP checks at 5 to avoid 429 rate-limits
-            let _permit = sem.acquire_owned().await;
-            let mut tunnel = LocalProxyTunnel::start(cfg).await?;
-            let port = tunnel.local_port();
-            let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
-            tunnel.stop();
-            geo_res
+            crate::launcher::check_proxy_config_live(&cfg).await
         });
         let abort_handle = join_handle.abort_handle();
         let task_id = abort_handle.id();
@@ -641,18 +670,9 @@ impl BonLoginApp {
                 match res {
                     Ok(geo) => {
                         if let Ok(db_guard) = db.lock() {
-                            let _ = db_guard.update_saved_proxy_check(&pid, Some(&geo), None);
-                            for prof in &app.profiles {
-                                if prof.proxy.as_ref().is_some_and(|p| {
-                                    p.host == cfg_for_profiles.host
-                                        && p.port == cfg_for_profiles.port
-                                        && p.protocol == cfg_for_profiles.protocol
-                                }) {
-                                    let _ = db_guard.update_resolved_geo(&prof.id, Some(&geo));
-                                }
-                            }
+                            let _ = db_guard.sync_geo_for_proxy_endpoint(&cfg_for_profiles, &geo);
                         }
-                        app.reload_profiles();
+                        app.reload_proxies_and_profiles();
                         app.banner_message =
                             Some(format!("Proxy '{proxy_name}' OK: {}", geo.summary_badge()));
                     }
@@ -661,7 +681,7 @@ impl BonLoginApp {
                         if let Ok(db_guard) = db.lock() {
                             let _ = db_guard.update_saved_proxy_check(&pid, None, Some(&err_s));
                         }
-                        app.reload_profiles();
+                        app.reload_proxies_and_profiles();
                         app.banner_message =
                             Some(format!("Proxy '{proxy_name}' failed: {err_s}"));
                     }
@@ -735,12 +755,15 @@ impl BonLoginApp {
             return;
         }
         if let Ok(db) = self.db.lock() {
-            for (idx, mut prof) in target_profiles.into_iter().enumerate() {
-                let chosen = &pool[idx % pool.len()];
-                prof.proxy = Some(chosen.config.clone());
-                prof.resolved_geo = chosen.resolved_geo.clone();
-                let _ = db.upsert_profile(&prof);
-            }
+            let _ = db.with_transaction(|db| {
+                for (idx, mut prof) in target_profiles.into_iter().enumerate() {
+                    let chosen = &pool[idx % pool.len()];
+                    prof.proxy = Some(chosen.config.clone());
+                    prof.resolved_geo = chosen.resolved_geo.clone();
+                    let _ = db.upsert_profile(&prof);
+                }
+                Ok(())
+            });
         }
         self.reload_profiles();
         if let Some(sel) = self.selected_profile_id.clone() {
@@ -886,17 +909,11 @@ impl BonLoginApp {
         cx.notify();
 
         let tokio_handle = self.tokio_handle.clone();
-        let sem = self.proxy_check_sem.clone();
         let db = self.db.clone();
         let cfg_for_db = cfg.clone();
 
         let join_handle = tokio_handle.spawn(async move {
-            let _permit = sem.acquire_owned().await;
-            let mut tunnel = LocalProxyTunnel::start(cfg).await?;
-            let port = tunnel.local_port();
-            let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
-            tunnel.stop();
-            geo_res
+            crate::launcher::check_proxy_config_live(&cfg).await
         });
         let abort_handle = join_handle.abort_handle();
         let task_id = abort_handle.id();
@@ -923,16 +940,10 @@ impl BonLoginApp {
                         Ok(geo) => {
                             m.resolved_geo = Some(geo.clone());
                             m.proxy_check_error = None;
-                            if let Some(sp) = app.saved_proxies.iter().find(|s| {
-                                s.config.protocol == cfg_for_db.protocol
-                                    && s.config.host == cfg_for_db.host
-                                    && s.config.port == cfg_for_db.port
-                            }) && let Ok(db_guard) = db.lock()
-                            {
-                                let _ =
-                                    db_guard.update_saved_proxy_check(&sp.id, Some(&geo), None);
+                            if let Ok(db_guard) = db.lock() {
+                                let _ = db_guard.sync_geo_for_proxy_endpoint(&cfg_for_db, &geo);
                             }
-                            app.reload_profiles();
+                            app.reload_proxies_and_profiles();
                             app.banner_message =
                                 Some(format!("Proxy OK: {}", geo.summary_badge()));
                         }
@@ -971,6 +982,20 @@ impl BonLoginApp {
     ) {
         self.active_view = WorkspaceView::EditProfile;
         self.select_profile(profile_id, window, cx);
+    }
+
+    pub fn open_edit_cookies_view(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_view = WorkspaceView::EditProfile;
+        self.select_profile(profile_id, window, cx);
+        if let Some(m) = self.modal.as_mut() {
+            m.active_tab = profile_modal::ProfileEditorTab::Cookies;
+        }
+        cx.notify();
     }
 
     pub fn randomize_profile_seed(
@@ -1035,9 +1060,12 @@ impl BonLoginApp {
         }
 
         if let Ok(db) = self.db.lock() {
-            for p in &created {
-                let _ = db.upsert_profile(p);
-            }
+            let _ = db.with_transaction(|db| {
+                for p in &created {
+                    let _ = db.upsert_profile(p);
+                }
+                Ok(())
+            });
         }
         let count = created.len();
         let last_id = created.last().map(|p| p.id.clone());
@@ -1104,7 +1132,7 @@ impl BonLoginApp {
         if let Ok(db) = self.db.lock() {
             let _ = db.set_extension_enabled(ext_id, next_enabled);
         }
-        self.reload_profiles();
+        self.reload_extensions_only();
 
         let target_dir = crate::launcher::app_support_dir()
             .join("extensions")
@@ -1164,7 +1192,7 @@ impl BonLoginApp {
                                 if let Ok(db) = app.db.lock() {
                                     let _ = db.set_extension_enabled(&eid, false);
                                 }
-                                app.reload_profiles();
+                                app.reload_extensions_only();
                                 app.banner_message =
                                     Some(format!("Extension sync failed ({ename}): {e}"));
                             }
@@ -1173,7 +1201,7 @@ impl BonLoginApp {
                                 if let Ok(db) = app.db.lock() {
                                     let _ = db.set_extension_enabled(&eid, false);
                                 }
-                                app.reload_profiles();
+                                app.reload_extensions_only();
                                 app.banner_message =
                                     Some(format!("Extension task error ({ename}): {e}"));
                             }
@@ -1540,6 +1568,25 @@ impl BonLoginApp {
         let cookies_raw = modal.cookies_input.read(cx).value().to_string();
         match modal.build_profile(cx) {
             Ok(profile) => {
+                let normalized_cookies = if cookies_raw.trim().is_empty() {
+                    None
+                } else {
+                    match crate::launcher::parse_and_normalize_cookies(
+                        &cookies_raw,
+                        Some(&profile.startup_url),
+                    ) {
+                        Ok(bundle) => Some(bundle),
+                        Err(e) => {
+                            if let Some(m) = self.modal.as_mut() {
+                                m.active_tab = profile_modal::ProfileEditorTab::Cookies;
+                                m.validation_error = Some(format!("Cookies error: {e}"));
+                            }
+                            cx.notify();
+                            return;
+                        }
+                    }
+                };
+
                 if let Ok(db) = self.db.lock()
                     && let Err(e) = db.upsert_profile(&profile)
                 {
@@ -1549,14 +1596,52 @@ impl BonLoginApp {
                     cx.notify();
                     return;
                 }
-                let _ = crate::launcher::save_prelaunch_cookies(&profile.short_id(), &cookies_raw);
+
+                let short_id = profile.short_id();
+                let payload_to_save = normalized_cookies
+                    .as_ref()
+                    .map(|b| b.to_state_json_pretty())
+                    .unwrap_or_default();
+                let _ = crate::launcher::save_prelaunch_cookies(&short_id, &payload_to_save);
+
                 let saved_id = profile.id.clone();
                 let saved_name = profile.name.clone();
+                let live_pair = self.running_session_pair(&saved_id);
                 self.reload_profiles();
                 self.select_profile(&saved_id, window, cx);
                 self.active_view = WorkspaceView::Profiles;
-                self.banner_message = Some(format!("Saved profile '{saved_name}'"));
-                cx.notify();
+
+                if let (Some((sid, ws_url)), Some(bundle)) = (live_pair, normalized_cookies) {
+                    let badge = bundle.summary_badge();
+                    let state_str = bundle.to_state_json_pretty();
+                    let tokio_handle = self.tokio_handle.clone();
+                    let prof_name = saved_name.clone();
+                    self.banner_message = Some(format!(
+                        "Saved '{saved_name}' & injecting {badge} into live browser..."
+                    ));
+                    cx.notify();
+                    cx.spawn(async move |this, cx| {
+                        let res = tokio_handle
+                            .spawn_blocking(move || {
+                                crate::launcher::agent_import_state_or_cookies(
+                                    &sid, &ws_url, &state_str,
+                                )
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+                        let _ = this.update(cx, |app, cx| {
+                            app.banner_message = Some(match res {
+                                Ok(msg) => format!("Saved '{prof_name}' • {msg}"),
+                                Err(e) => format!("Saved '{prof_name}', live cookie inject failed: {e}"),
+                            });
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                } else {
+                    self.banner_message = Some(format!("Saved profile '{saved_name}'"));
+                    cx.notify();
+                }
             }
             Err(e) => {
                 if let Some(m) = self.modal.as_mut() {
@@ -1565,6 +1650,140 @@ impl BonLoginApp {
                 cx.notify();
             }
         }
+    }
+
+    pub fn set_modal_cookies_text(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(m) = self.modal.as_mut() else {
+            return;
+        };
+        m.validation_error = None;
+        m.cookies_input = cx.new(|cx| {
+            crate::ui::input::TextareaState::new(window, cx)
+                .rows(14)
+                .placeholder("Paste Cookie-Editor JSON [...], State JSON, J2Team JSON, Netscape .txt, cURL, or key=value...")
+                .default_value(text)
+        });
+        cx.notify();
+    }
+
+    pub fn pick_modal_cookie_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tokio_handle = self.tokio_handle.clone();
+        let startup_url = self
+            .modal
+            .as_ref()
+            .map(|m| m.startup_url_input.read(cx).value().to_string())
+            .unwrap_or_default();
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = tokio_handle
+                .spawn_blocking(move || -> anyhow::Result<Option<(String, String)>> {
+                    let out = std::process::Command::new("osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose file with prompt \"Choose Cookie File (.json or .txt)\")",
+                        ])
+                        .output()?;
+                    if !out.status.success() {
+                        return Ok(None);
+                    }
+                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if path_str.is_empty() {
+                        return Ok(None);
+                    }
+                    let raw = std::fs::read_to_string(&path_str)?;
+                    Ok(Some((path_str, raw)))
+                })
+                .await
+                .unwrap_or(Ok(None));
+
+            let _ = this.update_in(cx, |app, window, cx| match loaded {
+                Ok(Some((path_str, raw))) => {
+                    match crate::launcher::parse_and_normalize_cookies(&raw, Some(&startup_url)) {
+                        Ok(bundle) => {
+                            let badge = bundle.summary_badge();
+                            app.set_modal_cookies_text(bundle.to_state_json_pretty(), window, cx);
+                            app.banner_message =
+                                Some(format!("Imported {badge} from {path_str}"));
+                        }
+                        Err(e) => {
+                            app.set_modal_cookies_text(raw, window, cx);
+                            if let Some(m) = app.modal.as_mut() {
+                                m.validation_error = Some(format!("Cookie file error: {e}"));
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    app.banner_message = Some(format!("Failed to read cookie file: {e}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn paste_modal_cookies_from_clipboard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.banner_message = Some("Clipboard is empty".to_string());
+            cx.notify();
+            return;
+        };
+        if clip.trim().is_empty() {
+            self.banner_message = Some("Clipboard text is empty".to_string());
+            cx.notify();
+            return;
+        }
+        let startup_url = self
+            .modal
+            .as_ref()
+            .map(|m| m.startup_url_input.read(cx).value().to_string())
+            .unwrap_or_default();
+        match crate::launcher::parse_and_normalize_cookies(&clip, Some(&startup_url)) {
+            Ok(bundle) => {
+                let badge = bundle.summary_badge();
+                self.set_modal_cookies_text(bundle.to_state_json_pretty(), window, cx);
+                self.banner_message = Some(format!("Pasted & normalized {badge}"));
+            }
+            Err(_) => {
+                self.set_modal_cookies_text(clip, window, cx);
+                self.banner_message = Some("Pasted raw text from clipboard".to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn format_modal_cookies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(m) = self.modal.as_ref() else {
+            return;
+        };
+        let raw = m.cookies_input.read(cx).value().to_string();
+        let startup_url = m.startup_url_input.read(cx).value().to_string();
+        if raw.trim().is_empty() {
+            return;
+        }
+        match crate::launcher::parse_and_normalize_cookies(&raw, Some(&startup_url)) {
+            Ok(bundle) => {
+                let badge = bundle.summary_badge();
+                self.set_modal_cookies_text(bundle.to_state_json_pretty(), window, cx);
+                self.banner_message = Some(format!("Normalized {badge}"));
+            }
+            Err(e) => {
+                if let Some(m) = self.modal.as_mut() {
+                    m.validation_error = Some(format!("Cookie format error: {e}"));
+                }
+            }
+        }
+        cx.notify();
     }
 
     pub fn clone_profile(
@@ -1576,8 +1795,10 @@ impl BonLoginApp {
         let Some(orig) = self.profiles.iter().find(|p| p.id == profile_id) else {
             return;
         };
+        let src_sid = orig.short_id();
         let cloned = orig.cloned_with_new_seed();
         let new_id = cloned.id.clone();
+        crate::launcher::copy_prelaunch_cookies(&src_sid, &cloned.short_id());
         if let Ok(db) = self.db.lock() {
             let _ = db.upsert_profile(&cloned);
         }
@@ -1706,17 +1927,20 @@ impl BonLoginApp {
         let target_group = self.batch_selected_group.trim().to_string();
         let mut moved = 0usize;
         if let Ok(db) = self.db.lock() {
-            for mut prof in self
-                .profiles
-                .iter()
-                .filter(|p| self.checked_profile_ids.contains(&p.id))
-                .cloned()
-            {
-                prof.group_tag = target_group.clone();
-                if db.upsert_profile(&prof).is_ok() {
-                    moved += 1;
+            let _ = db.with_transaction(|db| {
+                for mut prof in self
+                    .profiles
+                    .iter()
+                    .filter(|p| self.checked_profile_ids.contains(&p.id))
+                    .cloned()
+                {
+                    prof.group_tag = target_group.clone();
+                    if db.upsert_profile(&prof).is_ok() {
+                        moved += 1;
+                    }
                 }
-            }
+                Ok(())
+            });
         }
         self.reload_profiles();
         if let Some(sel) = self.selected_profile_id.clone() {
@@ -1785,30 +2009,33 @@ impl BonLoginApp {
         let mut updated = 0usize;
 
         if let Ok(db) = self.db.lock() {
-            for (idx, mut prof) in targets.into_iter().enumerate() {
-                prof.seed = crate::models::Profile::random_seed();
-                prof.os_platform = target_os;
-                prof.os_version = target_os.os_version_for_seed(prof.seed).to_string();
-                prof.brand = target_brand;
-                prof.brand_version = target_brand.version_for_seed(prof.seed).to_string();
-                prof.gpu_spoofing = crate::models::GpuSpoofMode::SeedGenerated;
-                prof.hardware_concurrency = target_os.optimal_cores_for_seed(prof.seed);
-                prof.window_size = target_os.default_window_size().to_string();
-                if !prefix.is_empty() && prefix != "Profile" {
-                    prof.name = format!("{prefix}-{:02}", idx + 1);
+            let _ = db.with_transaction(|db| {
+                for (idx, mut prof) in targets.into_iter().enumerate() {
+                    prof.seed = crate::models::Profile::random_seed();
+                    prof.os_platform = target_os;
+                    prof.os_version = target_os.os_version_for_seed(prof.seed).to_string();
+                    prof.brand = target_brand;
+                    prof.brand_version = target_brand.version_for_seed(prof.seed).to_string();
+                    prof.gpu_spoofing = crate::models::GpuSpoofMode::SeedGenerated;
+                    prof.hardware_concurrency = target_os.optimal_cores_for_seed(prof.seed);
+                    prof.window_size = target_os.default_window_size().to_string();
+                    if !prefix.is_empty() && prefix != "Profile" {
+                        prof.name = format!("{prefix}-{:02}", idx + 1);
+                    }
+                    if !group.is_empty() {
+                        prof.group_tag = group.clone();
+                    }
+                    if !pool.is_empty() {
+                        let chosen = &pool[idx % pool.len()];
+                        prof.proxy = Some(chosen.config.clone());
+                        prof.resolved_geo = chosen.resolved_geo.clone();
+                    }
+                    if db.upsert_profile(&prof).is_ok() {
+                        updated += 1;
+                    }
                 }
-                if !group.is_empty() {
-                    prof.group_tag = group.clone();
-                }
-                if !pool.is_empty() {
-                    let chosen = &pool[idx % pool.len()];
-                    prof.proxy = Some(chosen.config.clone());
-                    prof.resolved_geo = chosen.resolved_geo.clone();
-                }
-                if db.upsert_profile(&prof).is_ok() {
-                    updated += 1;
-                }
-            }
+                Ok(())
+            });
         }
         self.reload_profiles();
         if let Some(sel) = self.selected_profile_id.clone() {
@@ -1856,11 +2083,18 @@ impl BonLoginApp {
             })
             .detach();
         } else {
-            let saved = crate::launcher::read_prelaunch_cookies(&prof.short_id());
-            let payload = if saved.trim().is_empty() {
-                "[]".to_string()
-            } else {
+            let sid = prof.short_id();
+            let saved = crate::launcher::read_prelaunch_cookies(&sid);
+            let payload = if !saved.trim().is_empty() {
                 saved
+            } else {
+                let state_path = crate::launcher::app_support_dir()
+                    .join("states")
+                    .join(format!("bon_{sid}_state.json"));
+                std::fs::read_to_string(state_path)
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "[]".to_string())
             };
             cx.write_to_clipboard(ClipboardItem::new_string(payload));
             self.banner_message = Some(format!(
@@ -2000,13 +2234,16 @@ impl BonLoginApp {
             .collect();
         let mut updated = 0usize;
         if let Ok(db) = self.db.lock() {
-            for mut prof in targets {
-                prof.proxy = Some(sp.config.clone());
-                prof.resolved_geo = sp.resolved_geo.clone();
-                if db.upsert_profile(&prof).is_ok() {
-                    updated += 1;
+            let _ = db.with_transaction(|db| {
+                for mut prof in targets {
+                    prof.proxy = Some(sp.config.clone());
+                    prof.resolved_geo = sp.resolved_geo.clone();
+                    if db.upsert_profile(&prof).is_ok() {
+                        updated += 1;
+                    }
                 }
-            }
+                Ok(())
+            });
         }
         self.reload_profiles();
         if let Some(sel) = self.selected_profile_id.clone() {
@@ -2042,19 +2279,22 @@ impl BonLoginApp {
         }
         let mut updated = 0usize;
         if let Ok(db) = self.db.lock() {
-            for (idx, mut prof) in targets.into_iter().enumerate() {
-                if self.batch_proxy_group == "None" {
-                    prof.proxy = None;
-                    prof.resolved_geo = None;
-                } else {
-                    let chosen = &pool[idx % pool.len()];
-                    prof.proxy = Some(chosen.config.clone());
-                    prof.resolved_geo = chosen.resolved_geo.clone();
+            let _ = db.with_transaction(|db| {
+                for (idx, mut prof) in targets.into_iter().enumerate() {
+                    if self.batch_proxy_group == "None" {
+                        prof.proxy = None;
+                        prof.resolved_geo = None;
+                    } else {
+                        let chosen = &pool[idx % pool.len()];
+                        prof.proxy = Some(chosen.config.clone());
+                        prof.resolved_geo = chosen.resolved_geo.clone();
+                    }
+                    if db.upsert_profile(&prof).is_ok() {
+                        updated += 1;
+                    }
                 }
-                if db.upsert_profile(&prof).is_ok() {
-                    updated += 1;
-                }
-            }
+                Ok(())
+            });
         }
         self.reload_profiles();
         if let Some(sel) = self.selected_profile_id.clone() {
@@ -2088,9 +2328,12 @@ impl BonLoginApp {
             }
         }
         if let Ok(db) = self.db.lock() {
-            for id in &deletable_ids {
-                let _ = db.delete_profile(id);
-            }
+            let _ = db.with_transaction(|db| {
+                for id in &deletable_ids {
+                    let _ = db.delete_profile(id);
+                }
+                Ok(())
+            });
         }
         for id in &deletable_ids {
             let _ = crate::launcher::wipe_profile_data(id);
@@ -2127,18 +2370,12 @@ impl BonLoginApp {
         cx.notify();
 
         let tokio_handle = self.tokio_handle.clone();
-        let sem = self.proxy_check_sem.clone();
         let db = self.db.clone();
         let proxy_for_sync = profile.proxy.clone();
 
         let join_handle = tokio_handle.spawn(async move {
-            let _permit = sem.acquire_owned().await;
             if let Some(proxy_cfg) = profile.proxy {
-                let mut tunnel = LocalProxyTunnel::start(proxy_cfg).await?;
-                let port = tunnel.local_port();
-                let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
-                tunnel.stop();
-                geo_res
+                crate::launcher::check_proxy_config_live(&proxy_cfg).await
             } else {
                 crate::geoip::resolve_geo_via_port(None).await
             }
@@ -2172,23 +2409,13 @@ impl BonLoginApp {
                 match res {
                     Ok(geo) => {
                         if let Ok(db_guard) = db.lock() {
-                            let _ = db_guard.update_resolved_geo(&pid, Some(&geo));
                             if let Some(cfg) = &proxy_for_sync {
-                                for sp in &app.saved_proxies {
-                                    if sp.config.protocol == cfg.protocol
-                                        && sp.config.host == cfg.host
-                                        && sp.config.port == cfg.port
-                                    {
-                                        let _ = db_guard.update_saved_proxy_check(
-                                            &sp.id,
-                                            Some(&geo),
-                                            None,
-                                        );
-                                    }
-                                }
+                                let _ = db_guard.sync_geo_for_proxy_endpoint(cfg, &geo);
+                            } else {
+                                let _ = db_guard.update_resolved_geo(&pid, Some(&geo));
                             }
                         }
-                        app.reload_profiles();
+                        app.reload_proxies_and_profiles();
                         if !still_running {
                             app.statuses.insert(pid.clone(), ProfileStatus::Stopped);
                         }
@@ -2438,7 +2665,7 @@ impl Render for BonLoginApp {
                     "Create Profile"
                 }
             }
-            WorkspaceView::BulkBackup => "Extensions",
+            WorkspaceView::Extensions => "Extensions",
         };
         let app_entity = cx.entity().clone();
 
@@ -2607,8 +2834,8 @@ impl Render for BonLoginApp {
                                     ))
                                     .child(sidebar_nav_item(
                                         "\u{10096e}   Extensions",
-                                        active_view == WorkspaceView::BulkBackup,
-                                        WorkspaceView::BulkBackup,
+                                        active_view == WorkspaceView::Extensions,
+                                        WorkspaceView::Extensions,
                                         cx,
                                     )),
                             ),
@@ -3112,7 +3339,7 @@ impl Render for BonLoginApp {
                                 div().child("No profile loaded").into_any_element()
                             }
                         }
-                        WorkspaceView::BulkBackup => render_bulk_backup_view(self, cx)
+                        WorkspaceView::Extensions => render_extensions_view(self, cx)
                             .with_animation(
                                 "view-extensions-enter",
                                 Animation::new(Duration::from_millis(140))

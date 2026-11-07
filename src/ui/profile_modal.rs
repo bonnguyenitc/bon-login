@@ -78,6 +78,8 @@ pub struct ProfileModalState {
     pub startup_url_input: Entity<InputState>,
     pub notes_input: Entity<InputState>,
     pub cookies_input: Entity<TextareaState>,
+    pub cookies_cache_key: std::cell::RefCell<String>,
+    pub cookies_cache_status: std::cell::RefCell<Option<Result<String, String>>>,
     pub validation_error: Option<String>,
 }
 
@@ -96,7 +98,22 @@ impl ProfileModalState {
         let url_val = profile.startup_url.clone();
         let notes_val = profile.notes.clone();
         let cookies_val = if is_edit {
-            crate::launcher::read_prelaunch_cookies(&profile.short_id())
+            let sid = profile.short_id();
+            let pre = crate::launcher::read_prelaunch_cookies(&sid);
+            if !pre.trim().is_empty() {
+                pre
+            } else {
+                let state_path = crate::launcher::app_support_dir()
+                    .join("states")
+                    .join(format!("bon_{sid}_state.json"));
+                std::fs::read_to_string(state_path)
+                    .ok()
+                    .filter(|s| {
+                        crate::launcher::parse_and_normalize_cookies(s, None)
+                            .is_ok_and(|b| !b.cookies.is_empty() || !b.origins.is_empty())
+                    })
+                    .unwrap_or_default()
+            }
         } else {
             String::new()
         };
@@ -165,6 +182,8 @@ impl ProfileModalState {
                     .placeholder("Optional: Paste Cookie JSON or State JSON to auto-inject on Launch...")
                     .default_value(cookies_val)
             }),
+            cookies_cache_key: std::cell::RefCell::new(String::new()),
+            cookies_cache_status: std::cell::RefCell::new(None),
             validation_error: None,
         }
     }
@@ -291,6 +310,34 @@ pub fn render_edit_profile_view(
     let url_preview = {
         let v = modal.startup_url_input.read(cx).value().trim().to_string();
         if v.is_empty() { "-".to_string() } else { v }
+    };
+    let cookies_raw_ref = modal.cookies_input.read(cx).value();
+    if modal.cookies_cache_key.borrow().as_str() != cookies_raw_ref.as_ref() {
+        let trimmed = cookies_raw_ref.trim();
+        let status = if trimmed.is_empty() {
+            None
+        } else {
+            Some(
+                crate::launcher::parse_and_normalize_cookies(trimmed, Some(&url_preview))
+                    .map(|b| {
+                        if b.cookies.is_empty() && b.origins.is_empty() {
+                            String::new()
+                        } else {
+                            b.summary_badge()
+                        }
+                    })
+                    .map_err(|e| e.to_string()),
+            )
+        };
+        *modal.cookies_cache_key.borrow_mut() = cookies_raw_ref.to_string();
+        *modal.cookies_cache_status.borrow_mut() = status;
+    }
+    let cookies_parse_status = modal.cookies_cache_status.borrow().clone();
+    let cookies_detail_str = match &cookies_parse_status {
+        None => "None".to_string(),
+        Some(Ok(badge)) if badge.is_empty() => "Empty".to_string(),
+        Some(Ok(badge)) => badge.clone(),
+        Some(Err(_)) => "Invalid format".to_string(),
     };
     let proxy_mode = modal.proxy_mode;
     let selected_proxy = modal.selected_proxy.clone();
@@ -1556,40 +1603,167 @@ pub fn render_edit_profile_view(
                                         .w_full()
                                         .justify_between()
                                         .items_center()
+                                        .gap_2()
                                         .child(field_label(
-                                            "Import or Export Cookies as JSON file",
+                                            "Import or Export Cookies",
                                         ))
                                         .child(
-                                            Button::new("modal-copy-cookies")
-                                                .with_variant(BonTheme::row_action(cx))
-                                                .small()
-                                                .label("Copy Cookies JSON")
-                                                .on_click(cx.listener(|app, _, _, cx| {
-                                                    if let Some(m) = app.modal.as_ref() {
-                                                        let c = m
-                                                            .cookies_input
-                                                            .read(cx)
-                                                            .value()
-                                                            .to_string();
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(c),
-                                                        );
-                                                        app.banner_message = Some(
-                                                            "Copied profile cookies JSON to clipboard"
-                                                                .to_string(),
-                                                        );
-                                                        cx.notify();
-                                                    }
-                                                })),
+                                            h_flex()
+                                                .gap_1p5()
+                                                .items_center()
+                                                .child(
+                                                    Button::new("modal-import-cookie-file")
+                                                        .with_variant(BonTheme::outline_blue(cx))
+                                                        .small()
+                                                        .label(format!(
+                                                            "{} Import File",
+                                                            SfSymbol::ARROW_UP_DOC
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            |app, _, window, cx| {
+                                                                app.pick_modal_cookie_file(
+                                                                    window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("modal-paste-cookies")
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .small()
+                                                        .label(format!(
+                                                            "{} Paste",
+                                                            SfSymbol::DOC_ON_DOC
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            |app, _, window, cx| {
+                                                                app.paste_modal_cookies_from_clipboard(
+                                                                    window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("modal-format-cookies")
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .small()
+                                                        .label(format!(
+                                                            "{} Format JSON",
+                                                            SfSymbol::CHECKMARK
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            |app, _, window, cx| {
+                                                                app.format_modal_cookies(
+                                                                    window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("modal-copy-cookies")
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .small()
+                                                        .label(format!(
+                                                            "{} Copy JSON",
+                                                            SfSymbol::ARROW_DOWN_DOC
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            |app, _, _, cx| {
+                                                                if let Some(m) = app.modal.as_ref()
+                                                                {
+                                                                    let c = m
+                                                                        .cookies_input
+                                                                        .read(cx)
+                                                                        .value()
+                                                                        .to_string();
+                                                                    cx.write_to_clipboard(
+                                                                        ClipboardItem::new_string(c),
+                                                                    );
+                                                                    app.banner_message = Some(
+                                                                        "Copied profile cookies JSON to clipboard"
+                                                                            .to_string(),
+                                                                    );
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new("modal-clear-cookies")
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .small()
+                                                        .label(format!(
+                                                            "{} Clear",
+                                                            SfSymbol::TRASH
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            |app, _, window, cx| {
+                                                                app.set_modal_cookies_text(
+                                                                    String::new(),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                                app.banner_message = Some(
+                                                                    "Cleared cookies input"
+                                                                        .to_string(),
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                ),
                                         ),
                                 )
+                                .child(match &cookies_parse_status {
+                                    None => div()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .bg(BonTheme::bg_well())
+                                        .text_xs()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child(
+                                            "Supports: Cookie-Editor JSON [...], Playwright State JSON, J2Team JSON, Netscape .txt, cURL, or raw key=value (auto-detects FB/Google/TikTok/X/Shopee).",
+                                        ),
+                                    Some(Ok(badge)) => div()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .bg(BonTheme::bg_well())
+                                        .border_1()
+                                        .border_color(BonTheme::success())
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::success())
+                                        .child(format!(
+                                            "{}  Ready to inject: {}",
+                                            SfSymbol::CHECKMARK_CIRCLE_FILL,
+                                            if badge.is_empty() { "Empty" } else { badge }
+                                        )),
+                                    Some(Err(err)) => div()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .bg(BonTheme::danger_bg())
+                                        .border_1()
+                                        .border_color(BonTheme::danger())
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::danger())
+                                        .child(format!(
+                                            "{}  Invalid cookie format: {err}",
+                                            SfSymbol::EXCLAMATIONMARK_TRIANGLE_FILL
+                                        )),
+                                })
                                 .child(
                                     v_flex()
                                         .w_full()
                                         .flex_1()
                                         .gap_1p5()
                                         .child(field_label(
-                                            "Paste Cookie JSON / Auth State JSON (auto-injected when launching profile):",
+                                            "Paste Cookies (auto-normalized & injected when launching or updating profile):",
                                         ))
                                         .child(Textarea::new(&modal.cookies_input).w_full()),
                                 )
@@ -1647,6 +1821,7 @@ pub fn render_edit_profile_view(
                             format!("{cores} Cores / {ram_preview} GB"),
                         ))
                         .child(detail_summary_row("Start URL", url_preview))
+                        .child(detail_summary_row("Cookies", cookies_detail_str))
                         .child(detail_summary_row("Proxy", proxy_detail_str))
                         .child(detail_summary_row(
                             "WebRTC",
@@ -1695,7 +1870,7 @@ pub fn render_edit_profile_view(
         )
 }
 
-fn detail_summary_row(label: &'static str, value: String) -> Div {
+pub fn detail_summary_row(label: &'static str, value: String) -> Div {
     h_flex()
         .w_full()
         .min_w_0()
@@ -1728,7 +1903,7 @@ fn detail_summary_row(label: &'static str, value: String) -> Div {
 }
 
 /// GenLogin 3.0 `Extensions` View (`docs/genlogin-3.0/assets/menu-bar_extensions_01.png`)
-pub fn render_bulk_backup_view(
+pub fn render_extensions_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
 ) -> Div {

@@ -205,19 +205,13 @@ impl SfSymbol {
     pub const MINUS: &'static str = "\u{10017d}";
     pub const CHECKMARK: &'static str = "\u{100185}";
     pub const XMARK: &'static str = "\u{100184}";
-    pub const SQUARE_GRID_2X2: &'static str = "\u{1001f7}";
-    pub const SQUARE_GRID_2X2_FILL: &'static str = "\u{100688}";
-    pub const NETWORK: &'static str = "\u{100906}";
     pub const GLOBE: &'static str = "\u{1001aa}";
-    pub const PUZZLEPIECE_EXTENSION: &'static str = "\u{10096d}";
     pub const PUZZLEPIECE_EXTENSION_FILL: &'static str = "\u{10096e}";
     pub const BOLT_FILL: &'static str = "\u{1002e6}";
-    pub const FOLDER: &'static str = "\u{100215}";
     pub const FOLDER_FILL: &'static str = "\u{100216}";
     pub const TRASH: &'static str = "\u{100211}";
     pub const PENCIL: &'static str = "\u{10020a}";
     pub const SLIDER_HORIZONTAL_3: &'static str = "\u{100306}";
-    pub const GEARSHAPE: &'static str = "\u{1008cb}";
     pub const GEARSHAPE_FILL: &'static str = "\u{1008cc}";
     pub const ARROW_CLOCKWISE: &'static str = "\u{100148}";
     pub const ARROW_TRIANGLE_2_CIRCLEPATH: &'static str = "\u{1002af}";
@@ -229,10 +223,6 @@ impl SfSymbol {
     pub const ELLIPSIS: &'static str = "\u{100360}";
     pub const DOC_ON_DOC: &'static str = "\u{100241}";
     pub const PLUS_SQUARE_ON_SQUARE: &'static str = "\u{100add}";
-    pub const MAGNIFYINGGLASS: &'static str = "\u{1002ab}";
-    pub const CHEVRON_UP: &'static str = "\u{100187}";
-    pub const CHEVRON_DOWN: &'static str = "\u{100188}";
-    pub const CHEVRON_LEFT: &'static str = "\u{100189}";
     pub const CHEVRON_RIGHT: &'static str = "\u{10018a}";
     pub const ICLOUD_AND_ARROW_UP: &'static str = "\u{100315}";
     pub const LINK: &'static str = "\u{100263}";
@@ -243,11 +233,9 @@ impl SfSymbol {
     pub const INFO_CIRCLE_FILL: &'static str = "\u{100175}";
     pub const EXCLAMATIONMARK_TRIANGLE_FILL: &'static str = "\u{1001ff}";
     pub const APPLE_LOGO: &'static str = "\u{1008fa}";
-    pub const DESKTOPCOMPUTER: &'static str = "\u{100657}";
     pub const PC: &'static str = "\u{10097a}";
     pub const CALENDAR: &'static str = "\u{100249}";
     pub const CLOCK_ARROW_CIRCLEPATH: &'static str = "\u{1008d4}";
     pub const TAG_FILL: &'static str = "\u{1002e2}";
     pub const SIDEBAR_RIGHT: &'static str = "\u{1003db}";
-    pub const KEY_FILL: &'static str = "\u{1007d6}";
 }

@@ -156,8 +156,6 @@ impl PlatformType {
 pub enum BrowserBrand {
     Chrome,
     Edge,
-    Opera,
-    Vivaldi,
 }
 
 impl BrowserBrand {
@@ -166,7 +164,7 @@ impl BrowserBrand {
 
     pub fn as_cli_str(&self) -> &'static str {
         match self {
-            Self::Chrome | Self::Opera | Self::Vivaldi => "Chrome",
+            Self::Chrome => "Chrome",
             Self::Edge => "Edge",
         }
     }
@@ -228,13 +226,6 @@ impl GpuSpoofMode {
         match self {
             Self::NativePassthrough => "native",
             Self::SeedGenerated => "seed",
-        }
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::NativePassthrough => "Native GPU",
-            Self::SeedGenerated => "Seed GPU",
         }
     }
 
@@ -569,9 +560,7 @@ impl SavedProxy {
                 m_s.trim().parse::<u32>(),
                 y_s.trim().parse::<i32>(),
             )
-            && (1..=31).contains(&d)
-            && (1..=12).contains(&m)
-            && y >= 2000
+            && valid_civil_date(y, m, d)
         {
             return Some(days_from_civil(y, m, d) * 86_400 + 86_399);
         }
@@ -581,14 +570,26 @@ impl SavedProxy {
                 m_s.trim().parse::<u32>(),
                 d_s.trim().parse::<u32>(),
             )
-            && (1..=31).contains(&d)
-            && (1..=12).contains(&m)
-            && y >= 2000
+            && valid_civil_date(y, m, d)
         {
             return Some(days_from_civil(y, m, d) * 86_400 + 86_399);
         }
         None
     }
+}
+
+fn valid_civil_date(y: i32, m: u32, d: u32) -> bool {
+    if !(2000..=2200).contains(&y) || !(1..=12).contains(&m) || d == 0 {
+        return false;
+    }
+    let max_d = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    d <= max_d
 }
 
 pub fn format_unix_dd_mm_yyyy(ts: i64) -> String {
@@ -736,23 +737,24 @@ impl Profile {
             return false;
         }
 
-        let q = query.trim().to_ascii_lowercase();
+        let q = query.trim();
         if q.is_empty() {
             return true;
         }
 
-        self.name.to_ascii_lowercase().contains(&q)
-            || self.group_tag.to_ascii_lowercase().contains(&q)
-            || self.notes.to_ascii_lowercase().contains(&q)
-            || self.seed.to_string().contains(&q)
+        contains_ignore_ascii_case(&self.name, q)
+            || contains_ignore_ascii_case(&self.id, q)
+            || contains_ignore_ascii_case(&self.group_tag, q)
+            || contains_ignore_ascii_case(&self.notes, q)
             || self
                 .proxy
                 .as_ref()
-                .is_some_and(|p| p.host.to_ascii_lowercase().contains(&q))
+                .is_some_and(|p| contains_ignore_ascii_case(&p.host, q))
             || self.resolved_geo.as_ref().is_some_and(|g| {
-                g.ip.to_ascii_lowercase().contains(&q)
-                    || g.country_code.to_ascii_lowercase().contains(&q)
+                contains_ignore_ascii_case(&g.ip, q)
+                    || contains_ignore_ascii_case(&g.country_code, q)
             })
+            || (q.bytes().all(|b| b.is_ascii_digit()) && u32_contains_digits(self.seed, q))
     }
 
     pub fn short_id(&self) -> String {
@@ -867,6 +869,33 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+#[inline]
+pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let n = needle.as_bytes();
+    n.is_empty()
+        || haystack
+            .as_bytes()
+            .windows(n.len())
+            .any(|w| w.eq_ignore_ascii_case(n))
+}
+
+#[inline]
+fn u32_contains_digits(mut n: u32, needle: &str) -> bool {
+    let mut buf = [0u8; 10];
+    let mut i = 10;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf[i..]
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,6 +966,13 @@ mod tests {
         p.spoof_font = false;
         p.gpu_spoofing = GpuSpoofMode::NativePassthrough;
         assert_eq!(p.disabled_spoofing_csv().as_deref(), Some("font,gpu"));
+        let sid = p.short_id();
+        assert!(p.matches_filter(&sid.to_ascii_uppercase(), None));
+        assert!(p.matches_filter("test mac", None));
+        assert!(!p.matches_filter("nonexistent", None));
+        p.seed = 987654321;
+        assert!(p.matches_filter("7654", None));
+        assert!(!p.matches_filter("1111", None));
     }
 
     #[test]
@@ -951,11 +987,107 @@ mod tests {
         p.notes = "2FA enabled - FB Ads Campaign Alpha\nLine 2".to_string();
         assert_eq!(p.short_note(12).as_deref(), Some("2FA enabled…"));
 
+        assert!(SavedProxy::parse_expiration_input("31/02/2026").is_none());
+        assert!(SavedProxy::parse_expiration_input("2026-04-31").is_none());
+        assert!(SavedProxy::parse_expiration_input("29/02/2028").is_some());
+
         let sid = "testck01";
+        let dst_sid = "testck02";
         crate::launcher::save_prelaunch_cookies(sid, "[{\"name\":\"c_user\",\"value\":\"1\"}]")
             .unwrap();
         assert!(crate::launcher::read_prelaunch_cookies(sid).contains("c_user"));
+        crate::launcher::copy_prelaunch_cookies(sid, dst_sid);
+        assert!(crate::launcher::read_prelaunch_cookies(dst_sid).contains("c_user"));
         crate::launcher::save_prelaunch_cookies(sid, "   ").unwrap();
+        crate::launcher::save_prelaunch_cookies(dst_sid, "   ").unwrap();
         assert!(crate::launcher::read_prelaunch_cookies(sid).is_empty());
+    }
+
+    #[test]
+    fn test_universal_cookie_parser_all_formats() {
+        // 1. Cookie-Editor JSON array (`expirationDate`, `sameSite: "no_restriction"` / `"unspecified"`, `hostOnly`)
+        let cookie_editor = r#"[
+            {
+                "name": "c_user",
+                "value": "1000888999",
+                "domain": ".facebook.com",
+                "hostOnly": false,
+                "path": "/",
+                "secure": true,
+                "httpOnly": false,
+                "sameSite": "no_restriction",
+                "session": false,
+                "expirationDate": 1825502626.5
+            },
+            {
+                "name": "__Host-csrf",
+                "value": "tok123",
+                "domain": ".facebook.com",
+                "path": "/login",
+                "sameSite": "unspecified",
+                "session": true
+            }
+        ]"#;
+        let b1 = crate::launcher::parse_and_normalize_cookies(cookie_editor, None).unwrap();
+        assert_eq!(b1.format_label, "Cookie-Editor JSON");
+        assert_eq!(b1.cookies.len(), 2);
+        assert_eq!(b1.cookies[0]["sameSite"], "None");
+        assert_eq!(b1.cookies[0]["secure"], true);
+        assert_eq!(b1.cookies[0]["expires"], 1825502626.5);
+        // __Host- cookie must strip leading dot, force path "/", force secure: true, and omit unspecified sameSite
+        assert_eq!(b1.cookies[1]["domain"], "facebook.com");
+        assert_eq!(b1.cookies[1]["path"], "/");
+        assert_eq!(b1.cookies[1]["secure"], true);
+        assert!(b1.cookies[1].get("sameSite").is_none());
+
+        // 2. J2Team JSON (`{"url": ..., "cookies": [...]}`)
+        let j2team = r#"{
+            "url": "https://shopee.vn",
+            "cookies": [
+                {"name": "SPC_EC", "value": "abc", "expirationDate": 1890000000000}
+            ]
+        }"#;
+        let b2 = crate::launcher::parse_and_normalize_cookies(j2team, None).unwrap();
+        assert_eq!(b2.format_label, "J2Team Cookie JSON");
+        assert_eq!(b2.cookies.len(), 1);
+        assert_eq!(b2.cookies[0]["domain"], "shopee.vn");
+        assert_eq!(b2.cookies[0]["expires"], 1890000000.0);
+
+        // 3. Cookie & Token Grabber JSON (`url` + `cookie` string + `localStorage`)
+        let grabber = r#"{
+            "url": "https://app.example.com/dashboard",
+            "cookie": "sid=xyz987; theme=dark",
+            "localStorage": {"auth_jwt": "eyJhbG..."}
+        }"#;
+        let b3 = crate::launcher::parse_and_normalize_cookies(grabber, None).unwrap();
+        assert_eq!(b3.cookies.len(), 2);
+        assert_eq!(b3.origins.len(), 1);
+        assert_eq!(b3.origins[0]["origin"], "https://app.example.com");
+
+        // 4. Netscape HTTP Cookie File (including `#HttpOnly_`)
+        let netscape = "\
+# Netscape HTTP Cookie File
+#HttpOnly_.facebook.com\tTRUE\t/\tTRUE\t1800000000\txs\t44%3Asecret
+.facebook.com\tTRUE\t/\tTRUE\t1800000000\tc_user\t1000111222
+";
+        let b4 = crate::launcher::parse_and_normalize_cookies(netscape, None).unwrap();
+        assert_eq!(b4.format_label, "Netscape Cookie File");
+        assert_eq!(b4.cookies.len(), 2);
+        assert_eq!(b4.cookies[0]["httpOnly"], true);
+        assert_eq!(b4.cookies[0]["name"], "xs");
+
+        // 5. cURL command
+        let curl_cmd = "curl 'https://x.com/home' -H 'Cookie: auth_token=tok_abc; ct0=csrf_123'";
+        let b5 = crate::launcher::parse_and_normalize_cookies(curl_cmd, None).unwrap();
+        assert_eq!(b5.format_label, "cURL Command");
+        assert_eq!(b5.cookies.len(), 2);
+        assert_eq!(b5.domains, vec!["x.com"]);
+
+        // 6. MMO Pipe account string (`UID|Pass|2FA|c_user=...; xs=...`)
+        let mmo_line = "1000998877|Pass123!|JBSWY3DPEHPK3PXP|c_user=1000998877; xs=28%3Aabcd; datr=xyz";
+        let b6 = crate::launcher::parse_and_normalize_cookies(mmo_line, None).unwrap();
+        assert_eq!(b6.format_label, "Raw Cookie String");
+        assert_eq!(b6.cookies.len(), 3);
+        assert_eq!(b6.domains, vec!["facebook.com"]);
     }
 }

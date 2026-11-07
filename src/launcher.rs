@@ -11,14 +11,10 @@ use std::time::Duration;
 pub struct KernelInfo {
     pub path: PathBuf,
     pub version_label: String,
-    pub is_adryfish_bundle: bool,
 }
 
 pub fn app_support_dir() -> PathBuf {
-    dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Library/Application Support")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("com.bonlogin.app")
+    crate::db::app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("com.bonlogin.app"))
 }
 
 /// Locates the `adryfish/fingerprint-chromium` binary on macOS.
@@ -31,7 +27,6 @@ pub fn locate_chromium_kernel() -> Option<KernelInfo> {
                 return Some(KernelInfo {
                     path: p,
                     version_label: "Custom Kernel (BONLOGIN_CHROMIUM_PATH)".to_string(),
-                    is_adryfish_bundle: true,
                 });
             }
         }
@@ -44,7 +39,6 @@ pub fn locate_chromium_kernel() -> Option<KernelInfo> {
             return Some(KernelInfo {
                 path: direct_app,
                 version_label: "adryfish Chromium (Bundled)".to_string(),
-                is_adryfish_bundle: true,
             });
         }
 
@@ -66,7 +60,6 @@ pub fn locate_chromium_kernel() -> Option<KernelInfo> {
                     return Some(KernelInfo {
                         path: candidate,
                         version_label: folder_name.to_string(),
-                        is_adryfish_bundle: true,
                     });
                 }
             }
@@ -78,7 +71,6 @@ pub fn locate_chromium_kernel() -> Option<KernelInfo> {
         return Some(KernelInfo {
             path: system_app,
             version_label: "Applications/Chromium.app".to_string(),
-            is_adryfish_bundle: true,
         });
     }
 
@@ -1122,7 +1114,9 @@ pub fn ensure_extension_unpacked(ext: &BrowserExtension) -> Result<PathBuf> {
         app_support_dir().join("extensions").join(&ext.id)
     };
     if ext_dir.join("manifest.json").is_file() {
-        patch_unpacked_extension_for_agent(&ext_dir, &ext.id, None);
+        if !ext_dir.join("__bon_ext_shim.js").is_file() {
+            patch_unpacked_extension_for_agent(&ext_dir, &ext.id, None);
+        }
         return Ok(ext_dir);
     }
     std::fs::create_dir_all(&ext_dir)?;
@@ -1236,27 +1230,42 @@ pub async fn sync_enabled_remote_extensions() {
         })
         .collect();
 
+    let mut set = tokio::task::JoinSet::new();
     for ext in enabled_remote {
-        let store_url = ext.source_url.trim().to_string();
-        let eid = ext.id.clone();
-        let still_enabled = || {
-            crate::db::Database::open_fast()
-                .ok()
-                .and_then(|db| db.list_extensions().ok())
-                .is_some_and(|list| list.iter().any(|e| e.id == eid && e.enabled))
-        };
-        if !still_enabled() {
-            continue;
-        }
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        if download_extension_from_url_cancellable(&store_url, Some(&eid), &cancelled)
-            .await
-            .is_ok()
-            && !still_enabled()
-        {
-            remove_extension_files(&eid);
-        }
+        set.spawn(async move {
+            let store_url = ext.source_url.trim().to_string();
+            let eid = ext.id;
+            let still_enabled = || {
+                crate::db::Database::open_fast()
+                    .ok()
+                    .and_then(|db| db.list_extensions().ok())
+                    .is_some_and(|list| list.iter().any(|e| e.id == eid && e.enabled))
+            };
+            if !still_enabled() {
+                return;
+            }
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            if let Ok(downloaded) =
+                download_extension_from_url_cancellable(&store_url, Some(&eid), &cancelled).await
+            {
+                if let Ok(db) = crate::db::Database::open_fast() {
+                    if db
+                        .list_extensions()
+                        .ok()
+                        .is_some_and(|list| list.iter().any(|e| e.id == eid && e.enabled))
+                    {
+                        let _ = db.upsert_extension(&downloaded);
+                    } else {
+                        remove_extension_files(&eid);
+                    }
+                }
+            }
+        });
     }
+    let _ = tokio::time::timeout(Duration::from_secs(8), async {
+        while set.join_next().await.is_some() {}
+    })
+    .await;
 }
 
 /// Removes an unpacked extension directory from disk.
@@ -1432,10 +1441,29 @@ pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
         return None;
     };
 
-    if cdp_has_open_window(info.cdp_port) == Some(true) {
-        Some(info)
-    } else {
-        None
+    let pid_alive = info.pid > 0
+        && Command::new("kill")
+            .args(["-0", &info.pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    if info.pid > 0 && !pid_alive {
+        let _ = std::fs::remove_file(&rt_path);
+        let _ = std::fs::remove_file(&active_port_path);
+        return None;
+    }
+
+    match cdp_has_open_window(info.cdp_port) {
+        Some(true) => Some(info),
+        Some(false) => None,
+        None if pid_alive => Some(info),
+        None => {
+            let _ = std::fs::remove_file(&rt_path);
+            let _ = std::fs::remove_file(&active_port_path);
+            None
+        }
     }
 }
 
@@ -1461,6 +1489,17 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
 
     let mut stopped_any = false;
     if let Some(info) = maybe_info {
+        if !short_id.is_empty()
+            && cdp_has_open_window(info.cdp_port) == Some(true)
+            && let Ok((_, live_json)) = agent_export_state(short_id, &info.ws_url)
+        {
+            let pre_path = app_support_dir()
+                .join("states")
+                .join(format!("bon_{short_id}_prelaunch.json"));
+            if pre_path.is_file() {
+                let _ = std::fs::write(pre_path, live_json);
+            }
+        }
         if info.pid > 0 {
             #[cfg(unix)]
             {
@@ -1471,8 +1510,15 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
-                for _ in 0..30 {
-                    if cdp_has_open_window(info.cdp_port).is_none() {
+                for _ in 0..40 {
+                    let alive = Command::new("kill")
+                        .args(["-0", &pid_s])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !alive {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(50));
@@ -1486,7 +1532,7 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
             }
             stopped_any = true;
         } else if let Some(list_body) = cdp_http_get_body(info.cdp_port, "/json/list")
-            && let Ok( serde_json::Value::Array(arr) ) = serde_json::from_str(&list_body)
+            && let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&list_body)
         {
             for item in arr {
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
@@ -1512,10 +1558,25 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
 }
 
 pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
-    let dir = app_support_dir().join("profiles").join(profile_id);
+    let profiles_root = app_support_dir().join("profiles");
+    let dir = profiles_root.join(profile_id);
     if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("Failed to wipe profile dir {}", dir.display()))?;
+        let trash_dir = profiles_root.join(format!(
+            ".trash_{}_{}",
+            profile_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        if std::fs::rename(&dir, &trash_dir).is_ok() {
+            std::thread::spawn(move || {
+                let _ = std::fs::remove_dir_all(trash_dir);
+            });
+        } else {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("Failed to wipe profile dir {}", dir.display()))?;
+        }
     }
     std::fs::create_dir_all(&dir)?;
     let short_id: String = profile_id
@@ -1529,11 +1590,678 @@ pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NormalizedCookieBundle {
+    pub format_label: String,
+    pub cookies: Vec<serde_json::Value>,
+    pub origins: Vec<serde_json::Value>,
+    pub domains: Vec<String>,
+}
+
+impl NormalizedCookieBundle {
+    pub fn to_state_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "cookies": self.cookies,
+            "origins": self.origins,
+        }))
+        .unwrap_or_else(|_| "{\"cookies\":[],\"origins\":[]}".to_string())
+    }
+
+    pub fn summary_badge(&self) -> String {
+        let dom_str = if self.domains.is_empty() {
+            "no domain".to_string()
+        } else if self.domains.len() <= 3 {
+            self.domains.join(", ")
+        } else {
+            format!(
+                "{}, +{} more",
+                self.domains[..2].join(", "),
+                self.domains.len() - 2
+            )
+        };
+        if self.origins.is_empty() {
+            format!(
+                "{} cookies ({}) • {}",
+                self.cookies.len(),
+                dom_str,
+                self.format_label
+            )
+        } else {
+            format!(
+                "{} cookies + {} origins ({}) • {}",
+                self.cookies.len(),
+                self.origins.len(),
+                dom_str,
+                self.format_label
+            )
+        }
+    }
+}
+
+fn extract_host_from_url_or_domain(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(['"', '\'', ' ', '\t', '\r', '\n', ';']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("wss://"))
+        .or_else(|| trimmed.strip_prefix("ws://"))
+        .unwrap_or(trimmed);
+    let had_scheme = without_scheme.len() != trimmed.len();
+    let host_port = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let host = host_port.split(':').next().unwrap_or("").trim();
+    if host.is_empty() || (!host.contains('.') && !host.eq_ignore_ascii_case("localhost")) {
+        return None;
+    }
+    if had_scheme {
+        Some(host.trim_start_matches('.').to_ascii_lowercase())
+    } else if host.starts_with('.') {
+        Some(format!(".{}", host.trim_start_matches('.').to_ascii_lowercase()))
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn extract_origin_from_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(['"', '\'']);
+    let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        ("https://", r)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        ("http://", r)
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}{authority}"))
+}
+
+fn infer_domain_from_cookie_name(name: &str) -> Option<&'static str> {
+    match name.trim() {
+        "c_user" | "xs" | "datr" | "sb" | "fr" | "wd" | "presence" => Some(".facebook.com"),
+        "SID" | "HSID" | "SSID" | "APISID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID"
+        | "__Secure-1PAPISID" | "__Secure-3PAPISID" | "NID" => Some(".google.com"),
+        "auth_token" | "ct0" | "twid" | "kdt" => Some(".x.com"),
+        "sessionid" | "sessionid_ss" | "sid_tt" | "uid_tt" | "tt_webid" | "odin_tt" => {
+            Some(".tiktok.com")
+        }
+        "SPC_EC" | "SPC_F" | "SPC_U" | "SPC_ST" | "SPC_R_T_ID" | "SPC_T_ID" => {
+            Some(".shopee.vn")
+        }
+        "ds_user_id" | "csrftoken" | "ig_did" | "mid" | "rur" => Some(".instagram.com"),
+        "li_at" | "liap" | "li_rm" => Some(".linkedin.com"),
+        "user_session" | "_gh_sess" | "dotcom_user" | "__Host-user_session_same_site" => {
+            Some(".github.com")
+        }
+        "ubid-main" | "x-main" | "at-main" | "sess-at-main" | "session-id" => {
+            Some(".amazon.com")
+        }
+        "SUB" | "SUBP" | "SSOLoginState" => Some(".weibo.com"),
+        _ => None,
+    }
+}
+
+fn normalize_same_site_str(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "strict" => Some("Strict"),
+        "lax" => Some("Lax"),
+        "none" | "no_restriction" | "norestriction" => Some("None"),
+        _ => None,
+    }
+}
+
+fn normalize_single_cookie_json(
+    item: &serde_json::Value,
+    default_domain: Option<&str>,
+) -> Option<serde_json::Value> {
+    let obj = item.as_object()?;
+    let name = obj.get("name")?.as_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let value = match obj.get("value") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    };
+
+    let raw_domain = obj
+        .get("domain")
+        .or_else(|| obj.get("host"))
+        .and_then(|v| v.as_str())
+        .and_then(extract_host_from_url_or_domain)
+        .or_else(|| {
+            obj.get("url")
+                .and_then(|v| v.as_str())
+                .and_then(extract_host_from_url_or_domain)
+        })
+        .or_else(|| default_domain.and_then(extract_host_from_url_or_domain))
+        .or_else(|| infer_domain_from_cookie_name(name).map(ToString::to_string))?;
+
+    let host_only = obj
+        .get("hostOnly")
+        .or_else(|| obj.get("host_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_host_prefix = name.starts_with("__Host-");
+    let is_secure_prefix = name.starts_with("__Secure-");
+
+    let clean_domain = if host_only || is_host_prefix {
+        raw_domain.trim_start_matches('.').to_string()
+    } else {
+        raw_domain
+    };
+    if clean_domain.is_empty() {
+        return None;
+    }
+
+    let raw_path = obj
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("/");
+    let path = if is_host_prefix || raw_path.is_empty() || !raw_path.starts_with('/') {
+        "/".to_string()
+    } else {
+        raw_path.to_string()
+    };
+
+    let http_only = obj
+        .get("httpOnly")
+        .or_else(|| obj.get("http_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let same_site = obj
+        .get("sameSite")
+        .or_else(|| obj.get("same_site"))
+        .and_then(|v| v.as_str())
+        .and_then(normalize_same_site_str);
+
+    let secure = obj
+        .get("secure")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || same_site == Some("None")
+        || is_host_prefix
+        || is_secure_prefix;
+
+    let explicit_session = obj
+        .get("session")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let raw_exp = obj
+        .get("expires")
+        .or_else(|| obj.get("expirationDate"))
+        .or_else(|| obj.get("expiry"))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_i64().map(|n| n as f64))
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        });
+    let (expires, session) = match raw_exp {
+        Some(ts) if !explicit_session && ts > 0.0 => {
+            let secs = if ts > 100_000_000_000.0 {
+                ts / 1000.0
+            } else {
+                ts
+            };
+            (secs, false)
+        }
+        _ => (-1.0, true),
+    };
+
+    let mut out = serde_json::Map::new();
+    out.insert("name".into(), serde_json::Value::String(name.to_string()));
+    out.insert("value".into(), serde_json::Value::String(value.clone()));
+    out.insert("domain".into(), serde_json::Value::String(clean_domain));
+    out.insert("path".into(), serde_json::Value::String(path));
+    out.insert("expires".into(), serde_json::json!(expires));
+    out.insert(
+        "size".into(),
+        serde_json::json!(name.len().saturating_add(value.len())),
+    );
+    out.insert("httpOnly".into(), serde_json::Value::Bool(http_only));
+    out.insert("secure".into(), serde_json::Value::Bool(secure));
+    out.insert("session".into(), serde_json::Value::Bool(session));
+    if let Some(ss) = same_site {
+        out.insert("sameSite".into(), serde_json::Value::String(ss.to_string()));
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+fn parse_semicolon_cookie_pairs(
+    raw_pairs: &str,
+    fallback_domain: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut explicit_domain: Option<String> = None;
+    let mut explicit_path = "/".to_string();
+    let mut explicit_secure = false;
+    let mut explicit_http_only = false;
+    let mut explicit_same_site: Option<&'static str> = None;
+    let mut explicit_expires: Option<f64> = None;
+    let mut kv_pairs: Vec<(String, String)> = Vec::new();
+
+    let cleaned = raw_pairs
+        .trim()
+        .strip_prefix("Cookie:")
+        .or_else(|| raw_pairs.trim().strip_prefix("cookie:"))
+        .unwrap_or(raw_pairs.trim());
+
+    for token in cleaned.split(';') {
+        let part = token.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once('=') {
+            let key = k.trim();
+            let val = v.trim().trim_matches('"');
+            if key.is_empty() {
+                continue;
+            }
+            match key.to_ascii_lowercase().as_str() {
+                "domain" => {
+                    explicit_domain = extract_host_from_url_or_domain(val);
+                }
+                "path" => {
+                    if val.starts_with('/') {
+                        explicit_path = val.to_string();
+                    }
+                }
+                "samesite" => {
+                    explicit_same_site = normalize_same_site_str(val);
+                }
+                "max-age" => {
+                    if let Ok(secs) = val.parse::<i64>() {
+                        explicit_expires = Some((unix_now().saturating_add(secs)) as f64);
+                    }
+                }
+                "expires" => {
+                    if let Ok(ts) = val.parse::<f64>() {
+                        explicit_expires = Some(ts);
+                    }
+                }
+                _ => {
+                    kv_pairs.push((key.to_string(), val.to_string()));
+                }
+            }
+        } else {
+            match part.to_ascii_lowercase().as_str() {
+                "secure" => explicit_secure = true,
+                "httponly" => explicit_http_only = true,
+                _ => {}
+            }
+        }
+    }
+
+    if kv_pairs.is_empty() {
+        bail!("No valid name=value pairs found in cookie string");
+    }
+
+    let inferred_batch_domain = explicit_domain
+        .or_else(|| {
+            kv_pairs
+                .iter()
+                .find_map(|(k, _)| infer_domain_from_cookie_name(k).map(ToString::to_string))
+        })
+        .or_else(|| {
+            fallback_domain
+                .filter(|u| !u.trim().eq_ignore_ascii_case("https://browserscan.net"))
+                .and_then(extract_host_from_url_or_domain)
+        });
+
+    let Some(domain) = inferred_batch_domain else {
+        bail!(
+            "Raw key=value cookies require a target domain. Include 'domain=.example.com;' or set the profile's Startup URL first."
+        );
+    };
+
+    let default_exp = explicit_expires.unwrap_or_else(|| (unix_now() + 86_400 * 180) as f64);
+    let mut out = Vec::with_capacity(kv_pairs.len());
+    for (name, value) in kv_pairs {
+        let cookie_domain = infer_domain_from_cookie_name(&name)
+            .filter(|d| domain == *d || domain.ends_with(d.trim_start_matches('.')))
+            .unwrap_or(domain.as_str());
+        let mut map = serde_json::Map::new();
+        map.insert("name".into(), serde_json::Value::String(name));
+        map.insert("value".into(), serde_json::Value::String(value));
+        map.insert(
+            "domain".into(),
+            serde_json::Value::String(cookie_domain.to_string()),
+        );
+        map.insert(
+            "path".into(),
+            serde_json::Value::String(explicit_path.clone()),
+        );
+        map.insert("expires".into(), serde_json::json!(default_exp));
+        map.insert(
+            "secure".into(),
+            serde_json::Value::Bool(explicit_secure || cookie_domain.starts_with('.')),
+        );
+        map.insert(
+            "httpOnly".into(),
+            serde_json::Value::Bool(explicit_http_only),
+        );
+        if let Some(ss) = explicit_same_site {
+            map.insert("sameSite".into(), serde_json::Value::String(ss.to_string()));
+        }
+        if let Some(norm) =
+            normalize_single_cookie_json(&serde_json::Value::Object(map), Some(cookie_domain))
+        {
+            out.push(norm);
+        }
+    }
+    Ok(out)
+}
+
+fn collect_unique_domains(cookies: &[serde_json::Value]) -> Vec<String> {
+    let mut domains = Vec::new();
+    for c in cookies {
+        if let Some(d) = c
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+            && !d.is_empty()
+            && !domains.contains(&d)
+        {
+            domains.push(d);
+        }
+    }
+    domains
+}
+
+/// Parses and normalizes any supported cookie/state payload into BonLogin's canonical CDP State JSON:
+/// 1. Playwright / BonLogin State JSON (`{"cookies": [...], "origins": [...]}`)
+/// 2. Cookie-Editor / EditThisCookie JSON Array (`[{"name": ..., "value": ..., "domain": ...}]`)
+/// 3. J2Team / Cookie & Token Grabber JSON (`{"url": "...", "cookies": [...]}` or `{"url": "...", "cookie": "...", "localStorage": {...}}`)
+/// 4. Netscape HTTP Cookie File format (`# Netscape HTTP Cookie File` / 7 columns including `#HttpOnly_`)
+/// 5. cURL command (`curl 'https://...' -H 'Cookie: ...'` or `-b '...'`)
+/// 6. Raw `Cookie: k=v; k2=v2` or MMO pipe account line `UID|Pass|2FA|c_user=...; xs=...`
+pub fn parse_and_normalize_cookies(
+    raw_payload: &str,
+    fallback_url: Option<&str>,
+) -> Result<NormalizedCookieBundle> {
+    let trimmed = raw_payload.trim().trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        bail!("Cookie payload is empty");
+    }
+
+    // 1. JSON formats (Array or Object)
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        let parsed: serde_json::Value =
+            serde_json::from_str(trimmed).context("Invalid JSON syntax in cookie payload")?;
+        match parsed {
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    return Ok(NormalizedCookieBundle {
+                        format_label: "Empty JSON Array".to_string(),
+                        cookies: Vec::new(),
+                        origins: Vec::new(),
+                        domains: Vec::new(),
+                    });
+                }
+                let mut cookies = Vec::with_capacity(arr.len());
+                for item in &arr {
+                    if let Some(c) = normalize_single_cookie_json(item, fallback_url) {
+                        cookies.push(c);
+                    }
+                }
+                if cookies.is_empty() {
+                    bail!(
+                        "JSON array contains no valid cookies (each item needs 'name', 'value', and 'domain')"
+                    );
+                }
+                let domains = collect_unique_domains(&cookies);
+                return Ok(NormalizedCookieBundle {
+                    format_label: "Cookie-Editor JSON".to_string(),
+                    cookies,
+                    origins: Vec::new(),
+                    domains,
+                });
+            }
+            serde_json::Value::Object(obj) => {
+                let top_url_or_domain = obj
+                    .get("domain")
+                    .or_else(|| obj.get("url"))
+                    .or_else(|| obj.get("origin"))
+                    .and_then(|v| v.as_str())
+                    .or(fallback_url);
+
+                let mut origins = obj
+                    .get("origins")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                if let Some(ls_obj) = obj.get("localStorage").and_then(|v| v.as_object())
+                    && !ls_obj.is_empty()
+                    && let Some(origin_url) = obj
+                        .get("url")
+                        .or_else(|| obj.get("origin"))
+                        .and_then(|v| v.as_str())
+                        .or(fallback_url)
+                        .and_then(extract_origin_from_url)
+                {
+                    let ls_items: Vec<serde_json::Value> = ls_obj
+                        .iter()
+                        .map(|(k, v)| {
+                            let val_str = v
+                                .as_str()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| v.to_string());
+                            serde_json::json!({ "name": k, "value": val_str })
+                        })
+                        .collect();
+                    origins.push(serde_json::json!({
+                        "origin": origin_url,
+                        "localStorage": ls_items,
+                    }));
+                }
+
+                let mut cookies = Vec::new();
+                if let Some(arr) = obj.get("cookies").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(c) = normalize_single_cookie_json(item, top_url_or_domain) {
+                            cookies.push(c);
+                        }
+                    }
+                } else if let Some(raw_cookie_str) = obj
+                    .get("cookie")
+                    .or_else(|| obj.get("cookies"))
+                    .and_then(|v| v.as_str())
+                    && !raw_cookie_str.trim().is_empty()
+                {
+                    cookies.extend(parse_semicolon_cookie_pairs(
+                        raw_cookie_str,
+                        top_url_or_domain,
+                    )?);
+                } else if obj.contains_key("name") && obj.contains_key("value") {
+                    let val = serde_json::Value::Object(obj.clone());
+                    if let Some(c) = normalize_single_cookie_json(&val, top_url_or_domain) {
+                        cookies.push(c);
+                    }
+                }
+
+                let has_cookies_key = obj.contains_key("cookies") || obj.contains_key("origins");
+                if cookies.is_empty() && origins.is_empty() && !has_cookies_key {
+                    bail!(
+                        "JSON object does not contain 'cookies', 'origins', or a valid cookie {{'name','value','domain'}}"
+                    );
+                }
+
+                let format_label = if obj.contains_key("origins") {
+                    "State JSON"
+                } else if obj.contains_key("url") && obj.contains_key("cookies") {
+                    "J2Team Cookie JSON"
+                } else if obj.contains_key("localStorage") {
+                    "Token Grabber JSON"
+                } else {
+                    "Cookie JSON"
+                }
+                .to_string();
+                let domains = collect_unique_domains(&cookies);
+                return Ok(NormalizedCookieBundle {
+                    format_label,
+                    cookies,
+                    origins,
+                    domains,
+                });
+            }
+            _ => bail!("Cookie JSON must be an Array [...] or Object {{...}}"),
+        }
+    }
+
+    // 2. Netscape HTTP Cookie File format (7 tab/whitespace columns)
+    let mut netscape_cookies = Vec::new();
+    for raw_line in trimmed.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (http_only, effective_line) = if let Some(rest) = line
+            .strip_prefix("#HttpOnly_")
+            .or_else(|| line.strip_prefix("#httponly_"))
+        {
+            (true, rest.trim())
+        } else if line.starts_with('#') {
+            continue;
+        } else {
+            (false, line)
+        };
+
+        let cols: Vec<&str> = if effective_line.contains('\t') {
+            effective_line.splitn(7, '\t').collect()
+        } else {
+            effective_line.split_whitespace().collect()
+        };
+        if cols.len() >= 6
+            && matches!(
+                cols[1].to_ascii_uppercase().as_str(),
+                "TRUE" | "FALSE" | "1" | "0"
+            )
+            && matches!(
+                cols[3].to_ascii_uppercase().as_str(),
+                "TRUE" | "FALSE" | "1" | "0"
+            )
+        {
+            let domain = cols[0].trim();
+            let path = cols[2].trim();
+            let secure = matches!(cols[3].to_ascii_uppercase().as_str(), "TRUE" | "1");
+            let expires = cols[4].trim().parse::<f64>().unwrap_or(-1.0);
+            let name = cols[5].trim();
+            let value = cols.get(6).copied().unwrap_or("").trim();
+            let candidate = serde_json::json!({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path,
+                "secure": secure,
+                "httpOnly": http_only,
+                "expires": expires,
+            });
+            if let Some(norm) = normalize_single_cookie_json(&candidate, fallback_url) {
+                netscape_cookies.push(norm);
+            }
+        }
+    }
+    if !netscape_cookies.is_empty() {
+        let domains = collect_unique_domains(&netscape_cookies);
+        return Ok(NormalizedCookieBundle {
+            format_label: "Netscape Cookie File".to_string(),
+            cookies: netscape_cookies,
+            origins: Vec::new(),
+            domains,
+        });
+    }
+
+    // 3. cURL command (`curl 'https://...' -H 'Cookie: ...'` or `-b '...'`)
+    if trimmed.starts_with("curl ") || trimmed.contains(" -H ") || trimmed.contains(" --cookie ") {
+        let mut curl_url: Option<String> = None;
+        for token in trimmed.split_whitespace() {
+            let clean = token.trim_matches(['\'', '"', '\\']);
+            if clean.starts_with("https://") || clean.starts_with("http://") {
+                curl_url = Some(clean.to_string());
+                break;
+            }
+        }
+        let mut cookie_headers = Vec::new();
+        let lower = trimmed.to_ascii_lowercase();
+        let mut search_idx = 0;
+        while let Some(pos) = lower[search_idx..].find("cookie:") {
+            let start = search_idx + pos + "cookie:".len();
+            let rest = &trimmed[start..];
+            let end = rest.find(['\'', '"', '\n', '\r']).unwrap_or(rest.len());
+            let extracted = rest[..end].trim();
+            if !extracted.is_empty() {
+                cookie_headers.push(extracted.to_string());
+            }
+            search_idx = start + end;
+        }
+        for flag in ["-b ", "--cookie "] {
+            if let Some(pos) = trimmed.find(flag) {
+                let after = trimmed[pos + flag.len()..].trim_start();
+                if let Some(quote) = after.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                    let inner = &after[1..];
+                    if let Some(end) = inner.find(quote) {
+                        cookie_headers.push(inner[..end].to_string());
+                    }
+                }
+            }
+        }
+        if !cookie_headers.is_empty() {
+            let joined = cookie_headers.join("; ");
+            let domain_hint = curl_url.as_deref().or(fallback_url);
+            let cookies = parse_semicolon_cookie_pairs(&joined, domain_hint)?;
+            let domains = collect_unique_domains(&cookies);
+            return Ok(NormalizedCookieBundle {
+                format_label: "cURL Command".to_string(),
+                cookies,
+                origins: Vec::new(),
+                domains,
+            });
+        }
+    }
+
+    // 4. Raw `Cookie: a=1; b=2` or MMO pipe format `UID|Pass|2FA|c_user=1; xs=2`
+    let candidate_raw = if trimmed.contains('|') {
+        trimmed
+            .split('|')
+            .map(str::trim)
+            .find(|seg| seg.contains('=') && (seg.contains(';') || infer_domain_from_cookie_name(seg.split('=').next().unwrap_or("")).is_some()))
+            .unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let cookies = parse_semicolon_cookie_pairs(candidate_raw, fallback_url)?;
+    let domains = collect_unique_domains(&cookies);
+    Ok(NormalizedCookieBundle {
+        format_label: "Raw Cookie String".to_string(),
+        cookies,
+        origins: Vec::new(),
+        domains,
+    })
+}
+
 pub fn read_prelaunch_cookies(short_id: &str) -> String {
-    let path = app_support_dir()
-        .join("states")
-        .join(format!("bon_{short_id}_prelaunch.json"));
-    std::fs::read_to_string(path).unwrap_or_default()
+    let states_dir = app_support_dir().join("states");
+    let pre_path = states_dir.join(format!("bon_{short_id}_prelaunch.json"));
+    if let Ok(s) = std::fs::read_to_string(&pre_path)
+        && !s.trim().is_empty()
+    {
+        return s;
+    }
+    String::new()
 }
 
 pub fn save_prelaunch_cookies(short_id: &str, raw: &str) -> Result<()> {
@@ -1543,10 +2271,18 @@ pub fn save_prelaunch_cookies(short_id: &str, raw: &str) -> Result<()> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         let _ = std::fs::remove_file(path);
+    } else if let Ok(bundle) = parse_and_normalize_cookies(trimmed, None) {
+        std::fs::write(path, bundle.to_state_json_pretty())?;
     } else {
         std::fs::write(path, trimmed)?;
     }
     Ok(())
+}
+pub fn copy_prelaunch_cookies(src_short_id: &str, dst_short_id: &str) {
+    let raw = read_prelaunch_cookies(src_short_id);
+    if !raw.trim().is_empty() {
+        let _ = save_prelaunch_cookies(dst_short_id, &raw);
+    }
 }
 
 /// Builds the exact `adryfish/fingerprint-chromium` + Patchright Stealth + WebRTC + DNS leak prevention flags.
@@ -1637,7 +2373,8 @@ pub fn build_chromium_args(
         format!("--lang={icu_locale}"),
         format!("--accept-lang={accept_lang}"),
         "-AppleLanguages".to_string(),
-        format!("({locale})"),
+        // XML plist array sets macOS NSUserDefaults AppleLanguages without parsing as a valid GURL in StartupBrowserCreator
+        format!("<array><string>{locale}</string></array>"),
     ];
     if let Some(tz) = timezone_opt {
         args.push(format!("--timezone={tz}"));
@@ -1772,6 +2509,17 @@ impl RunningProcess {
 
     pub fn stop_gracefully(&mut self) {
         if self.is_process_running() {
+            if !self.short_id.is_empty()
+                && cdp_has_open_window(self.info.cdp_port) == Some(true)
+                && let Ok((_, live_json)) = agent_export_state(&self.short_id, &self.info.ws_url)
+            {
+                let pre_path = app_support_dir()
+                    .join("states")
+                    .join(format!("bon_{}_prelaunch.json", self.short_id));
+                if pre_path.is_file() {
+                    let _ = std::fs::write(pre_path, live_json);
+                }
+            }
             #[cfg(unix)]
             {
                 let pid = self.child.id().to_string();
@@ -1914,7 +2662,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     let pid = child_guard.child.as_ref().map(Child::id).unwrap_or(0);
     let mut cdp_endpoint: Option<(u16, String)> = None;
 
-    for _ in 0..50 {
+    for _ in 0..200 {
         if let Ok(contents) = std::fs::read_to_string(&active_port_file)
             && let Ok(parsed) = parse_devtools_active_port(&contents)
         {
@@ -1931,7 +2679,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
             bail!("Chromium exited early with status {status} before opening DevToolsActivePort");
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     let (cdp_port, ws_url) = match cdp_endpoint {
@@ -1957,28 +2705,32 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     }
 
     let mut saw_window = false;
-    for _ in 0..30 {
+    for _ in 0..120 {
         if cdp_has_open_window(cdp_port) == Some(true) {
             saw_window = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     let short_id = profile.short_id();
     let prelaunch_cookies = read_prelaunch_cookies(&short_id);
     let sid = short_id.clone();
     let ws_clone = ws_url.clone();
+    let startup_url_hint = profile.startup_url.clone();
     if !prelaunch_cookies.trim().is_empty() {
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = agent_import_state_or_cookies(&sid, &ws_clone, &prelaunch_cookies);
+            let payload = parse_and_normalize_cookies(&prelaunch_cookies, Some(&startup_url_hint))
+                .map(|b| b.to_state_json_pretty())
+                .unwrap_or(prelaunch_cookies);
+            let _ = agent_import_state_or_cookies(&sid, &ws_clone, &payload);
         })
         .await;
     } else {
-        let _ = tokio::task::spawn_blocking(move || {
+        // Connect agent-browser daemon in background so UI transitions to Running immediately
+        tokio::task::spawn_blocking(move || {
             let _ = ensure_agent_browser_connected(&sid, &ws_clone);
-        })
-        .await;
+        });
     }
     let child = child_guard
         .child
@@ -2003,15 +2755,20 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
 // ---------------------------------------------------------------------------
 
 fn agent_browser_cmd() -> Command {
-    let mut cmd = if let Some(home) = dirs::home_dir()
-        && home.join(".local/bin/agent-browser").is_file()
-    {
-        Command::new(home.join(".local/bin/agent-browser"))
-    } else if Path::new("/opt/homebrew/bin/agent-browser").is_file() {
-        Command::new("/opt/homebrew/bin/agent-browser")
-    } else {
-        Command::new("agent-browser")
-    };
+    static BIN: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        if let Some(home) = dirs::home_dir() {
+            let local_bin = home.join(".local/bin/agent-browser");
+            if local_bin.is_file() {
+                return local_bin;
+            }
+        }
+        let brew_bin = Path::new("/opt/homebrew/bin/agent-browser");
+        if brew_bin.is_file() {
+            return brew_bin.to_path_buf();
+        }
+        PathBuf::from("agent-browser")
+    });
+    let mut cmd = Command::new(BIN.as_os_str());
     cmd.env("AGENT_BROWSER_NO_VERSION_CHECK", "1")
         .env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "0");
     cmd
@@ -2033,6 +2790,7 @@ fn cdp_http_get_body(cdp_port: u16, path: &str) -> Option<String> {
     const MAX_CDP_HTTP_BYTES: usize = 1_048_576;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cdp_port);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
     let req = format!(
@@ -2396,6 +3154,77 @@ pub fn agent_export_state(short_id: &str, ws_url: &str) -> Result<(PathBuf, Stri
     Ok((state_path, json))
 }
 
+fn apply_cookies_via_cli_set(
+    session: &str,
+    short_id: &str,
+    cookies: &[serde_json::Value],
+    only_host_prefix: bool,
+) -> usize {
+    let mut applied = 0;
+    for c in cookies {
+        let Some(name) = c.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if only_host_prefix && !name.starts_with("__Host-") {
+            continue;
+        }
+        let value = c.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let domain = c.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+        let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+        let secure = c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
+        let http_only = c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false);
+        let same_site = c.get("sameSite").and_then(|v| v.as_str());
+        let session_flag = c.get("session").and_then(|v| v.as_bool()).unwrap_or(false);
+        let expires = c.get("expires").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+
+        let mut args = vec![
+            "--session".to_string(),
+            session.to_string(),
+            "cookies".to_string(),
+            "set".to_string(),
+            name.to_string(),
+            value.to_string(),
+        ];
+        if name.starts_with("__Host-") {
+            let host = domain.trim_start_matches('.');
+            args.push("--url".to_string());
+            args.push(format!("https://{host}/"));
+            args.push("--path".to_string());
+            args.push("/".to_string());
+            args.push("--secure".to_string());
+        } else {
+            if !domain.is_empty() {
+                args.push("--domain".to_string());
+                args.push(domain.to_string());
+            }
+            args.push("--path".to_string());
+            args.push(path.to_string());
+            if secure {
+                args.push("--secure".to_string());
+            }
+        }
+        if http_only {
+            args.push("--http-only".to_string());
+        }
+        if let Some(ss) = same_site.and_then(normalize_same_site_str) {
+            args.push("--same-site".to_string());
+            args.push(ss.to_string());
+        }
+        if !session_flag && expires > 0.0 {
+            args.push("--expires".to_string());
+            args.push(format!("{}", expires as i64));
+        }
+        if agent_browser_cmd_for_short_id(short_id)
+            .args(&args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            applied += 1;
+        }
+    }
+    applied
+}
+
 pub fn agent_import_state_or_cookies(
     short_id: &str,
     ws_url: &str,
@@ -2406,56 +3235,77 @@ pub fn agent_import_state_or_cookies(
     std::fs::create_dir_all(&dir)?;
 
     let trimmed = raw_payload.trim();
-    let file_path = if trimmed.is_empty() {
+    let source_text = if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        let prelaunch = dir.join(format!("bon_{short_id}_prelaunch.json"));
         let default_state = dir.join(format!("bon_{short_id}_state.json"));
-        if !default_state.is_file() {
+        if prelaunch.is_file() {
+            std::fs::read_to_string(&prelaunch)?
+        } else if default_state.is_file() {
+            std::fs::read_to_string(&default_state)?
+        } else {
             bail!(
-                "Paste JSON/cURL cookies into the input box first, or export a state file for bon_{short_id}"
+                "Paste Cookies (JSON, Netscape, cURL, or key=value) first, or export a state file for bon_{short_id}"
             );
         }
-        default_state
-    } else {
-        let tmp_file = dir.join(format!("bon_{short_id}_import.json"));
-        std::fs::write(&tmp_file, trimmed)?;
-        tmp_file
     };
 
-    let content = std::fs::read_to_string(&file_path).unwrap_or_default();
-    let is_full_state = content.contains("\"cookies\"") && content.contains("\"origins\"");
+    let bundle = parse_and_normalize_cookies(&source_text, None)?;
+    if bundle.cookies.is_empty() && bundle.origins.is_empty() {
+        return Ok("No cookies or origins to import".to_string());
+    }
 
-    let out = if is_full_state {
-        agent_browser_cmd_for_short_id(short_id)
+    let state_json = bundle.to_state_json_pretty();
+    let tmp_file = dir.join(format!("bon_{short_id}_import.json"));
+    let state_file = dir.join(format!("bon_{short_id}_state.json"));
+    let _ = std::fs::write(&state_file, &state_json);
+
+    let non_host_cookies: Vec<&serde_json::Value> = bundle
+        .cookies
+        .iter()
+        .filter(|c| {
+            !c.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|n| n.starts_with("__Host-"))
+        })
+        .collect();
+
+    if !non_host_cookies.is_empty() || !bundle.origins.is_empty() {
+        let load_payload = serde_json::to_string_pretty(&serde_json::json!({
+            "cookies": non_host_cookies,
+            "origins": bundle.origins,
+        }))?;
+        std::fs::write(&tmp_file, &load_payload)?;
+        let out = agent_browser_cmd_for_short_id(short_id)
             .args([
                 "--session",
                 &session,
                 "state",
                 "load",
-                &file_path.to_string_lossy(),
+                &tmp_file.to_string_lossy(),
             ])
-            .output()?
-    } else {
-        agent_browser_cmd_for_short_id(short_id)
-            .args([
-                "--session",
-                &session,
-                "cookies",
-                "set",
-                "--curl",
-                &file_path.to_string_lossy(),
-            ])
-            .output()?
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if !out.status.success() {
-        bail!("Import failed: {stderr} {stdout}");
+            .output()?;
+        if !out.status.success() {
+            // shortcut: cap per-cookie CLI fallback at 25 so malformed bundles never stall for 20s
+            let cap = bundle.cookies.len().min(25);
+            let fallback_set =
+                apply_cookies_via_cli_set(&session, short_id, &bundle.cookies[..cap], false);
+            if fallback_set == 0 {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                bail!("Import failed: {stderr} {stdout}");
+            }
+        }
     }
-    Ok(if stdout.is_empty() {
-        format!("Imported state/cookies from {}", file_path.display())
-    } else {
-        stdout
-    })
+    let _ = apply_cookies_via_cli_set(&session, short_id, &bundle.cookies, true);
+
+    // Refresh active tab so newly injected session cookies take effect immediately
+    let _ = agent_browser_cmd_for_short_id(short_id)
+        .args(["--session", &session, "reload"])
+        .output();
+
+    Ok(format!("Imported {}", bundle.summary_badge()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2662,7 +3512,13 @@ pub fn apply_profile_cli_flags(
                 } else {
                     raw.to_string()
                 };
-                save_prelaunch_cookies(&profile.short_id(), &payload)?;
+                if payload.trim().is_empty() {
+                    save_prelaunch_cookies(&profile.short_id(), "")?;
+                } else {
+                    let bundle =
+                        parse_and_normalize_cookies(&payload, Some(&profile.startup_url))?;
+                    save_prelaunch_cookies(&profile.short_id(), &bundle.to_state_json_pretty())?;
+                }
                 idx += 2;
             }
             "--proxy" => {
@@ -2813,7 +3669,7 @@ pub fn ensure_profile_launched_via_supervisor(
     bail!("Timed out (12s) waiting for profile '{}' to launch", profile.name)
 }
 
-async fn check_proxy_config_live(cfg: &ProxyConfig) -> Result<GeoInfo> {
+pub async fn check_proxy_config_live(cfg: &ProxyConfig) -> Result<GeoInfo> {
     let mut tun = crate::proxy_tunnel::LocalProxyTunnel::start(cfg.clone()).await?;
     let port = tun.local_port();
     let res = crate::geoip::resolve_geo_via_port(Some(port)).await;
@@ -2842,7 +3698,7 @@ fn print_cli_help() {
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
            bon-login profile list [--group <g>] [--search <q>]\n  \
            bon-login profile show <id|name>\n  \
-           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge|brave|opera]\n                            [--group <g>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>]\n                            [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--cookies <file_or_json>]\n  \
+           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>]\n                            [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--cookies <file_or_json>]\n  \
            bon-login profile update <id|name|--group <g>|--all> [same flags as create]\n  \
            bon-login profile reseed <id|name|--group <g>|--all>\n  \
            bon-login profile clone <id|name> [--count <n>] [--name <prefix>]\n  \
@@ -3193,6 +4049,7 @@ fn run_profile_subcommand(
             }
             let profiles = db.list_profiles()?;
             let src = find_profile_by_query(&profiles, target)?;
+            let src_sid = src.short_id();
             let mut created = Vec::new();
             for i in 1..=count {
                 let mut c = src.cloned_with_new_seed();
@@ -3205,6 +4062,7 @@ fn run_profile_subcommand(
                 } else if count > 1 {
                     c.name = format!("{} (Copy {i})", src.name);
                 }
+                copy_prelaunch_cookies(&src_sid, &c.short_id());
                 db.upsert_profile(&c)?;
                 created.push(profile_summary_json(&c));
             }
@@ -3239,7 +4097,9 @@ fn run_profile_subcommand(
                     }
                     other => {
                         forwarded_flags.push(other.to_string());
-                        if let Some(val) = rest.get(idx + 1) {
+                        if let Some(val) = rest.get(idx + 1)
+                            && !matches!(val.as_str(), "--count" | "-n" | "--prefix" | "--proxy-tag")
+                        {
                             forwarded_flags.push(val.clone());
                             idx += 2;
                         } else {
@@ -3309,16 +4169,10 @@ fn run_profile_subcommand(
                 };
                 match res {
                     Ok(geo) => {
-                        let _ = db.update_resolved_geo(&p.id, Some(&geo));
                         if let Some(cfg) = &p.proxy {
-                            for sp in &saved_proxies {
-                                if sp.config.protocol == cfg.protocol
-                                    && sp.config.host == cfg.host
-                                    && sp.config.port == cfg.port
-                                {
-                                    let _ = db.update_saved_proxy_check(&sp.id, Some(&geo), None);
-                                }
-                            }
+                            let _ = db.sync_geo_for_proxy_endpoint(cfg, &geo);
+                        } else {
+                            let _ = db.update_resolved_geo(&p.id, Some(&geo));
                         }
                         out.push(serde_json::json!({
                             "id": p.id,
@@ -3408,9 +4262,15 @@ fn run_profile_subcommand(
             let profiles = db.list_profiles()?;
             let p = find_profile_by_query(&profiles, target)?;
             let sid = p.short_id();
-            save_prelaunch_cookies(&sid, &payload)?;
+            let bundle = parse_and_normalize_cookies(&payload, Some(&p.startup_url))?;
+            let normalized_json = bundle.to_state_json_pretty();
+            save_prelaunch_cookies(&sid, &normalized_json)?;
             let live_msg = if let Some(live) = probe_live_runtime(&p.id) {
-                Some(agent_import_state_or_cookies(&sid, &live.ws_url, &payload)?)
+                Some(agent_import_state_or_cookies(
+                    &sid,
+                    &live.ws_url,
+                    &normalized_json,
+                )?)
             } else {
                 None
             };
@@ -3419,6 +4279,10 @@ fn run_profile_subcommand(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": true,
                     "short_id": sid,
+                    "format": bundle.format_label,
+                    "cookie_count": bundle.cookies.len(),
+                    "origin_count": bundle.origins.len(),
+                    "domains": bundle.domains,
                     "saved_prelaunch": true,
                     "live_imported": live_msg,
                 }))?
@@ -3725,22 +4589,12 @@ fn run_proxy_subcommand(
         }
         "check" => {
             let proxies = db.list_proxies()?;
-            let profiles = db.list_profiles()?;
             let (targets, _) = select_proxies_by_target(&proxies, rest)?;
             let mut results = Vec::new();
             for sp in targets {
                 match tokio_handle.block_on(check_proxy_config_live(&sp.config)) {
                     Ok(geo) => {
-                        let _ = db.update_saved_proxy_check(&sp.id, Some(&geo), None);
-                        for prof in &profiles {
-                            if prof.proxy.as_ref().is_some_and(|p| {
-                                p.protocol == sp.config.protocol
-                                    && p.host == sp.config.host
-                                    && p.port == sp.config.port
-                            }) {
-                                let _ = db.update_resolved_geo(&prof.id, Some(&geo));
-                            }
-                        }
+                        let _ = db.sync_geo_for_proxy_endpoint(&sp.config, &geo);
                         results.push(serde_json::json!({
                             "id": sp.id,
                             "name": sp.name,
@@ -4184,7 +5038,6 @@ fn run_kernel_subcommand(args: &[String]) -> Result<()> {
                     "installed": k.is_some(),
                     "version": k.as_ref().map(|i| &i.version_label),
                     "path": k.as_ref().map(|i| &i.path),
-                    "is_adryfish_bundle": k.as_ref().map(|i| i.is_adryfish_bundle),
                 }))?
             );
             Ok(())
@@ -4932,13 +5785,6 @@ fn extract_domain_from_url(url: &str) -> String {
         .to_string()
 }
 
-fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
     std::fs::read_to_string(path)
         .ok()
@@ -4946,22 +5792,21 @@ fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
         .unwrap_or_else(|| AgentFlow {
             name: default_name.to_string(),
             domain: String::new(),
-            updated_at: unix_now_secs(),
+            updated_at: unix_now(),
             steps: Vec::new(),
         })
 }
 
 fn save_flow_to_path(path: &Path, flow: &mut AgentFlow) -> Result<()> {
-    flow.updated_at = unix_now_secs();
-    if flow.domain.is_empty() {
-        if let Some(first_url) = flow
+    flow.updated_at = unix_now();
+    if flow.domain.is_empty()
+        && let Some(first_url) = flow
             .steps
             .iter()
             .find(|s| s.op == "open")
             .and_then(|s| s.value.as_deref())
-        {
-            flow.domain = extract_domain_from_url(first_url);
-        }
+    {
+        flow.domain = extract_domain_from_url(first_url);
     }
     let json = serde_json::to_string_pretty(flow)?;
     std::fs::write(path, json)?;
@@ -5016,20 +5861,29 @@ pub fn parameterize_flow_steps(
     steps: &mut [FlowStep],
     literal_to_var: &[(String, String)],
 ) {
-    for (var_name, literal) in literal_to_var {
-        if literal.is_empty() {
-            continue;
-        }
+    let mut sorted: Vec<&(String, String)> = literal_to_var
+        .iter()
+        .filter(|(_, lit)| !lit.is_empty())
+        .collect();
+    sorted.sort_by_key(|(_, lit)| std::cmp::Reverse(lit.len()));
+    for (var_name, literal) in sorted {
         let placeholder = format!("{{{{{var_name}}}}}");
+        let replace_field = |target: &mut String| {
+            if *target == *literal {
+                *target = placeholder.clone();
+            } else if literal.len() >= 4 && target.contains(literal.as_str()) {
+                *target = target.replace(literal, &placeholder);
+            }
+        };
         for step in steps.iter_mut() {
             if step.op == "open" {
                 continue;
             }
             if let Some(val) = &mut step.value {
-                *val = val.replace(literal, &placeholder);
+                replace_field(val);
             }
             for extra in &mut step.extra_args {
-                *extra = extra.replace(literal, &placeholder);
+                replace_field(extra);
             }
         }
     }
@@ -5862,7 +6716,7 @@ mod tests {
         assert!(args.contains(&"--lang=vi".to_string()));
         assert!(args.contains(&"--accept-lang=vi,vi-VN,vi,en-US;q=0.9,en;q=0.8".to_string()));
         assert!(args.contains(&"-AppleLanguages".to_string()));
-        assert!(args.contains(&"(vi-VN)".to_string()));
+        assert!(args.contains(&"<array><string>vi-VN</string></array>".to_string()));
         assert_eq!(chromium_icu_locale("zh-CN"), "zh-CN");
         assert_eq!(chromium_icu_locale("pt-BR"), "pt-BR");
         assert_eq!(chromium_icu_locale("ja-JP"), "ja");
@@ -6371,8 +7225,8 @@ mod tests {
         parameterize_flow_steps(
             &mut steps,
             &[
+                ("short".to_string(), "alice".to_string()),
                 ("username".to_string(), "alice@example.com".to_string()),
-                ("short".to_string(), "login".to_string()),
             ],
         );
         assert_eq!(steps[0].value.as_deref(), Some("https://x.com/login"));

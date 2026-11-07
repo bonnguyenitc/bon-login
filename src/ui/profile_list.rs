@@ -6,9 +6,9 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use std::time::Duration;
 use crate::models::{Profile, ProfileStatus};
+use crate::ui::profile_modal::detail_summary_row as drawer_row;
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction};
-
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnVisibility {
     pub show_id: bool,
@@ -446,38 +446,6 @@ pub fn render_profile_table(
         )
 }
 
-fn drawer_row(label: &'static str, value: String) -> Div {
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .px_1()
-        .py_1p5()
-        .rounded_sm()
-        .border_b_1()
-        .border_color(BonTheme::border())
-        .justify_between()
-        .items_center()
-        .gap_2()
-        .overflow_hidden()
-        .hover(|s| s.bg(BonTheme::bg_hover()))
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_xs()
-                .text_color(BonTheme::text_secondary())
-                .child(label),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .font_semibold()
-                .text_color(BonTheme::text_primary())
-                .child(value),
-        )
-}
-
 fn build_profile_popup_menu(
     menu: PopupMenu,
     app_entity: Entity<BonLoginApp>,
@@ -487,6 +455,8 @@ fn build_profile_popup_menu(
     let app_edit = app_entity.clone();
     let pid_edit = profile_id.clone();
     // Only real implemented actions in row popup/context menu
+    let app_import_cookies = app_entity.clone();
+    let pid_import_cookies = profile_id.clone();
     let app_cookies = app_entity.clone();
     let pid_cookies = profile_id.clone();
     let app_clone = app_entity.clone();
@@ -514,6 +484,15 @@ fn build_profile_popup_menu(
                 move |_, _, cx| {
                     app_agent.update(cx, |app, cx| {
                         app.copy_agent_browser_cli(&pid_agent, cx);
+                    });
+                },
+            ),
+        )
+        .item(
+            PopupMenuItem::new(format!("{}   Import cookies", SfSymbol::ARROW_UP_DOC)).on_click(
+                move |_, window, cx| {
+                    app_import_cookies.update(cx, |app, cx| {
+                        app.open_edit_cookies_view(&pid_import_cookies, window, cx);
                     });
                 },
             ),

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -24,6 +24,8 @@ impl LocalProxyTunnel {
             .context("Failed to bind local proxy listener on 127.0.0.1:0")?;
         let local_port = listener.local_addr()?.port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let upstream_addr: Arc<str> = format!("{}:{}", proxy.host, proxy.port).into();
+        let auth_header: Arc<str> = build_proxy_auth_header(&proxy).unwrap_or_default().into();
         let proxy = Arc::new(proxy);
 
         tokio::spawn(async move {
@@ -37,12 +39,17 @@ impl LocalProxyTunnel {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((client_stream, _)) => {
+                                let _ = client_stream.set_nodelay(true);
                                 let proxy_cfg = Arc::clone(&proxy);
+                                let addr = Arc::clone(&upstream_addr);
+                                let auth = Arc::clone(&auth_header);
                                 join_set.spawn(async move {
-                                    let _ = handle_client(client_stream, &proxy_cfg).await;
+                                    let _ = handle_client(client_stream, &proxy_cfg, &addr, &auth).await;
                                 });
                             }
-                            Err(_) => break,
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
                         }
                     }
                     Some(_) = join_set.join_next(), if !join_set.is_empty() => {}
@@ -204,41 +211,44 @@ fn build_proxy_auth_header(proxy: &ProxyConfig) -> Option<String> {
     Some(format!("Proxy-Authorization: Basic {encoded}\r\n"))
 }
 
-async fn handle_client(mut client_stream: TcpStream, proxy: &ProxyConfig) -> Result<()> {
+async fn handle_client(
+    mut client_stream: TcpStream,
+    proxy: &ProxyConfig,
+    upstream_addr: &str,
+    auth_header: &str,
+) -> Result<()> {
     let (header_bytes, body_prefix) = timeout(HANDSHAKE_TIMEOUT, read_until_double_crlf(&mut client_stream))
         .await
         .context("Timeout reading client request")??;
 
     let req = parse_client_request(&header_bytes, body_prefix)?;
 
-    let upstream_addr = format!("{}:{}", proxy.host, proxy.port);
-    let mut upstream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(&upstream_addr))
+    let mut upstream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(upstream_addr))
         .await
         .with_context(|| format!("Timeout connecting to upstream proxy {upstream_addr}"))?
         .with_context(|| format!("Failed connecting to upstream proxy {upstream_addr}"))?;
+    let _ = upstream.set_nodelay(true);
 
     match proxy.protocol {
         ProxyProtocol::Http => {
-            handle_http_upstream(&mut client_stream, &mut upstream, proxy, &header_bytes, req).await?;
+            handle_http_upstream(&mut client_stream, &mut upstream, auth_header, &header_bytes, req).await?;
         }
         ProxyProtocol::Socks5 => {
             handle_socks5_upstream(&mut client_stream, &mut upstream, proxy, req).await?;
         }
     }
 
-    let _ = copy_bidirectional(&mut client_stream, &mut upstream).await;
+    let _ = copy_bidirectional_with_sizes(&mut client_stream, &mut upstream, 64 * 1024, 64 * 1024).await;
     Ok(())
 }
 
 async fn handle_http_upstream(
     client_stream: &mut TcpStream,
     upstream: &mut TcpStream,
-    proxy: &ProxyConfig,
+    auth_header: &str,
     raw_header_bytes: &[u8],
     req: ParsedClientRequest,
 ) -> Result<()> {
-    let auth_header = build_proxy_auth_header(proxy).unwrap_or_default();
-
     if req.is_connect {
         let connect_req = format!(
             "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
@@ -272,18 +282,40 @@ async fn handle_http_upstream(
         }
     } else {
         // Plain HTTP request to upstream HTTP proxy: inject Proxy-Authorization if present
-        let mut out = Vec::with_capacity(raw_header_bytes.len() + auth_header.len() + req.body_prefix.len());
-        if auth_header.is_empty() {
-            out.extend_from_slice(raw_header_bytes);
+        let mut out = Vec::with_capacity(
+            raw_header_bytes.len() + auth_header.len() + 48 + req.body_prefix.len(),
+        );
+        if let Ok(hdr_str) = std::str::from_utf8(raw_header_bytes) {
+            for (idx, line) in hdr_str.split("\r\n").enumerate() {
+                if line.is_empty() {
+                    continue;
+                }
+                let strip = idx > 0
+                    && line.split_once(':').is_some_and(|(k, _)| {
+                        let k = k.trim();
+                        k.eq_ignore_ascii_case("connection")
+                            || k.eq_ignore_ascii_case("proxy-connection")
+                            || (!auth_header.is_empty()
+                                && k.eq_ignore_ascii_case("proxy-authorization"))
+                    });
+                if !strip {
+                    out.extend_from_slice(line.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            if !auth_header.is_empty() {
+                out.extend_from_slice(auth_header.as_bytes());
+            }
+            out.extend_from_slice(b"Proxy-Connection: close\r\nConnection: close\r\n\r\n");
         } else {
-            // Insert before trailing \r\n\r\n (i.e. after the last \r\n of headers)
             let insert_pos = raw_header_bytes.len().saturating_sub(2);
             out.extend_from_slice(&raw_header_bytes[..insert_pos]);
-            out.extend_from_slice(auth_header.as_bytes());
-            out.extend_from_slice(b"\r\n");
+            if !auth_header.is_empty() {
+                out.extend_from_slice(auth_header.as_bytes());
+            }
+            out.extend_from_slice(b"Connection: close\r\n\r\n");
         }
         out.extend_from_slice(&req.body_prefix);
-
         timeout(HANDSHAKE_TIMEOUT, upstream.write_all(&out))
             .await
             .context("Timeout forwarding plain HTTP request to upstream")??;

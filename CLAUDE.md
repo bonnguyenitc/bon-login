@@ -4,8 +4,6 @@
 >
 > Tài liệu này là **hiến pháp kỹ thuật** chống lan man (anti-scope-creep). Mọi quyết định thiết kế và code phải tuân thủ nghiêm ngặt các quy tắc dưới đây.
 
-@.claude/skills/jev/SKILL.md
-
 ## Automatic Jev Execution Policy
 
 Agents working in this repository MUST proactively use the 12 TypeSafe Jev MCP judgment tools (`jev_screen`, `jev_verify`, `jev_noul`, `jev_find`, `jev_rerank`, `jev_classify`, `jev_decide`, `jev_compare`, `jev_extract`, `jev_audit`, `jev_review`, `jev_gate`):

@@ -4,18 +4,32 @@ use crate::models::{
 };
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+static APP_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    let dir = dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Library/Application Support")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.bonlogin.app");
+    for sub in ["profiles", "kernels", "states", "screenshots", "extensions", "backups"] {
+        let _ = std::fs::create_dir_all(dir.join(sub));
+    }
+    dir
+});
 
 pub fn app_data_dir() -> anyhow::Result<PathBuf> {
-    let dir = dirs::data_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not locate macOS Application Support directory"))?
-        .join("com.bonlogin.app");
-    std::fs::create_dir_all(dir.join("profiles"))?;
-    std::fs::create_dir_all(dir.join("kernels"))?;
-    std::fs::create_dir_all(dir.join("states"))?;
-    std::fs::create_dir_all(dir.join("screenshots"))?;
-    std::fs::create_dir_all(dir.join("extensions"))?;
-    std::fs::create_dir_all(dir.join("backups"))?;
-    Ok(dir)
+    Ok(APP_DATA_DIR.clone())
+}
+
+fn apply_fast_pragmas(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA mmap_size = 67108864;
+         PRAGMA cache_size = -16000;",
+    );
 }
 
 pub struct Database {
@@ -26,26 +40,39 @@ impl Database {
     pub fn open_default() -> anyhow::Result<Self> {
         let db_path = app_data_dir()?.join("bonlogin.sqlite3");
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
+        apply_fast_pragmas(&conn);
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
     }
 
     pub fn open_fast() -> anyhow::Result<Self> {
-        let db_path = crate::launcher::app_support_dir().join("bonlogin.sqlite3");
+        let db_path = APP_DATA_DIR.join("bonlogin.sqlite3");
         let conn = Connection::open(db_path)?;
-        let _ = conn.pragma_update(None, "busy_timeout", 5000);
+        apply_fast_pragmas(&conn);
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
+        apply_fast_pragmas(&conn);
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
+    }
+
+    pub fn with_transaction<T>(&self, f: impl FnOnce(&Self) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.conn.execute_batch("SAVEPOINT bon_batch")?;
+        match f(self) {
+            Ok(val) => {
+                self.conn.execute_batch("RELEASE SAVEPOINT bon_batch")?;
+                Ok(val)
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO SAVEPOINT bon_batch; RELEASE SAVEPOINT bon_batch");
+                Err(err)
+            }
+        }
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
@@ -122,6 +149,10 @@ impl Database {
                 folder_path TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON profiles(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_profiles_group_tag ON profiles(group_tag COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_proxies_created_at ON proxies(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_proxies_group_tag ON proxies(group_tag COLLATE NOCASE);
             INSERT OR IGNORE INTO profile_groups (name, created_at)
                 SELECT DISTINCT TRIM(group_tag), created_at FROM profiles WHERE TRIM(group_tag) != '';
             INSERT OR IGNORE INTO proxy_tags (name, created_at)
@@ -270,7 +301,7 @@ impl Database {
 
 
     pub fn list_profiles(&self) -> anyhow::Result<Vec<Profile>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT
                 id, name, group_tag, seed, os_platform, os_version,
                 brand, brand_version, hardware_concurrency, gpu_spoofing,
@@ -399,7 +430,7 @@ impl Database {
                 None => (None, None, None, None, None, None),
             };
 
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO profiles (
                 id, name, group_tag, seed, os_platform, os_version,
                 brand, brand_version, hardware_concurrency, gpu_spoofing,
@@ -449,7 +480,8 @@ impl Database {
                 notes = excluded.notes,
                 created_at = excluded.created_at,
                 last_launched_at = excluded.last_launched_at",
-            params![
+        )?;
+        stmt.execute(params![
                 profile.id,
                 profile.name,
                 profile.group_tag,
@@ -506,26 +538,28 @@ impl Database {
             ),
             None => (None, None, None, None, None, None),
         };
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "UPDATE profiles
              SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4, geo_accept_lang = ?5, geo_latency_ms = ?6
              WHERE id = ?7",
-            params![ip, country, tz, locale, accept_lang, latency_ms, profile_id],
         )?;
+        stmt.execute(params![ip, country, tz, locale, accept_lang, latency_ms, profile_id])?;
         Ok(())
     }
 
     pub fn touch_last_launched(&self, profile_id: &str) -> anyhow::Result<()> {
-        self.conn.execute(
-            "UPDATE profiles SET last_launched_at = ?1 WHERE id = ?2",
-            params![unix_now(), profile_id],
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE profiles SET last_launched_at = ?1 WHERE id = ?2")?;
+        stmt.execute(params![unix_now(), profile_id])?;
         Ok(())
     }
 
     pub fn delete_profile(&self, profile_id: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM profiles WHERE id = ?1", params![profile_id])?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("DELETE FROM profiles WHERE id = ?1")?;
+        stmt.execute(params![profile_id])?;
         Ok(())
     }
 
@@ -548,15 +582,17 @@ impl Database {
             .into_iter()
             .map(|p| p.id)
             .collect();
-        let mut count = 0;
-        for mut p in parsed {
-            if existing_ids.contains(&p.id) {
-                p.id = uuid::Uuid::new_v4().to_string();
+        self.with_transaction(|db| {
+            let mut count = 0;
+            for mut p in parsed {
+                if existing_ids.contains(&p.id) {
+                    p.id = uuid::Uuid::new_v4().to_string();
+                }
+                db.upsert_profile(&p)?;
+                count += 1;
             }
-            self.upsert_profile(&p)?;
-            count += 1;
-        }
-        Ok(count)
+            Ok(count)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -564,7 +600,7 @@ impl Database {
     // -----------------------------------------------------------------------
 
     pub fn list_proxies(&self) -> anyhow::Result<Vec<SavedProxy>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT
                 id, name, group_tag, protocol, host, port, username, password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
@@ -637,7 +673,7 @@ impl Database {
             None => (None, None, None, None, None, None),
         };
 
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO proxies (
                 id, name, group_tag, protocol, host, port, username, password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
@@ -663,7 +699,8 @@ impl Database {
                 geo_latency_ms = excluded.geo_latency_ms,
                 last_error = excluded.last_error,
                 expired_at = excluded.expired_at",
-            params![
+        )?;
+        stmt.execute(params![
                 proxy.id,
                 proxy.name,
                 proxy.group_tag,
@@ -706,26 +743,76 @@ impl Database {
             ),
             None => (None, None, None, None, None, None),
         };
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "UPDATE proxies
              SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
                  geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = ?7
              WHERE id = ?8",
-            params![ip, country, tz, locale, accept_lang, latency_ms, err, proxy_id],
         )?;
+        stmt.execute(params![ip, country, tz, locale, accept_lang, latency_ms, err, proxy_id])?;
         Ok(())
     }
 
+    /// Updates cached GeoIP across all saved proxies and profiles matching `(protocol, host, port)`.
+    pub fn sync_geo_for_proxy_endpoint(
+        &self,
+        cfg: &ProxyConfig,
+        geo: &GeoInfo,
+    ) -> anyhow::Result<()> {
+        let proto = cfg.protocol.as_str();
+        self.with_transaction(|db| {
+            db.conn
+                .prepare_cached(
+                    "UPDATE proxies
+                     SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
+                         geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = NULL
+                     WHERE protocol = ?7 AND host = ?8 AND port = ?9",
+                )?
+                .execute(params![
+                    geo.ip,
+                    geo.country_code,
+                    geo.timezone,
+                    geo.locale,
+                    geo.accept_lang,
+                    geo.latency_ms,
+                    proto,
+                    cfg.host,
+                    cfg.port
+                ])?;
+            db.conn
+                .prepare_cached(
+                    "UPDATE profiles
+                     SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
+                         geo_accept_lang = ?5, geo_latency_ms = ?6
+                     WHERE proxy_protocol = ?7 AND proxy_host = ?8 AND proxy_port = ?9",
+                )?
+                .execute(params![
+                    geo.ip,
+                    geo.country_code,
+                    geo.timezone,
+                    geo.locale,
+                    geo.accept_lang,
+                    geo.latency_ms,
+                    proto,
+                    cfg.host,
+                    cfg.port
+                ])?;
+            Ok(())
+        })
+    }
+
     pub fn delete_proxy(&self, proxy_id: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM proxies WHERE id = ?1", params![proxy_id])?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("DELETE FROM proxies WHERE id = ?1")?;
+        stmt.execute(params![proxy_id])?;
         Ok(())
     }
 
     pub fn list_groups(&self) -> anyhow::Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name FROM profile_groups ORDER BY created_at ASC, name ASC")?;
+            .prepare_cached("SELECT name FROM profile_groups ORDER BY created_at ASC, name ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -740,30 +827,33 @@ impl Database {
         if trimmed.is_empty() {
             return Ok(());
         }
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO profile_groups (name, created_at) VALUES (?1, ?2)",
-            params![trimmed, unix_now()],
         )?;
+        stmt.execute(params![trimmed, unix_now()])?;
         Ok(())
     }
 
     pub fn delete_group(&self, name: &str) -> anyhow::Result<()> {
         let trimmed = name.trim();
-        self.conn.execute(
-            "DELETE FROM profile_groups WHERE name = ?1 COLLATE NOCASE",
-            params![trimmed],
-        )?;
-        self.conn.execute(
-            "UPDATE profiles SET group_tag = '' WHERE group_tag = ?1 COLLATE NOCASE",
-            params![trimmed],
-        )?;
+        self.with_transaction(|db| {
+            db.conn
+                .prepare_cached("DELETE FROM profile_groups WHERE name = ?1 COLLATE NOCASE")?
+                .execute(params![trimmed])?;
+            db.conn
+                .prepare_cached(
+                    "UPDATE profiles SET group_tag = '' WHERE group_tag = ?1 COLLATE NOCASE",
+                )?
+                .execute(params![trimmed])?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     pub fn list_tags(&self) -> anyhow::Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT name FROM proxy_tags ORDER BY created_at ASC, name ASC")?;
+            .prepare_cached("SELECT name FROM proxy_tags ORDER BY created_at ASC, name ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -778,28 +868,31 @@ impl Database {
         if trimmed.is_empty() {
             return Ok(());
         }
-        self.conn.execute(
-            "INSERT OR IGNORE INTO proxy_tags (name, created_at) VALUES (?1, ?2)",
-            params![trimmed, unix_now()],
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("INSERT OR IGNORE INTO proxy_tags (name, created_at) VALUES (?1, ?2)")?;
+        stmt.execute(params![trimmed, unix_now()])?;
         Ok(())
     }
 
     pub fn delete_tag(&self, name: &str) -> anyhow::Result<()> {
         let trimmed = name.trim();
-        self.conn.execute(
-            "DELETE FROM proxy_tags WHERE name = ?1 COLLATE NOCASE",
-            params![trimmed],
-        )?;
-        self.conn.execute(
-            "UPDATE proxies SET group_tag = '' WHERE group_tag = ?1 COLLATE NOCASE",
-            params![trimmed],
-        )?;
+        self.with_transaction(|db| {
+            db.conn
+                .prepare_cached("DELETE FROM proxy_tags WHERE name = ?1 COLLATE NOCASE")?
+                .execute(params![trimmed])?;
+            db.conn
+                .prepare_cached(
+                    "UPDATE proxies SET group_tag = '' WHERE group_tag = ?1 COLLATE NOCASE",
+                )?
+                .execute(params![trimmed])?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     pub fn list_extensions(&self) -> anyhow::Result<Vec<BrowserExtension>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, icon_label, icon_bg, is_default, enabled, source_url, folder_path, created_at
              FROM extensions
              ORDER BY is_default DESC, created_at ASC",
@@ -825,7 +918,7 @@ impl Database {
     }
 
     pub fn upsert_extension(&self, ext: &BrowserExtension) -> anyhow::Result<()> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO extensions (id, name, icon_label, icon_bg, is_default, enabled, source_url, folder_path, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
@@ -835,7 +928,8 @@ impl Database {
                 enabled = excluded.enabled,
                 source_url = excluded.source_url,
                 folder_path = excluded.folder_path",
-            params![
+        )?;
+        stmt.execute(params![
                 ext.id,
                 ext.name,
                 ext.icon_label,
@@ -851,18 +945,18 @@ impl Database {
     }
 
     pub fn set_extension_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<()> {
-        self.conn.execute(
-            "UPDATE extensions SET enabled = ?2 WHERE id = ?1",
-            params![id, i32::from(enabled)],
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE extensions SET enabled = ?2 WHERE id = ?1")?;
+        stmt.execute(params![id, i32::from(enabled)])?;
         Ok(())
     }
 
     pub fn delete_extension(&self, id: &str) -> anyhow::Result<bool> {
-        let affected = self.conn.execute(
-            "DELETE FROM extensions WHERE id = ?1 AND is_default = 0",
-            params![id],
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("DELETE FROM extensions WHERE id = ?1 AND is_default = 0")?;
+        let affected = stmt.execute(params![id])?;
         Ok(affected > 0)
     }
 }
@@ -879,7 +973,7 @@ mod tests {
         let mut custom = Profile::new_default("FB Ads - US 01", PlatformType::Windows);
         custom.group_tag = "Facebook".to_string();
         custom.seed = 424242;
-        custom.brand = BrowserBrand::Opera;
+        custom.brand = BrowserBrand::Edge;
         custom.hardware_concurrency = 16;
         custom.gpu_spoofing = GpuSpoofMode::SeedGenerated;
         custom.spoof_font = false;
@@ -1006,5 +1100,15 @@ mod tests {
         fake_crx.extend_from_slice(b"PK\x03\x04ZIPDATA");
         let stripped = crate::launcher::strip_crx_header(&fake_crx).unwrap();
         assert_eq!(stripped, b"PK\x03\x04ZIPDATA");
+
+        // Test savepoint transaction rollback on error and commit on success
+        let before_len = db.list_profiles().unwrap().len();
+        let err_res: anyhow::Result<()> = db.with_transaction(|tx| {
+            let p = Profile::new_default("RolledBack", PlatformType::MacOS);
+            tx.upsert_profile(&p)?;
+            anyhow::bail!("simulated batch error");
+        });
+        assert!(err_res.is_err());
+        assert_eq!(db.list_profiles().unwrap().len(), before_len);
     }
 }

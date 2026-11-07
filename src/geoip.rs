@@ -1,9 +1,26 @@
 use crate::models::GeoInfo;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 
-const GEO_TIMEOUT: Duration = Duration::from_secs(8);
+const GEO_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const GEO_TIMEOUT: Duration = Duration::from_secs(6);
+
+static DIRECT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(GEO_CONNECT_TIMEOUT)
+        .timeout(GEO_TIMEOUT)
+        .tcp_nodelay(true)
+        .user_agent("curl/8.7.1")
+        .build()
+        .expect("Failed to initialize direct GeoIP HTTP client")
+});
+
+// shortcut: cap concurrent GeoIP checks at 5 across UI + bulk launches + CLI to avoid 429 rate-limits
+static GEO_SEM: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(5));
 
 #[derive(Debug, Deserialize)]
 struct IpWhoResponse {
@@ -96,71 +113,64 @@ fn parse_ipapi_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
 }
 
 pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoInfo> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(GEO_TIMEOUT)
-        .user_agent("curl/8.7.1");
-
-    if let Some(port) = local_proxy_port {
+    let _permit = GEO_SEM.acquire().await;
+    let client = if let Some(port) = local_proxy_port {
         let proxy_url = format!("http://127.0.0.1:{port}");
-        builder = builder.proxy(
-            reqwest::Proxy::all(&proxy_url)
-                .with_context(|| format!("Invalid local proxy URL {proxy_url}"))?,
-        );
+        reqwest::Client::builder()
+            .connect_timeout(GEO_CONNECT_TIMEOUT)
+            .timeout(GEO_TIMEOUT)
+            .tcp_nodelay(true)
+            .user_agent("curl/8.7.1")
+            .proxy(
+                reqwest::Proxy::all(&proxy_url)
+                    .with_context(|| format!("Invalid local proxy URL {proxy_url}"))?,
+            )
+            .build()
+            .context("Failed to build GeoIP HTTP client")?
+    } else {
+        DIRECT_CLIENT.clone()
+    };
+
+    type ParserFn = fn(&str, Option<u32>) -> Result<GeoInfo>;
+    let providers: [(&'static str, &'static str, ParserFn); 3] = [
+        ("ipwho.is", "https://ipwho.is/", parse_ipwho_json),
+        ("ipinfo.io", "https://ipinfo.io/json", parse_ipinfo_json),
+        (
+            "ip-api.com",
+            "http://ip-api.com/json/?fields=status,message,countryCode,query,timezone",
+            parse_ipapi_json,
+        ),
+    ];
+
+    let mut set = JoinSet::new();
+    for (name, url, parser) in providers {
+        let c = client.clone();
+        set.spawn(async move {
+            let t0 = Instant::now();
+            let resp = c
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| format!("{name} req: {e}"))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("{name} body: {e}"))?;
+            let ms = t0.elapsed().as_millis() as u32;
+            parser(&text, Some(ms)).map_err(|e| format!("{name}: {e}"))
+        });
     }
 
-    let client = builder.build().context("Failed to build GeoIP HTTP client")?;
     let mut errors = Vec::with_capacity(3);
-
-    // 1. https://ipwho.is/
-    let t0 = Instant::now();
-    match client.get("https://ipwho.is/").send().await {
-        Ok(resp) => match resp.text().await {
-            Ok(text) => {
-                let ms = t0.elapsed().as_millis() as u32;
-                match parse_ipwho_json(&text, Some(ms)) {
-                    Ok(geo) => return Ok(geo),
-                    Err(e) => errors.push(format!("ipwho.is: {e}")),
-                }
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(geo)) => {
+                set.abort_all();
+                return Ok(geo);
             }
-            Err(e) => errors.push(format!("ipwho.is body: {e}")),
-        },
-        Err(e) => errors.push(format!("ipwho.is req: {e}")),
-    }
-
-    // 2. https://ipinfo.io/json
-    let t1 = Instant::now();
-    match client.get("https://ipinfo.io/json").send().await {
-        Ok(resp) => match resp.text().await {
-            Ok(text) => {
-                let ms = t1.elapsed().as_millis() as u32;
-                match parse_ipinfo_json(&text, Some(ms)) {
-                    Ok(geo) => return Ok(geo),
-                    Err(e) => errors.push(format!("ipinfo.io: {e}")),
-                }
-            }
-            Err(e) => errors.push(format!("ipinfo.io body: {e}")),
-        },
-        Err(e) => errors.push(format!("ipinfo.io req: {e}")),
-    }
-
-    // 3. http://ip-api.com/json/?fields=status,message,countryCode,query,timezone
-    let t2 = Instant::now();
-    match client
-        .get("http://ip-api.com/json/?fields=status,message,countryCode,query,timezone")
-        .send()
-        .await
-    {
-        Ok(resp) => match resp.text().await {
-            Ok(text) => {
-                let ms = t2.elapsed().as_millis() as u32;
-                match parse_ipapi_json(&text, Some(ms)) {
-                    Ok(geo) => return Ok(geo),
-                    Err(e) => errors.push(format!("ip-api.com: {e}")),
-                }
-            }
-            Err(e) => errors.push(format!("ip-api.com body: {e}")),
-        },
-        Err(e) => errors.push(format!("ip-api.com req: {e}")),
+            Ok(Err(err)) => errors.push(err),
+            Err(join_err) => errors.push(format!("task join: {join_err}")),
+        }
     }
 
     bail!(
