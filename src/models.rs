@@ -651,7 +651,7 @@ impl Profile {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
-            group_tag: "General".to_string(),
+            group_tag: String::new(),
             seed,
             os_platform,
             os_version: os_platform.os_version_for_seed(seed).to_string(),
@@ -785,7 +785,7 @@ impl Profile {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeInfo {
     pub pid: u32,
     pub cdp_port: u16,
@@ -801,6 +801,17 @@ impl RuntimeInfo {
         )
     }
 
+    pub fn pinned_tab_cli(&self, profile_short_id: &str, tab_tag: &str) -> String {
+        let clean_tag: String = tab_tag
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let suffix = if clean_tag.is_empty() { "tab1" } else { &clean_tag };
+        format!(
+            "agent-browser --session bon_{}_{} --input-mode human --pin-tab connect \"{}\"",
+            profile_short_id, suffix, self.ws_url
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

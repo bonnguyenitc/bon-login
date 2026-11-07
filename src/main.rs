@@ -23,6 +23,19 @@ fn main() {
         .expect("Failed to start Tokio runtime");
     let tokio_handle = tokio_rt.handle().clone();
 
+    if let Some(res) = crate::launcher::try_run_cli(&tokio_handle) {
+        if let Err(e) = res {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "error": e.to_string(),
+                })
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
     let db = Database::open_default().expect("Failed to open bonlogin.sqlite3");
 
     let running_processes: Arc<Mutex<HashMap<String, RunningProcess>>> =

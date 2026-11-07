@@ -230,7 +230,8 @@ impl SfSymbol {
     pub const DOC_ON_DOC: &'static str = "\u{100241}";
     pub const PLUS_SQUARE_ON_SQUARE: &'static str = "\u{100add}";
     pub const MAGNIFYINGGLASS: &'static str = "\u{1002ab}";
-    pub const CHEVRON_DOWN: &'static str = "\u{100187}";
+    pub const CHEVRON_UP: &'static str = "\u{100187}";
+    pub const CHEVRON_DOWN: &'static str = "\u{100188}";
     pub const CHEVRON_LEFT: &'static str = "\u{100189}";
     pub const CHEVRON_RIGHT: &'static str = "\u{10018a}";
     pub const ICLOUD_AND_ARROW_UP: &'static str = "\u{100315}";

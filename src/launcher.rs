@@ -82,6 +82,532 @@ pub fn locate_chromium_kernel() -> Option<KernelInfo> {
     None
 }
 
+/// Pure-Rust SHA-256 implementation (FIPS 180-4) for computing Chrome 32-char extension IDs (`a-p`) from SPKI DER keys.
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// Converts a SubjectPublicKeyInfo DER byte slice into Chrome's 32-char extension ID (`a-p`).
+pub fn pubkey_to_chrome_ext_id(spki_der: &[u8]) -> String {
+    let digest = sha256_bytes(spki_der);
+    let mut id = String::with_capacity(32);
+    for &b in &digest[..16] {
+        id.push((b'a' + (b >> 4)) as char);
+        id.push((b'a' + (b & 0x0f)) as char);
+    }
+    id
+}
+
+/// Synthesizes a valid deterministic ASN.1 DER RSA-1024 SubjectPublicKeyInfo (`"key"`) for non-CRX extensions.
+pub fn deterministic_spki_key_b64(seed_id: &str) -> String {
+    use base64::Engine;
+    const SPKI_PREFIX: [u8; 29] = [
+        0x30, 0x81, 0x9f, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+        0x01, 0x05, 0x00, 0x03, 0x81, 0x8d, 0x00, 0x30, 0x81, 0x89, 0x02, 0x81, 0x81, 0x00,
+    ];
+    const SPKI_SUFFIX: [u8; 5] = [0x02, 0x03, 0x01, 0x00, 0x01];
+    let mut der = Vec::with_capacity(162);
+    der.extend_from_slice(&SPKI_PREFIX);
+    for block in 0..4u8 {
+        let mut input = seed_id.as_bytes().to_vec();
+        input.push(b':');
+        input.push(b'0' + block);
+        let mut h = sha256_bytes(&input);
+        if block == 0 {
+            h[0] |= 0x80;
+        }
+        if block == 3 {
+            h[31] |= 0x01;
+        }
+        der.extend_from_slice(&h);
+    }
+    der.extend_from_slice(&SPKI_SUFFIX);
+    base64::engine::general_purpose::STANDARD.encode(&der)
+}
+
+fn read_proto_varint(buf: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    while pos < buf.len() {
+        let b = buf[pos];
+        pos += 1;
+        val |= u64::from(b & 0x7f).checked_shl(shift)?;
+        if (b & 0x80) == 0 {
+            return Some((val, pos));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Extracts the developer's RSA public key (base64) from a CRX2 or CRX3 header so unpacked extensions
+/// retain their exact Chrome Web Store 32-char `chrome-extension://<id>` identity.
+pub fn extract_crx_public_key_b64(bytes: &[u8], preferred_id: Option<&str>) -> Option<String> {
+    use base64::Engine;
+    if !bytes.starts_with(b"Cr24") || bytes.len() < 12 {
+        return None;
+    }
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version == 2 && bytes.len() >= 16 {
+        let pub_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let end = 16usize.saturating_add(pub_len);
+        if pub_len > 0 && end <= bytes.len() {
+            return Some(base64::engine::general_purpose::STANDARD.encode(&bytes[16..end]));
+        }
+        return None;
+    }
+    if version != 3 {
+        return None;
+    }
+    let header_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let header_end = 12usize.saturating_add(header_len);
+    if header_end > bytes.len() {
+        return None;
+    }
+    let header = &bytes[12..header_end];
+    // Google Web Store's own CRX3 signing key ID (not the extension's developer key)
+    const WEBSTORE_SIGNING_ID: &str = "lfoeajgcchlidpicbabpmckkejpckcfb";
+    let mut pos = 0;
+    let mut fallback_key: Option<String> = None;
+    while pos < header.len() {
+        let (tag, next_pos) = read_proto_varint(header, pos)?;
+        pos = next_pos;
+        let field_num = tag >> 3;
+        let wire_type = tag & 7;
+        match wire_type {
+            0 => {
+                let (_, next_p) = read_proto_varint(header, pos)?;
+                pos = next_p;
+            }
+            2 => {
+                let (len, next_p) = read_proto_varint(header, pos)?;
+                let end_p = next_p.saturating_add(len as usize);
+                if end_p > header.len() {
+                    break;
+                }
+                let payload = &header[next_p..end_p];
+                pos = end_p;
+                if field_num == 2 || field_num == 3 {
+                    let mut sub_pos = 0;
+                    while sub_pos < payload.len() {
+                        let Some((stag, snext)) = read_proto_varint(payload, sub_pos) else {
+                            break;
+                        };
+                        sub_pos = snext;
+                        let sfield = stag >> 3;
+                        let swire = stag & 7;
+                        if swire == 2 {
+                            let Some((slen, sp)) = read_proto_varint(payload, sub_pos) else {
+                                break;
+                            };
+                            let send = sp.saturating_add(slen as usize);
+                            if send > payload.len() {
+                                break;
+                            }
+                            if sfield == 1 {
+                                let pub_bytes = &payload[sp..send];
+                                let cid = pubkey_to_chrome_ext_id(pub_bytes);
+                                let b64 =
+                                    base64::engine::general_purpose::STANDARD.encode(pub_bytes);
+                                if preferred_id.is_some_and(|want| want.eq_ignore_ascii_case(&cid))
+                                {
+                                    return Some(b64);
+                                }
+                                if field_num == 2 && cid != WEBSTORE_SIGNING_ID {
+                                    fallback_key = Some(b64);
+                                }
+                            }
+                            sub_pos = send;
+                        } else if swire == 0 {
+                            let Some((_, sp)) = read_proto_varint(payload, sub_pos) else {
+                                break;
+                            };
+                            sub_pos = sp;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    fallback_key
+}
+
+const BON_EXT_SHIM_JS: &str = r#"/* __BON_EXT_SHIM__ */
+;(() => {
+  if (typeof globalThis.__bonExtShimInstalled !== 'undefined') return;
+  globalThis.__bonExtShimInstalled = true;
+  const ch = typeof chrome !== 'undefined' ? chrome : (typeof browser !== 'undefined' ? browser : null);
+  if (!ch) return;
+
+  if (ch.tabs && ch.tabs.query) {
+    const origQuery = ch.tabs.query.bind(ch.tabs);
+    const isSelfExtOnly = (tabs) =>
+      Array.isArray(tabs) &&
+      tabs.length === 1 &&
+      tabs[0] &&
+      typeof tabs[0].url === 'string' &&
+      tabs[0].url.startsWith('chrome-extension://');
+
+    ch.tabs.query = function(queryInfo, callback) {
+      if (!queryInfo || !queryInfo.active) {
+        return callback ? origQuery(queryInfo, callback) : origQuery(queryInfo);
+      }
+      if (callback) {
+        return origQuery(queryInfo, (tabs) => {
+          if (!isSelfExtOnly(tabs)) return callback(tabs);
+          const allInfo = Object.assign({}, queryInfo);
+          delete allInfo.active;
+          origQuery(allInfo, (allTabs) => {
+            const webTabs = (allTabs || []).filter(t => t && t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('devtools://'));
+            if (webTabs.length > 0) {
+              return callback([Object.assign({}, webTabs[webTabs.length - 1], { active: true })]);
+            }
+            callback(tabs);
+          });
+        });
+      }
+      return origQuery(queryInfo).then(async (tabs) => {
+        if (!isSelfExtOnly(tabs)) return tabs;
+        const allInfo = Object.assign({}, queryInfo);
+        delete allInfo.active;
+        const allTabs = await origQuery(allInfo);
+        const webTabs = (allTabs || []).filter(t => t && t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('devtools://'));
+        if (webTabs.length > 0) {
+          return [Object.assign({}, webTabs[webTabs.length - 1], { active: true })];
+        }
+        return tabs;
+      });
+    };
+  }
+
+  const normalizeExtUrl = (u) => {
+    if (!u || typeof u !== 'string') return null;
+    if (u.startsWith('chrome-extension://')) return u;
+    if (!u.includes('://') && u !== 'about:blank' && ch.runtime && ch.runtime.getURL) {
+      return ch.runtime.getURL(u.replace(/^\//, ''));
+    }
+    return null;
+  };
+
+  if (ch.windows && ch.windows.create && ch.tabs && ch.tabs.update) {
+    const origWinCreate = ch.windows.create.bind(ch.windows);
+    const origTabUpdate = ch.tabs.update.bind(ch.tabs);
+    ch.windows.create = function(createData, callback) {
+      const rawUrl = createData && (Array.isArray(createData.url) ? createData.url[0] : createData.url);
+      const extUrl = normalizeExtUrl(rawUrl);
+      if (!extUrl) {
+        return callback ? origWinCreate(createData, callback) : origWinCreate(createData);
+      }
+      const patched = Object.assign({}, createData, { url: 'about:blank' });
+      if (callback) {
+        return origWinCreate(patched, (win) => {
+          const tabId = win && win.tabs && win.tabs[0] && win.tabs[0].id;
+          if (tabId !== undefined) {
+            setTimeout(() => origTabUpdate(tabId, { url: extUrl }, () => callback(win)), 40);
+          } else {
+            callback(win);
+          }
+        });
+      }
+      return origWinCreate(patched).then(async (win) => {
+        const tabId = win && win.tabs && win.tabs[0] && win.tabs[0].id;
+        if (tabId !== undefined) {
+          await new Promise(r => setTimeout(r, 40));
+          await origTabUpdate(tabId, { url: extUrl });
+        }
+        return win;
+      });
+    };
+  }
+
+  if (ch.tabs && ch.tabs.create && ch.tabs.update) {
+    const origTabCreate = ch.tabs.create.bind(ch.tabs);
+    const origTabUpdate = ch.tabs.update.bind(ch.tabs);
+    ch.tabs.create = function(createProperties, callback) {
+      const extUrl = normalizeExtUrl(createProperties && createProperties.url);
+      if (!extUrl) {
+        return callback ? origTabCreate(createProperties, callback) : origTabCreate(createProperties);
+      }
+      const patched = Object.assign({}, createProperties, { url: 'about:blank' });
+      if (callback) {
+        return origTabCreate(patched, (tab) => {
+          if (tab && tab.id !== undefined) {
+            setTimeout(() => origTabUpdate(tab.id, { url: extUrl }, (updated) => callback(updated || tab)), 40);
+          } else {
+            callback(tab);
+          }
+        });
+      }
+      return origTabCreate(patched).then(async (tab) => {
+        if (tab && tab.id !== undefined) {
+          await new Promise(r => setTimeout(r, 40));
+          return await origTabUpdate(tab.id, { url: extUrl });
+        }
+        return tab;
+      });
+    };
+  }
+})();
+"#;
+
+fn inject_html_shim_recursive(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            inject_html_shim_recursive(&p);
+        } else if p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("html"))
+            && let Ok(html) = std::fs::read_to_string(&p)
+            && !html.contains("__bon_ext_shim.js")
+        {
+            let tag = r#"<script src="/__bon_ext_shim.js"></script>"#;
+            let patched = if let Some(idx) = html.to_ascii_lowercase().find("<head>") {
+                let split_at = idx + "<head>".len();
+                format!("{}{}{}", &html[..split_at], tag, &html[split_at..])
+            } else {
+                format!("{tag}{html}")
+            };
+            let _ = std::fs::write(&p, patched);
+        }
+    }
+}
+
+fn prepend_js_shim_if_needed(js_path: &Path) {
+    if let Ok(raw) = std::fs::read_to_string(js_path)
+        && !raw.contains("__BON_EXT_SHIM__")
+    {
+        let _ = std::fs::write(js_path, format!("{BON_EXT_SHIM_JS}\n{raw}"));
+    }
+}
+
+/// Patches an unpacked extension directory so `agent-browser` can deterministically address its
+/// `chrome-extension://<id>` pages, query active web tabs from popup tabs, and intercept popup windows.
+pub fn patch_unpacked_extension_for_agent(
+    ext_dir: &Path,
+    ext_id_hint: &str,
+    crx_key_b64: Option<&str>,
+) {
+    let manifest_path = ext_dir.join("manifest.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return;
+    };
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(obj) = val.as_object_mut() else {
+        return;
+    };
+
+    let has_valid_key = obj
+        .get("key")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty());
+    if let Some(k) = crx_key_b64 {
+        obj.insert("key".to_string(), serde_json::Value::String(k.to_string()));
+    } else if !has_valid_key {
+        let seed = if let Some(store_id) = BrowserExtension::extract_chrome_store_id(ext_id_hint) {
+            store_id
+        } else {
+            ext_id_hint.to_string()
+        };
+        obj.insert(
+            "key".to_string(),
+            serde_json::Value::String(deterministic_spki_key_b64(&seed)),
+        );
+    }
+
+    let mv = obj
+        .get("manifest_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3);
+    if mv >= 3 {
+        let mut hosts: Vec<String> = obj
+            .get("host_permissions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(opt_arr) = obj
+            .get("optional_host_permissions")
+            .and_then(|v| v.as_array())
+        {
+            for item in opt_arr.iter().filter_map(|x| x.as_str()) {
+                if !hosts.iter().any(|h| h == item) {
+                    hosts.push(item.to_string());
+                }
+            }
+        }
+        if !hosts.is_empty() && !hosts.iter().any(|h| h == "<all_urls>") {
+            hosts.push("<all_urls>".to_string());
+        }
+        if !hosts.is_empty() {
+            obj.insert(
+                "host_permissions".to_string(),
+                serde_json::Value::Array(
+                    hosts.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
+        }
+    }
+
+    if let Some(bg) = obj.get("background") {
+        if let Some(sw) = bg.get("service_worker").and_then(|v| v.as_str()) {
+            prepend_js_shim_if_needed(&ext_dir.join(sw.trim_start_matches('/')));
+        }
+        if let Some(scripts) = bg.get("scripts").and_then(|v| v.as_array()) {
+            for s in scripts.iter().filter_map(|v| v.as_str()) {
+                prepend_js_shim_if_needed(&ext_dir.join(s.trim_start_matches('/')));
+            }
+        }
+    }
+
+    let _ = std::fs::write(ext_dir.join("__bon_ext_shim.js"), BON_EXT_SHIM_JS);
+    inject_html_shim_recursive(ext_dir);
+    if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+        let _ = std::fs::write(&manifest_path, pretty);
+    }
+}
+
+/// Computes the runtime 32-char `chrome-extension://<id>` and primary entry HTML URL (`popup`/`options`/`sidepanel`) for an extension.
+pub fn resolve_extension_runtime_info(ext: &BrowserExtension) -> Option<(String, String)> {
+    use base64::Engine;
+    let ext_dir = ensure_extension_unpacked(ext).ok()?;
+    let raw = std::fs::read_to_string(ext_dir.join("manifest.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let key_b64 = val.get("key").and_then(|v| v.as_str())?;
+    let key_der = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.trim())
+        .ok()?;
+    let runtime_id = pubkey_to_chrome_ext_id(&key_der);
+
+    let popup_candidates = [
+        val.get("action")
+            .and_then(|a| a.get("default_popup"))
+            .and_then(|v| v.as_str()),
+        val.get("browser_action")
+            .and_then(|a| a.get("default_popup"))
+            .and_then(|v| v.as_str()),
+        val.get("page_action")
+            .and_then(|a| a.get("default_popup"))
+            .and_then(|v| v.as_str()),
+        val.get("side_panel")
+            .and_then(|a| a.get("default_path"))
+            .and_then(|v| v.as_str()),
+        val.get("options_ui")
+            .and_then(|a| a.get("page"))
+            .and_then(|v| v.as_str()),
+        val.get("options_page").and_then(|v| v.as_str()),
+    ];
+    for cand in popup_candidates.into_iter().flatten() {
+        let clean = cand.trim().trim_start_matches('/');
+        if !clean.is_empty() {
+            return Some((
+                runtime_id.clone(),
+                format!("chrome-extension://{runtime_id}/{clean}"),
+            ));
+        }
+    }
+    for fallback in [
+        "home.html",
+        "popup.html",
+        "index.html",
+        "notification.html",
+        "options.html",
+    ] {
+        if ext_dir.join(fallback).is_file() {
+            return Some((
+                runtime_id.clone(),
+                format!("chrome-extension://{runtime_id}/{fallback}"),
+            ));
+        }
+    }
+    Some((
+        runtime_id.clone(),
+        format!("chrome-extension://{runtime_id}/manifest.json"),
+    ))
+}
+
+pub fn is_placeholder_extension_dir(dir: &Path) -> bool {
+    !dir.join("manifest.json").is_file()
+        || std::fs::read_to_string(dir.join("content.js"))
+            .is_ok_and(|c| c.contains("BonLogin Managed Extension"))
+}
+
 /// Discovers enabled unpacked Chrome extensions inside `~/Library/Application Support/com.bonlogin.app/extensions/*`.
 pub fn discover_unpacked_extensions() -> Vec<PathBuf> {
     if let Ok(db) = crate::db::Database::open_fast()
@@ -393,6 +919,7 @@ pub fn install_extension_from_file(src_path: &Path) -> Result<BrowserExtension> 
             let _ = std::fs::remove_dir_all(&dest_dir);
         }
         copy_dir_recursive(src_path, &dest_dir)?;
+        patch_unpacked_extension_for_agent(&dest_dir, &ext_id, None);
         let name = read_extension_name_from_dir(&dest_dir, &ext_id);
         let (icon_label, icon_bg) = pick_icon_badge(&name);
         return Ok(BrowserExtension {
@@ -419,10 +946,17 @@ pub fn install_extension_from_bytes(
     preferred_id: Option<&str>,
     source_url: &str,
 ) -> Result<BrowserExtension> {
+    let crx_key_b64 = extract_crx_public_key_b64(raw_bytes, preferred_id);
     let zip_bytes = strip_crx_header(raw_bytes)?;
     let ext_id = preferred_id
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
+        .or_else(|| {
+            use base64::Engine;
+            let k = crx_key_b64.as_deref()?;
+            let der = base64::engine::general_purpose::STANDARD.decode(k).ok()?;
+            Some(pubkey_to_chrome_ext_id(&der))
+        })
         .unwrap_or_else(|| format!("ext-{}", unix_now()));
 
     let ext_root = app_support_dir().join("extensions");
@@ -461,6 +995,7 @@ pub fn install_extension_from_bytes(
         bail!("Archive does not contain a Chrome extension manifest.json");
     }
 
+    patch_unpacked_extension_for_agent(&dest_dir, &ext_id, crx_key_b64.as_deref());
     let name = read_extension_name_from_dir(&dest_dir, &ext_id);
     let (icon_label, icon_bg) = pick_icon_badge(&name);
     Ok(BrowserExtension {
@@ -516,23 +1051,34 @@ pub async fn download_extension_from_url(url_or_id: &str) -> Result<BrowserExten
 
 /// Ensures an enabled extension has a valid unpacked MV3 directory on disk in `extensions/<id>`.
 pub fn ensure_extension_unpacked(ext: &BrowserExtension) -> Result<PathBuf> {
-    let ext_dir = app_support_dir().join("extensions").join(&ext.id);
+    let ext_dir = if !ext.folder_path.trim().is_empty() {
+        PathBuf::from(ext.folder_path.trim())
+    } else {
+        app_support_dir().join("extensions").join(&ext.id)
+    };
     if ext_dir.join("manifest.json").is_file() {
+        patch_unpacked_extension_for_agent(&ext_dir, &ext.id, None);
         return Ok(ext_dir);
     }
     std::fs::create_dir_all(&ext_dir)?;
     let clean_name = ext.name.replace('"', "'");
-    let content_js = match ext.id.as_str() {
-        "coordinates" => {
+    let (content_js, popup_html, popup_js) = match ext.id.as_str() {
+        "coordinates" => (
             r#"(() => {
   const b = document.createElement('div');
+  b.id = '__bon_coords_badge';
   b.style.cssText = 'position:fixed;bottom:8px;right:8px;z-index:2147483647;background:rgba(15,17,23,0.88);color:#60a5fa;padding:3px 8px;border-radius:4px;font:11px monospace;pointer-events:none;border:1px solid #3b82f6;';
   b.textContent = 'x: 0, y: 0';
   document.documentElement.appendChild(b);
   window.addEventListener('mousemove', e => { b.textContent = `x: ${e.clientX}, y: ${e.clientY}`; }, { passive: true });
-})();"#
-        }
-        "cookie-token-grabber" => {
+})();"#,
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Coordinates Helper</title></head><body style="width:240px;padding:12px;font-family:sans-serif;background:#0f1117;color:#f8fafc"><h3>Coordinates Helper</h3><p id="status">Overlay active on all pages</p><button id="toggle-btn">Toggle Overlay</button><script src="popup.js"></script></body></html>"#,
+            r#"document.getElementById('toggle-btn').onclick = async () => {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  document.getElementById('status').textContent = tab ? ('Target: ' + tab.url) : 'Toggled';
+};"#,
+        ),
+        "cookie-token-grabber" => (
             r#"(() => {
   window.addEventListener('keydown', e => {
     if (e.altKey && e.shiftKey && e.code === 'KeyC') {
@@ -540,9 +1086,24 @@ pub fn ensure_extension_unpacked(ext: &BrowserExtension) -> Result<PathBuf> {
       navigator.clipboard.writeText(payload);
     }
   });
-})();"#
-        }
-        "ip-status-badge" => {
+})();"#,
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cookie & Token Grabber</title></head><body style="width:280px;padding:12px;font-family:sans-serif;background:#0f1117;color:#f8fafc"><h3>Cookie & Token Grabber</h3><pre id="out" style="max-height:140px;overflow:auto;font-size:11px;background:#1e293b;padding:6px"></pre><button id="grab-btn">Grab Active Tab Cookies</button><script src="popup.js"></script></body></html>"#,
+            r#"async function loadCookies() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.url) return;
+  const cookies = await chrome.cookies.getAll({ url: tab.url });
+  const text = JSON.stringify({ url: tab.url, count: cookies.length, cookies }, null, 2);
+  document.getElementById('out').textContent = text;
+  return text;
+}
+loadCookies();
+document.getElementById('grab-btn').onclick = async () => {
+  const text = await loadCookies();
+  if (text && navigator.clipboard) await navigator.clipboard.writeText(text);
+  document.getElementById('grab-btn').textContent = 'Copied!';
+};"#,
+        ),
+        "ip-status-badge" => (
             r#"(() => {
   const b = document.createElement('div');
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -551,14 +1112,15 @@ pub fn ensure_extension_unpacked(ext: &BrowserExtension) -> Result<PathBuf> {
   b.title = 'Click to hide';
   b.onclick = () => b.remove();
   document.documentElement.appendChild(b);
-})();"#
-        }
-        "element-helper" => {
-            r#"(() => {
-  window.__bonElementHelper = true;
-})();"#
-        }
-        _ => "// BonLogin Managed Extension\n",
+})();"#,
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Proxy / IP Status Badge</title></head><body style="width:240px;padding:12px;font-family:sans-serif;background:#0f1117;color:#f8fafc"><h3>Proxy / IP Status Badge</h3><div id="info"></div><script src="popup.js"></script></body></html>"#,
+            r#"document.getElementById('info').textContent = navigator.language + ' | ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');"#,
+        ),
+        _ => (
+            "// BonLogin Managed Extension\n",
+            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Extension Popup</title></head><body><h1>Extension Ready</h1></body></html>"#,
+            "",
+        ),
     };
     let manifest = format!(
         r#"{{
@@ -566,6 +1128,12 @@ pub fn ensure_extension_unpacked(ext: &BrowserExtension) -> Result<PathBuf> {
   "name": "{clean_name}",
   "version": "1.0.0",
   "description": "{clean_name} managed by BonLogin",
+  "permissions": ["tabs", "storage", "cookies", "clipboardWrite"],
+  "host_permissions": ["<all_urls>"],
+  "action": {{
+    "default_title": "{clean_name}",
+    "default_popup": "popup.html"
+  }},
   "content_scripts": [
     {{
       "matches": ["<all_urls>"],
@@ -577,7 +1145,47 @@ pub fn ensure_extension_unpacked(ext: &BrowserExtension) -> Result<PathBuf> {
     );
     std::fs::write(ext_dir.join("manifest.json"), manifest)?;
     std::fs::write(ext_dir.join("content.js"), content_js)?;
+    std::fs::write(ext_dir.join("popup.html"), popup_html)?;
+    std::fs::write(ext_dir.join("popup.js"), popup_js)?;
+    patch_unpacked_extension_for_agent(&ext_dir, &ext.id, None);
     Ok(ext_dir)
+}
+
+/// Downloads any enabled remote extensions (Chrome Web Store ID or URL) that are still placeholders on disk.
+pub async fn sync_enabled_remote_extensions() {
+    let enabled_remote: Vec<BrowserExtension> = crate::db::Database::open_fast()
+        .ok()
+        .and_then(|db| db.list_extensions().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| {
+            if !e.enabled {
+                return false;
+            }
+            let src = e.source_url.trim();
+            let is_remote = BrowserExtension::extract_chrome_store_id(src).is_some()
+                || src.starts_with("http://")
+                || src.starts_with("https://");
+            let dir = app_support_dir().join("extensions").join(&e.id);
+            is_remote && is_placeholder_extension_dir(&dir)
+        })
+        .collect();
+
+    for ext in enabled_remote {
+        let store_url = ext.source_url.trim().to_string();
+        let eid = ext.id.clone();
+        if let Ok(downloaded) = download_extension_from_url(&store_url).await {
+            let dst = app_support_dir().join("extensions").join(&eid);
+            if downloaded.id != eid {
+                let src = app_support_dir().join("extensions").join(&downloaded.id);
+                if src.exists() && src != dst {
+                    let _ = std::fs::remove_dir_all(&dst);
+                    let _ = std::fs::rename(&src, &dst);
+                }
+            }
+            patch_unpacked_extension_for_agent(&dst, &eid, None);
+        }
+    }
 }
 
 /// Removes an unpacked extension directory from disk.
@@ -708,6 +1316,131 @@ pub fn profile_user_data_dir(profile_id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+pub fn profile_download_dir(short_id: &str) -> PathBuf {
+    let dir = app_support_dir()
+        .join("downloads")
+        .join(format!("bon_{short_id}"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn runtime_file_path(profile_id: &str) -> PathBuf {
+    app_support_dir()
+        .join("profiles")
+        .join(profile_id)
+        .join("bon_runtime.json")
+}
+
+fn launch_error_file_path(profile_id: &str) -> PathBuf {
+    app_support_dir()
+        .join("profiles")
+        .join(profile_id)
+        .join("bon_launch_error.txt")
+}
+
+/// Checks whether a profile currently has a live Chromium instance with an open window.
+pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
+    let prof_dir = app_support_dir().join("profiles").join(profile_id);
+    let rt_path = prof_dir.join("bon_runtime.json");
+    let active_port_path = prof_dir.join("DevToolsActivePort");
+
+    let info = if let Ok(raw) = std::fs::read_to_string(&rt_path)
+        && let Ok(parsed) = serde_json::from_str::<RuntimeInfo>(&raw)
+    {
+        parsed
+    } else if let Ok(contents) = std::fs::read_to_string(&active_port_path)
+        && let Ok((cdp_port, ws_url)) = parse_devtools_active_port(&contents)
+    {
+        RuntimeInfo {
+            pid: 0,
+            cdp_port,
+            ws_url,
+            local_proxy_port: None,
+        }
+    } else {
+        return None;
+    };
+
+    if cdp_has_open_window(info.cdp_port) == Some(true) {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+/// Gracefully stops a profile launched by another process (CLI daemon or previous session).
+pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
+    let prof_dir = app_support_dir().join("profiles").join(profile_id);
+    let rt_path = prof_dir.join("bon_runtime.json");
+    let active_port_path = prof_dir.join("DevToolsActivePort");
+    let maybe_info = std::fs::read_to_string(&rt_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<RuntimeInfo>(&s).ok())
+        .or_else(|| {
+            std::fs::read_to_string(&active_port_path)
+                .ok()
+                .and_then(|c| parse_devtools_active_port(&c).ok())
+                .map(|(cdp_port, ws_url)| RuntimeInfo {
+                    pid: 0,
+                    cdp_port,
+                    ws_url,
+                    local_proxy_port: None,
+                })
+        });
+
+    let mut stopped_any = false;
+    if let Some(info) = maybe_info {
+        if info.pid > 0 {
+            #[cfg(unix)]
+            {
+                let pid_s = info.pid.to_string();
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid_s])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                for _ in 0..30 {
+                    if cdp_has_open_window(info.cdp_port).is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid_s])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            stopped_any = true;
+        } else if let Some(list_body) = cdp_http_get_body(info.cdp_port, "/json/list")
+            && let Ok( serde_json::Value::Array(arr) ) = serde_json::from_str(&list_body)
+        {
+            for item in arr {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    let _ = cdp_http_get_body(info.cdp_port, &format!("/json/close/{id}"));
+                    stopped_any = true;
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&rt_path);
+    let _ = std::fs::remove_file(&active_port_path);
+
+    if !short_id.is_empty() {
+        let session = format!("bon_{short_id}");
+        let _ = agent_browser_cmd()
+            .args(["--session", &session, "close"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    stopped_any
+}
+
 pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
     let dir = app_support_dir().join("profiles").join(profile_id);
     if dir.exists() {
@@ -824,8 +1557,11 @@ pub fn build_chromium_args(
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(",");
+        args.push(format!("--disable-extensions-except={joined}"));
         args.push(format!("--load-extension={joined}"));
+        args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".to_string());
     }
+    args.push("--allow-file-access-from-files".to_string());
 
     // WebRTC lock flags
     args.extend([
@@ -888,53 +1624,7 @@ pub fn parse_devtools_active_port(contents: &str) -> Result<(u16, String)> {
 /// Queries CDP `/json/list` over loopback to check whether any browser tab/window (`page` or `app`) is still open.
 /// On macOS, clicking the red close button closes the window while leaving the Chromium process idle in the Dock.
 pub fn cdp_has_open_window(cdp_port: u16) -> Option<bool> {
-    use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cdp_port);
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-    let req = format!("GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{cdp_port}\r\n\r\n");
-    stream.write_all(req.as_bytes()).ok()?;
-
-    // Chromium's net::HttpServer keeps sockets open; frame by Content-Length instead of waiting for EOF.
-    let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 2048];
-    let header_end = loop {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if buf.len() > 65536 {
-            return None;
-        }
-    };
-
-    let headers = std::str::from_utf8(&buf[..header_end]).ok()?;
-    let content_len = headers
-        .lines()
-        .find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| v.trim().parse::<usize>().ok())
-                .flatten()
-        })?;
-
-    while buf.len() < header_end + content_len {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-
-    let body = std::str::from_utf8(buf.get(header_end..header_end + content_len)?).ok()?;
+    let body = cdp_http_get_body(cdp_port, "/json/list")?;
     let items: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
     let arr = items.as_array()?;
     Some(arr.iter().any(|item| {
@@ -945,6 +1635,7 @@ pub fn cdp_has_open_window(cdp_port: u16) -> Option<bool> {
 }
 
 pub struct RunningProcess {
+    pub profile_id: String,
     pub child: Child,
     pub info: RuntimeInfo,
     pub short_id: String,
@@ -1000,9 +1691,19 @@ impl RunningProcess {
             tunnel.stop();
         }
 
+        if !self.profile_id.is_empty() {
+            let _ = std::fs::remove_file(runtime_file_path(&self.profile_id));
+            let _ = std::fs::remove_file(
+                app_support_dir()
+                    .join("profiles")
+                    .join(&self.profile_id)
+                    .join("DevToolsActivePort"),
+            );
+        }
+
         if !self.short_id.is_empty() {
             let session = format!("bon_{}", self.short_id);
-            let _ = agent_browser_cmd()
+            let _ = agent_browser_cmd_for_short_id(&self.short_id)
                 .args(["--session", &session, "close"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -1049,9 +1750,11 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
 
     let active_port_file = user_data_dir.join("DevToolsActivePort");
     let _ = std::fs::remove_file(&active_port_file);
-
+    let _ = std::fs::remove_file(runtime_file_path(&profile.id));
+    let _ = std::fs::remove_file(launch_error_file_path(&profile.id));
+    let _ = profile_download_dir(&profile.short_id());
     unquarantine_macos_app(&kernel.path);
-
+    sync_enabled_remote_extensions().await;
     let args = build_chromium_args(
         profile,
         local_proxy_port,
@@ -1113,7 +1816,15 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
             );
         }
     };
-
+    let info = RuntimeInfo {
+        pid,
+        cdp_port,
+        ws_url: ws_url.clone(),
+        local_proxy_port,
+    };
+    if let Ok(json) = serde_json::to_string(&info) {
+        let _ = std::fs::write(runtime_file_path(&profile.id), json);
+    }
 
     let mut saw_window = false;
     for _ in 0..30 {
@@ -1134,19 +1845,14 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         })
         .await;
     } else {
-        tokio::task::spawn_blocking(move || {
+        let _ = tokio::task::spawn_blocking(move || {
             let _ = ensure_agent_browser_connected(&sid, &ws_clone);
-        });
+        })
+        .await;
     }
-    let info = RuntimeInfo {
-        pid,
-        cdp_port,
-        ws_url,
-        local_proxy_port,
-    };
-
     Ok((
         RunningProcess {
+            profile_id: profile.id.clone(),
             child,
             info,
             short_id,
@@ -1163,22 +1869,142 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
 // ---------------------------------------------------------------------------
 
 fn agent_browser_cmd() -> Command {
-    if let Some(home) = dirs::home_dir() {
-        let local_bin = home.join(".local/bin/agent-browser");
-        if local_bin.is_file() {
-            return Command::new(local_bin);
-        }
-    }
-    let brew_bin = Path::new("/opt/homebrew/bin/agent-browser");
-    if brew_bin.is_file() {
-        return Command::new(brew_bin);
-    }
-    Command::new("agent-browser")
+    let mut cmd = if let Some(home) = dirs::home_dir()
+        && home.join(".local/bin/agent-browser").is_file()
+    {
+        Command::new(home.join(".local/bin/agent-browser"))
+    } else if Path::new("/opt/homebrew/bin/agent-browser").is_file() {
+        Command::new("/opt/homebrew/bin/agent-browser")
+    } else {
+        Command::new("agent-browser")
+    };
+    cmd.env("AGENT_BROWSER_NO_VERSION_CHECK", "1")
+        .env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "0");
+    cmd
 }
 
-fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<String> {
+fn agent_browser_cmd_for_short_id(short_id: &str) -> Command {
+    let mut cmd = agent_browser_cmd();
+    if !short_id.is_empty() {
+        cmd.env("AGENT_BROWSER_DOWNLOAD_PATH", profile_download_dir(short_id));
+    }
+    cmd
+}
+
+fn cdp_http_get_body(cdp_port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cdp_port);
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{cdp_port}\r\n\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 2048];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 65536 {
+            return None;
+        }
+    };
+    let headers = std::str::from_utf8(&buf[..header_end]).ok()?;
+    let content_len = headers.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| v.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    while buf.len() < header_end + content_len {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    std::str::from_utf8(buf.get(header_end..header_end + content_len)?)
+        .ok()
+        .map(ToString::to_string)
+}
+
+fn extract_port_from_ws_url(ws_url: &str) -> Option<u16> {
+    let after_host = ws_url.strip_prefix("ws://127.0.0.1:")?;
+    let port_str = after_host.split('/').next()?;
+    port_str.parse().ok()
+}
+
+/// Attaches any `chrome-extension://` page tabs that opened at browser startup (before `agent-browser connect`)
+/// so they appear in `agent-browser --session bon_<id> tab`.
+fn sync_extension_targets_to_agent_browser(session: &str, cdp_port: u16) -> usize {
+    let Some(list_body) = cdp_http_get_body(cdp_port, "/json/list") else {
+        return 0;
+    };
+    let Ok(targets) = serde_json::from_str::<serde_json::Value>(&list_body) else {
+        return 0;
+    };
+    let Some(target_arr) = targets.as_array() else {
+        return 0;
+    };
+    let ext_pages: Vec<(String, String)> = target_arr
+        .iter()
+        .filter_map(|t| {
+            let ty = t.get("type")?.as_str()?;
+            let id = t.get("id")?.as_str()?;
+            let url = t.get("url")?.as_str()?;
+            (matches!(ty, "page" | "app") && url.starts_with("chrome-extension://"))
+                .then(|| (id.to_string(), url.to_string()))
+        })
+        .collect();
+    if ext_pages.is_empty() {
+        return 0;
+    }
+
+    let known_urls: std::collections::HashSet<String> = agent_browser_cmd()
+        .args(["--session", session, "tab", "--json"])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| {
+            v.get("data")?
+                .get("tabs")?
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.get("url")?.as_str().map(ToString::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+
+    let mut attached = 0;
+    for (old_id, ext_url) in ext_pages {
+        if !known_urls.contains(&ext_url) {
+            let opened = agent_browser_cmd()
+                .args(["--session", session, "tab", "new", &ext_url])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if opened {
+                let _ = cdp_http_get_body(cdp_port, &format!("/json/close/{old_id}"));
+                attached += 1;
+            }
+        }
+    }
+    attached
+}
+
+pub fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<String> {
     let session = format!("bon_{short_id}");
-    let out = agent_browser_cmd()
+    let out = agent_browser_cmd_for_short_id(short_id)
         .args([
             "--session",
             &session,
@@ -1193,7 +2019,123 @@ fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<String
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("agent-browser connect failed: {}", stderr.trim());
     }
+    if let Some(port) = extract_port_from_ws_url(ws_url) {
+        sync_extension_targets_to_agent_browser(&session, port);
+    }
     Ok(session)
+}
+
+/// Creates a pinned-tab sub-session (`bon_<id8>_<tag>`) so multiple agents can operate concurrently on separate tabs.
+pub fn ensure_agent_browser_pinned_tab(
+    short_id: &str,
+    tab_tag: &str,
+    ws_url: &str,
+    initial_url: Option<&str>,
+) -> Result<String> {
+    let clean_tag: String = tab_tag
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let suffix = if clean_tag.is_empty() { "tab1" } else { &clean_tag };
+    let session = format!("bon_{short_id}_{suffix}");
+
+    let out = agent_browser_cmd_for_short_id(short_id)
+        .args([
+            "--session",
+            &session,
+            "--input-mode",
+            "human",
+            "--pin-tab",
+            "connect",
+            ws_url,
+        ])
+        .output()
+        .context("Failed to execute `agent-browser` for pinned tab")?;
+    if !out.status.success() {
+        bail!(
+            "agent-browser --pin-tab connect failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if let Some(url) = initial_url.filter(|u| !u.trim().is_empty()) {
+        let _ = agent_browser_cmd_for_short_id(short_id)
+            .args(["--session", &session, "tab", "new", url.trim()])
+            .output();
+    }
+    Ok(session)
+}
+
+/// Re-scans CDP targets (OAuth popups, Web3 wallet windows, extensions) and returns the active tab list.
+pub fn agent_sync_targets(short_id: &str, ws_url: &str) -> Result<serde_json::Value> {
+    let session = ensure_agent_browser_connected(short_id, ws_url)?;
+    let cdp_port = extract_port_from_ws_url(ws_url).unwrap_or(0);
+    let newly_attached = if cdp_port > 0 {
+        sync_extension_targets_to_agent_browser(&session, cdp_port)
+    } else {
+        0
+    };
+    let tabs_out = agent_browser_cmd_for_short_id(short_id)
+        .args(["--session", &session, "tab", "--json"])
+        .output()?;
+    let tabs_json = serde_json::from_slice::<serde_json::Value>(&tabs_out.stdout)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Ok(serde_json::json!({
+        "ok": true,
+        "session": session,
+        "newly_attached_extension_tabs": newly_attached,
+        "tabs": tabs_json.get("data").and_then(|d| d.get("tabs")).cloned().unwrap_or(tabs_json),
+    }))
+}
+
+/// Blocks `agent-browser` commands/flags that invoke CDP `Emulation.*` or override BonLogin's C++ stealth fingerprint.
+pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
+    for (idx, arg) in args.iter().enumerate() {
+        let lower = arg.to_ascii_lowercase();
+        for forbidden_flag in [
+            "--user-agent",
+            "--proxy",
+            "--proxy-bypass",
+            "--args",
+            "--executable-path",
+            "--profile",
+            "--engine",
+        ] {
+            if lower == forbidden_flag || lower.starts_with(&format!("{forbidden_flag}=")) {
+                bail!(
+                    "Blocked by BonLogin Stealth Guardrail: flag '{arg}' overrides C++ fingerprint/proxy tunnel. Configure this in BonLogin Profile Settings instead."
+                );
+            }
+        }
+        if lower == "set"
+            && let Some(sub) = args.get(idx + 1).map(|s| s.to_ascii_lowercase())
+            && matches!(
+                sub.as_str(),
+                "viewport" | "device" | "geo" | "media" | "headers"
+            )
+        {
+            bail!(
+                "Blocked by BonLogin Stealth Guardrail: 'agent-browser set {sub}' invokes CDP Emulation/Network overrides that expose automation on BrowserScan/CreepJS."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Opens an extension popup/options page inside a running profile via `agent-browser --session bon_<id> tab new <url>`.
+pub fn agent_open_extension_tab(short_id: &str, ws_url: &str, ext_url: &str) -> Result<String> {
+    let session = ensure_agent_browser_connected(short_id, ws_url)?;
+    let out = agent_browser_cmd()
+        .args(["--session", &session, "tab", "new", ext_url])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "agent-browser tab new failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(format!(
+        "agent-browser --session {session} snapshot -i"
+    ))
 }
 #[cfg(test)]
 pub fn agent_audit_fingerprint(short_id: &str, ws_url: &str) -> Result<String> {
@@ -1325,6 +2267,285 @@ pub fn agent_import_state_or_cookies(
         stdout
     })
 }
+
+// ---------------------------------------------------------------------------
+// Headless CLI Control Plane for AI Agents (`bon-login list|launch|stop|sync|agent`)
+// ---------------------------------------------------------------------------
+
+fn find_profile_by_query<'a>(profiles: &'a [Profile], query: &str) -> Result<&'a Profile> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Profile identifier or name is required");
+    }
+    let stripped = q.strip_prefix("bon_").unwrap_or(q);
+    if let Some(p) = profiles.iter().find(|p| {
+        p.id.eq_ignore_ascii_case(q)
+            || p.short_id().eq_ignore_ascii_case(stripped)
+            || p.name.eq_ignore_ascii_case(q)
+    }) {
+        return Ok(p);
+    }
+    let q_lower = q.to_ascii_lowercase();
+    profiles
+        .iter()
+        .find(|p| p.name.to_ascii_lowercase().contains(&q_lower))
+        .ok_or_else(|| anyhow!("No profile found matching '{query}'"))
+}
+
+pub fn ensure_profile_launched_via_supervisor(
+    db: &crate::db::Database,
+    profile: &Profile,
+) -> Result<RuntimeInfo> {
+    let short_id = profile.short_id();
+    if let Some(info) = probe_live_runtime(&profile.id) {
+        let _ = ensure_agent_browser_connected(&short_id, &info.ws_url);
+        return Ok(info);
+    }
+
+    let err_file = launch_error_file_path(&profile.id);
+    let _ = std::fs::remove_file(&err_file);
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable path")?;
+    let mut child = Command::new(exe)
+        .args(["--hold-profile", &profile.id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn background profile supervisor")?;
+
+    for _ in 0..80 {
+        if let Ok(err_txt) = std::fs::read_to_string(&err_file)
+            && !err_txt.trim().is_empty()
+        {
+            let _ = std::fs::remove_file(&err_file);
+            bail!("{}", err_txt.trim());
+        }
+        if let Some(info) = probe_live_runtime(&profile.id)
+            && info.pid > 0
+        {
+            let _ = db.touch_last_launched(&profile.id);
+            let _ = ensure_agent_browser_connected(&short_id, &info.ws_url);
+            return Ok(info);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            if let Ok(err_txt) = std::fs::read_to_string(&err_file)
+                && !err_txt.trim().is_empty()
+            {
+                let _ = std::fs::remove_file(&err_file);
+                bail!("{}", err_txt.trim());
+            }
+            bail!("Supervisor exited early with status {status}");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    bail!("Timed out (12s) waiting for profile '{}' to launch", profile.name)
+}
+
+/// Executes CLI subcommands (`list`, `launch`, `stop`, `sync`, `agent`, `--hold-profile`, `--help`)
+/// when invoked with arguments, returning `Some(Result)` so `main()` can exit without opening GPUI.
+pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first()?.as_str();
+
+    Some((|| -> Result<()> {
+        match cmd {
+            "--hold-profile" => {
+                let profile_id = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("Missing profile_id for --hold-profile"))?;
+                let db = crate::db::Database::open_fast()?;
+                let profiles = db.list_profiles()?;
+                let profile = find_profile_by_query(&profiles, profile_id)?.clone();
+                let err_file = launch_error_file_path(&profile.id);
+                let _ = std::fs::remove_file(&err_file);
+                match tokio_handle.block_on(launch_profile(&profile)) {
+                    Ok((mut running, maybe_geo)) => {
+                        if let Some(geo) = &maybe_geo {
+                            let _ = db.update_resolved_geo(&profile.id, Some(geo));
+                        }
+                        let _ = db.touch_last_launched(&profile.id);
+                        while running.is_alive() {
+                            std::thread::sleep(Duration::from_millis(800));
+                        }
+                        running.stop_gracefully();
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = profile_user_data_dir(&profile.id);
+                        let _ = std::fs::write(&err_file, e.to_string());
+                        Err(e)
+                    }
+                }
+            }
+            "list" | "ls" => {
+                let db = crate::db::Database::open_fast()?;
+                let profiles = db.list_profiles()?;
+                let items: Vec<serde_json::Value> = profiles
+                    .iter()
+                    .map(|p| {
+                        let sid = p.short_id();
+                        let session = format!("bon_{sid}");
+                        let live = probe_live_runtime(&p.id);
+                        serde_json::json!({
+                            "id": p.id,
+                            "short_id": sid,
+                            "session": session,
+                            "name": p.name,
+                            "group": p.group_tag,
+                            "os": p.os_platform.as_cli_str(),
+                            "brand": p.brand.as_cli_str(),
+                            "proxy": p.proxy.as_ref().map(|px| px.display_short()).unwrap_or_else(|| "Direct".to_string()),
+                            "running": live.is_some(),
+                            "pid": live.as_ref().map(|r| r.pid),
+                            "cdp_port": live.as_ref().map(|r| r.cdp_port),
+                            "ws_url": live.as_ref().map(|r| r.ws_url.clone()),
+                            "download_dir": profile_download_dir(&sid),
+                            "cli": format!("agent-browser --session {session} snapshot -i -c"),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+                Ok(())
+            }
+            "launch" | "start" => {
+                let target = args
+                    .get(1)
+                    .filter(|s| !s.starts_with('-'))
+                    .ok_or_else(|| anyhow!("Usage: bon-login launch <short_id|name> [--pin-tab <tag>] [--url <url>]"))?;
+                let mut pin_tab: Option<String> = None;
+                let mut open_url: Option<String> = None;
+                let mut idx = 2;
+                while idx < args.len() {
+                    match args[idx].as_str() {
+                        "--pin-tab" => {
+                            pin_tab = args.get(idx + 1).cloned();
+                            idx += 2;
+                        }
+                        "--url" => {
+                            open_url = args.get(idx + 1).cloned();
+                            idx += 2;
+                        }
+                        _ => idx += 1,
+                    }
+                }
+                let db = crate::db::Database::open_fast()?;
+                let profiles = db.list_profiles()?;
+                let profile = find_profile_by_query(&profiles, target)?.clone();
+                let short_id = profile.short_id();
+                let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
+                let session = if let Some(tag) = &pin_tab {
+                    ensure_agent_browser_pinned_tab(&short_id, tag, &info.ws_url, open_url.as_deref())?
+                } else {
+                    let s = ensure_agent_browser_connected(&short_id, &info.ws_url)?;
+                    if let Some(u) = open_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                        let _ = agent_browser_cmd_for_short_id(&short_id)
+                            .args(["--session", &s, "open", u.trim()])
+                            .output();
+                    }
+                    s
+                };
+                let out = serde_json::json!({
+                    "ok": true,
+                    "id": profile.id,
+                    "short_id": short_id,
+                    "session": session,
+                    "name": profile.name,
+                    "pid": info.pid,
+                    "cdp_port": info.cdp_port,
+                    "ws_url": info.ws_url,
+                    "local_proxy_port": info.local_proxy_port,
+                    "download_dir": profile_download_dir(&short_id),
+                    "cli": format!("agent-browser --session {session} snapshot -i -c"),
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                Ok(())
+            }
+            "stop" | "close" => {
+                let target = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("Usage: bon-login stop <short_id|name|--all>"))?;
+                let db = crate::db::Database::open_fast()?;
+                let profiles = db.list_profiles()?;
+                let mut stopped = Vec::new();
+                if target == "--all" || target == "all" {
+                    for p in &profiles {
+                        if probe_live_runtime(&p.id).is_some()
+                            || stop_external_runtime(&p.id, &p.short_id())
+                        {
+                            let _ = stop_external_runtime(&p.id, &p.short_id());
+                            stopped.push(p.short_id());
+                        }
+                    }
+                } else {
+                    let p = find_profile_by_query(&profiles, target)?;
+                    stop_external_runtime(&p.id, &p.short_id());
+                    stopped.push(p.short_id());
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "stopped": stopped,
+                    }))?
+                );
+                Ok(())
+            }
+            "sync" => {
+                let target = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("Usage: bon-login sync <short_id|name>"))?;
+                let db = crate::db::Database::open_fast()?;
+                let profiles = db.list_profiles()?;
+                let p = find_profile_by_query(&profiles, target)?;
+                let info = probe_live_runtime(&p.id)
+                    .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
+                let res = agent_sync_targets(&p.short_id(), &info.ws_url)?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+                Ok(())
+            }
+            "agent" | "ab" => {
+                let target = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("Usage: bon-login agent <short_id|name> <agent-browser args...>"))?;
+                let rest = &args[2..];
+                if rest.is_empty() {
+                    bail!("Usage: bon-login agent <short_id|name> <agent-browser args...>");
+                }
+                validate_stealth_agent_args(rest)?;
+                let db = crate::db::Database::open_fast()?;
+                let profiles = db.list_profiles()?;
+                let profile = find_profile_by_query(&profiles, target)?.clone();
+                let short_id = profile.short_id();
+                let _info = ensure_profile_launched_via_supervisor(&db, &profile)?;
+                let session = format!("bon_{short_id}");
+                let status = agent_browser_cmd_for_short_id(&short_id)
+                    .args(["--session", &session, "--input-mode", "human"])
+                    .args(rest)
+                    .status()
+                    .context("Failed to execute agent-browser")?;
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Ok(())
+            }
+            "--help" | "-h" | "help" => {
+                println!(
+                    "BonLogin — Anti-Detect Browser & Agent-Browser Control Plane\n\n\
+                     Usage:\n  \
+                       bon-login                                           Open GPUI Desktop App\n  \
+                       bon-login list                                      List all profiles & live CDP/Agent sessions (JSON)\n  \
+                       bon-login launch <id|name> [--pin-tab <tag>] [--url <u >] Launch profile (Fail-Closed GeoIP + Tunnel) & connect agent-browser\n  \
+                       bon-login stop <id|name|--all>                      Stop running profile(s) & flush SQLite cookies\n  \
+                       bon-login sync <id|name>                            Sync OAuth popups & extension windows into agent-browser tabs\n  \
+                       bon-login agent <id|name> <agent-browser args...>   Run agent-browser with Stealth Guardrails (auto-launches if stopped)"
+                );
+                Ok(())
+            }
+            other => bail!("Unknown command '{other}'. Run `bon-login --help` for usage."),
+        }
+    })())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,11 +2662,92 @@ mod tests {
         assert_eq!(cdp_has_open_window(port), Some(false));
     }
 
+    #[test]
+    fn test_sha256_and_deterministic_extension_runtime_id() {
+        use base64::Engine;
+        // Known SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let digest = sha256_bytes(b"abc");
+        assert_eq!(digest[0], 0xba);
+        assert_eq!(digest[1], 0x78);
+        assert_eq!(digest[31], 0xad);
+
+        let key_b64 = deterministic_spki_key_b64("cookie-token-grabber");
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&key_b64)
+            .unwrap();
+        let ext_id = pubkey_to_chrome_ext_id(&der);
+        assert_eq!(ext_id.len(), 32);
+        assert!(ext_id.bytes().all(|b| (b'a'..=b'p').contains(&b)));
+        // Deterministic across calls
+        let key_b64_2 = deterministic_spki_key_b64("cookie-token-grabber");
+        assert_eq!(key_b64, key_b64_2);
+    }
+
+    #[test]
+    fn test_patch_unpacked_extension_and_resolve_runtime_info() {
+        let tmp = std::env::temp_dir().join(format!("bon_ext_test_{}", unix_now()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{
+              "manifest_version": 3,
+              "name": "TestExt",
+              "version": "1.0.0",
+              "optional_host_permissions": ["*://*/*"],
+              "background": { "service_worker": "bg.js" },
+              "action": { "default_popup": "popup.html" }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.join("bg.js"), "console.log('bg');").unwrap();
+        std::fs::write(tmp.join("popup.html"), "<html><head></head><body>Hi</body></html>").unwrap();
+
+        patch_unpacked_extension_for_agent(&tmp, "test-ext-id", None);
+        let ext = BrowserExtension {
+            id: "test-ext-id".to_string(),
+            name: "TestExt".to_string(),
+            icon_label: "TE".to_string(),
+            icon_bg: 0x3B82F6,
+            is_default: false,
+            enabled: true,
+            source_url: String::new(),
+            folder_path: tmp.to_string_lossy().into_owned(),
+            created_at: 0,
+        };
+        let (runtime_id, entry_url) = resolve_extension_runtime_info(&ext).unwrap();
+        assert_eq!(runtime_id.len(), 32);
+        assert_eq!(
+            entry_url,
+            format!("chrome-extension://{runtime_id}/popup.html")
+        );
+        let bg_patched = std::fs::read_to_string(tmp.join("bg.js")).unwrap();
+        assert!(bg_patched.contains("__BON_EXT_SHIM__"));
+        let html_patched = std::fs::read_to_string(tmp.join("popup.html")).unwrap();
+        assert!(html_patched.contains("__bon_ext_shim.js"));
+        let manifest_patched = std::fs::read_to_string(tmp.join("manifest.json")).unwrap();
+        assert!(manifest_patched.contains("\"<all_urls>\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn test_e2e_launch_adryfish_and_agent_browser_connect() {
         let Some(_kernel) = locate_chromium_kernel() else {
             return;
         };
+
+        let prev_enabled = crate::db::Database::open_fast()
+            .ok()
+            .and_then(|db| db.list_extensions().ok())
+            .and_then(|exts| {
+                exts.into_iter()
+                    .find(|e| e.id == "cookie-token-grabber")
+                    .map(|e| e.enabled)
+            })
+            .unwrap_or(false);
+        if let Ok(db) = crate::db::Database::open_fast() {
+            let _ = db.set_extension_enabled("cookie-token-grabber", true);
+        }
 
         let mut profile = Profile::new_default("E2E Smoke Profile", PlatformType::MacOS);
         profile.seed = 777888;
@@ -1475,6 +2777,32 @@ mod tests {
             "Expected hardwareConcurrency=12 in audit: {audit}"
         );
 
+        // Verify agent-browser can open and interact with the loaded extension's popup page
+        let grabber_ext = BrowserExtension {
+            id: "cookie-token-grabber".to_string(),
+            name: "Cookie & Token Grabber".to_string(),
+            icon_label: "📋".to_string(),
+            icon_bg: 0x0D9488,
+            is_default: true,
+            enabled: true,
+            source_url: String::new(),
+            folder_path: String::new(),
+            created_at: 0,
+        };
+        let (_rt_id, entry_url) =
+            resolve_extension_runtime_info(&grabber_ext).expect("should resolve extension URL");
+        agent_open_extension_tab(&short_id, &running.info.ws_url, &entry_url)
+            .expect("agent_open_extension_tab should open extension popup in new tab");
+        let snap_out = agent_browser_cmd()
+            .args(["--session", &format!("bon_{short_id}"), "snapshot", "-i"])
+            .output()
+            .expect("snapshot on extension popup should succeed");
+        let snap_txt = String::from_utf8_lossy(&snap_out.stdout);
+        assert!(
+            snap_txt.contains("Grab Active Tab Cookies"),
+            "Expected extension popup controls in snapshot: {snap_txt}"
+        );
+
         let (state_path, state_json) =
             agent_export_state(&short_id, &running.info.ws_url).expect("export state should work");
         assert!(state_path.is_file());
@@ -1483,10 +2811,61 @@ mod tests {
         running.stop_gracefully();
         assert!(!running.is_alive());
 
+        if let Ok(db) = crate::db::Database::open_fast() {
+            let _ = db.set_extension_enabled("cookie-token-grabber", prev_enabled);
+        }
         let _ = wipe_profile_data(&profile.id);
         if let Ok(dir) = profile_user_data_dir(&profile.id) {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 
+
+    #[test]
+    fn test_validate_stealth_agent_args_and_pinned_tab_cli() {
+        assert!(
+            validate_stealth_agent_args(&[
+                "snapshot".to_string(),
+                "-i".to_string(),
+                "-c".to_string()
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_stealth_agent_args(&[
+                "set".to_string(),
+                "viewport".to_string(),
+                "1920".to_string(),
+                "1080".to_string()
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_stealth_agent_args(&[
+                "set".to_string(),
+                "device".to_string(),
+                "iPhone 15".to_string()
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_stealth_agent_args(&[
+                "--user-agent=CustomUA".to_string(),
+                "open".to_string(),
+                "https://example.com".to_string()
+            ])
+            .is_err()
+        );
+
+        let info = RuntimeInfo {
+            pid: 1234,
+            cdp_port: 55111,
+            ws_url: "ws://127.0.0.1:55111/devtools/browser/abc".to_string(),
+            local_proxy_port: None,
+        };
+        assert_eq!(
+            info.pinned_tab_cli("76a2aa96", "worker 1"),
+            "agent-browser --session bon_76a2aa96_worker1 --input-mode human --pin-tab connect \"ws://127.0.0.1:55111/devtools/browser/abc\""
+        );
+    }
 }

@@ -122,8 +122,6 @@ impl Database {
                 folder_path TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL
             );
-            INSERT OR IGNORE INTO profile_groups (name, created_at) VALUES ('General', 0);
-            INSERT OR IGNORE INTO proxy_tags (name, created_at) VALUES ('General', 0);
             INSERT OR IGNORE INTO profile_groups (name, created_at)
                 SELECT DISTINCT TRIM(group_tag), created_at FROM profiles WHERE TRIM(group_tag) != '';
             INSERT OR IGNORE INTO proxy_tags (name, created_at)
@@ -733,9 +731,7 @@ impl Database {
         for r in rows {
             out.push(r?);
         }
-        if out.is_empty() {
-            out.push("General".to_string());
-        }
+        // Return actual groups without re-seeding deleted defaults
         Ok(out)
     }
 
@@ -752,11 +748,15 @@ impl Database {
     }
 
     pub fn delete_group(&self, name: &str) -> anyhow::Result<()> {
+        let trimmed = name.trim();
         self.conn.execute(
             "DELETE FROM profile_groups WHERE name = ?1 COLLATE NOCASE",
-            params![name.trim()],
+            params![trimmed],
         )?;
-        let _ = self.insert_group("General");
+        self.conn.execute(
+            "UPDATE profiles SET group_tag = '' WHERE group_tag = ?1 COLLATE NOCASE",
+            params![trimmed],
+        )?;
         Ok(())
     }
 
@@ -769,9 +769,7 @@ impl Database {
         for r in rows {
             out.push(r?);
         }
-        if out.is_empty() {
-            out.push("General".to_string());
-        }
+        // Return actual tags without re-seeding deleted defaults
         Ok(out)
     }
 
@@ -788,11 +786,15 @@ impl Database {
     }
 
     pub fn delete_tag(&self, name: &str) -> anyhow::Result<()> {
+        let trimmed = name.trim();
         self.conn.execute(
             "DELETE FROM proxy_tags WHERE name = ?1 COLLATE NOCASE",
-            params![name.trim()],
+            params![trimmed],
         )?;
-        let _ = self.insert_tag("General");
+        self.conn.execute(
+            "UPDATE proxies SET group_tag = '' WHERE group_tag = ?1 COLLATE NOCASE",
+            params![trimmed],
+        )?;
         Ok(())
     }
 

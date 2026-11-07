@@ -10,7 +10,7 @@ use crate::models::{
     BrowserBrand, GpuSpoofMode, PlatformType, Profile, ProxyConfig, ProxyProtocol, SavedProxy,
 };
 use crate::ui::theme::{BonTheme, SfSymbol};
-use crate::ui::{ActivePopupModal, BonLoginApp, ProfileSubTab, WorkspaceView};
+use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction, ProfileSubTab, WorkspaceView};
 
 
 fn get_extension_icon(ext: &crate::models::BrowserExtension) -> Option<std::sync::Arc<Image>> {
@@ -89,11 +89,7 @@ impl ProfileModalState {
         cx: &mut Context<BonLoginApp>,
     ) -> Self {
         let name_val = profile.name.clone();
-        let group_val = if profile.group_tag.trim().is_empty() {
-            "General".to_string()
-        } else {
-            profile.group_tag.clone()
-        };
+        let group_val = profile.group_tag.trim().to_string();
         let seed_val = profile.seed.to_string();
         let tz_val = profile.custom_timezone.clone().unwrap_or_default();
         let loc_val = profile.custom_locale.clone().unwrap_or_default();
@@ -178,11 +174,7 @@ impl ProfileModalState {
         if name.is_empty() {
             anyhow::bail!("Profile name cannot be empty");
         }
-        let group_tag = if self.selected_group.trim().is_empty() {
-            "General".to_string()
-        } else {
-            self.selected_group.trim().to_string()
-        };
+        let group_tag = self.selected_group.trim().to_string();
         let seed_str = self.seed_input.read(cx).value().trim().to_string();
         let seed: u32 = seed_str
             .parse()
@@ -287,11 +279,7 @@ pub fn render_edit_profile_view(
         let v = modal.name_input.read(cx).value().trim().to_string();
         if v.is_empty() { "-".to_string() } else { v }
     };
-    let group_preview = if modal.selected_group.trim().is_empty() {
-        "General".to_string()
-    } else {
-        modal.selected_group.clone()
-    };
+    let group_preview = modal.selected_group.trim().to_string();
     let seed_preview = modal.seed_input.read(cx).value().to_string();
     let seed_num: u32 = seed_preview.trim().parse().unwrap_or(1000);
     let ua_preview = brand.user_agent_for(os_platform);
@@ -467,10 +455,17 @@ pub fn render_edit_profile_view(
                                                         .items_center()
                                                         .child(field_label("Group"))
                                                         .child(
-                                                            Button::new("edit-open-groups-tab")
-                                                                .ghost()
-                                                                .xsmall()
-                                                                .label("Manage Groups")
+                                                            div()
+                                                                .id("edit-open-groups-tab")
+                                                                .cursor_pointer()
+                                                                .text_xs()
+                                                                .font_medium()
+                                                                .text_color(BonTheme::accent())
+                                                                .hover(|s| {
+                                                                    s.text_color(
+                                                                        BonTheme::text_primary(),
+                                                                    )
+                                                                })
                                                                 .on_click(cx.listener(
                                                                     |app, _, _, cx| {
                                                                         app.profile_sub_tab =
@@ -479,26 +474,63 @@ pub fn render_edit_profile_view(
                                                                             WorkspaceView::Profiles;
                                                                         cx.notify();
                                                                     },
-                                                                )),
+                                                                ))
+                                                                .child("Manage Groups"),
                                                         ),
                                                 )
-                                                .child(
+                                                .child({
+                                                    let cur_for_menu = cur_grp.clone();
+                                                    let display_grp = if cur_grp.trim().is_empty() {
+                                                        "No group"
+                                                    } else {
+                                                        cur_grp.as_str()
+                                                    };
                                                     Button::new("edit-prof-group-dropdown")
-                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .w_full()
+                                                        .outline()
+                                                        .dropdown_caret(true)
                                                         .label(format!(
-                                                            "{}  {cur_grp}  {}",
-                                                            SfSymbol::FOLDER_FILL,
-                                                            SfSymbol::CHEVRON_DOWN
+                                                            "{}  {display_grp}",
+                                                            SfSymbol::FOLDER_FILL
                                                         ))
                                                         .dropdown_menu(move |mut menu, _, _| {
+                                                            let app_none = app_for_grp.clone();
+                                                            menu = menu.item(
+                                                                PopupMenuItem::new("No group")
+                                                                    .checked(
+                                                                        cur_for_menu
+                                                                            .trim()
+                                                                            .is_empty(),
+                                                                    )
+                                                                    .on_click(move |_, _, cx| {
+                                                                        app_none.update(
+                                                                            cx,
+                                                                            |app, cx| {
+                                                                                if let Some(m) =
+                                                                                    app.modal
+                                                                                        .as_mut()
+                                                                                {
+                                                                                    m.selected_group =
+                                                                                        String::new();
+                                                                                }
+                                                                                cx.notify();
+                                                                            },
+                                                                        );
+                                                                    }),
+                                                            );
                                                             for grp in &groups_list {
                                                                 let g_val = grp.clone();
+                                                                let is_sel = g_val
+                                                                    .eq_ignore_ascii_case(
+                                                                        &cur_for_menu,
+                                                                    );
                                                                 let app_pick = app_for_grp.clone();
                                                                 menu = menu.item(
                                                                     PopupMenuItem::new(format!(
                                                                         "{}   {g_val}",
                                                                         SfSymbol::FOLDER_FILL
                                                                     ))
+                                                                    .checked(is_sel)
                                                                     .on_click(
                                                                         move |_, _, cx| {
                                                                             let g = g_val.clone();
@@ -520,8 +552,8 @@ pub fn render_edit_profile_view(
                                                                 );
                                                             }
                                                             menu
-                                                        }),
-                                                )
+                                                        })
+                                                })
                                         })
                                         .child(
                                             Button::new("edit-save-inline")
@@ -995,29 +1027,24 @@ pub fn render_edit_profile_view(
                                                     })
                                                     .unwrap_or(SfSymbol::GLOBE);
                                                 format!(
-                                                    "{flag}  {}:{} ({}) - {} (#{})  {}",
+                                                    "{flag}  {}:{} ({}) - {} (#{})",
                                                     sp.config.host,
                                                     sp.config.port,
                                                     sp.config.protocol.as_str().to_uppercase(),
                                                     sp.name,
                                                     sp.group_tag,
-                                                    SfSymbol::CHEVRON_DOWN
                                                 )
                                             } else {
                                                 format!(
-                                                    "{}  {} ({})  {}",
+                                                    "{}  {} ({})",
                                                     SfSymbol::GLOBE,
                                                     cfg.display_short(),
                                                     cfg.protocol.as_str().to_uppercase(),
-                                                    SfSymbol::CHEVRON_DOWN
                                                 )
                                             }
                                         })
                                         .unwrap_or_else(|| {
-                                            format!(
-                                                "Select proxy from Proxy manager  {}",
-                                                SfSymbol::CHEVRON_DOWN
-                                            )
+                                            "Select proxy from Proxy manager".to_string()
                                         });
 
                                     v_flex()
@@ -1087,7 +1114,9 @@ pub fn render_edit_profile_view(
                                                 .items_center()
                                                 .child(
                                                     Button::new("select-saved-proxy-dropdown")
-                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .min_w(px(280.))
+                                                        .outline()
+                                                        .dropdown_caret(true)
                                                         .small()
                                                         .disabled(saved_proxies.is_empty())
                                                         .label(selected_sp_label)
@@ -1757,6 +1786,7 @@ pub fn render_bulk_backup_view(
                         .children(row_exts.into_iter().map(|ext| {
                             let ext_id_toggle = ext.id.clone();
                             let ext_id_remove = ext.id.clone();
+                            let ext_id_agent = ext.id.clone();
                             let is_enabled = ext.enabled;
                             let is_default = ext.is_default;
 
@@ -1845,30 +1875,53 @@ pub fn render_bulk_backup_view(
                                         .py_2p5()
                                         .justify_between()
                                         .items_center()
-                                        .child(if is_default {
-                                            div().into_any_element()
-                                        } else {
+                                        .child(
                                             h_flex()
-                                                .gap_1p5()
+                                                .gap_3()
                                                 .items_center()
-                                                .cursor_pointer()
-                                                .text_xs()
-                                                .text_color(BonTheme::text_secondary())
-                                                .hover(|s| s.text_color(BonTheme::danger()))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |app, _, _, cx| {
-                                                        app.pending_remove_ext_id =
-                                                            Some(ext_id_remove.clone());
-                                                        app.popup_modal =
-                                                            Some(ActivePopupModal::RemoveExtension);
-                                                        cx.notify();
-                                                    }),
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1()
+                                                        .items_center()
+                                                        .cursor_pointer()
+                                                        .text_xs()
+                                                        .text_color(BonTheme::text_secondary())
+                                                        .hover(|s| s.text_color(BonTheme::accent()))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |app, _, _, cx| {
+                                                                app.open_or_copy_extension_agent_cli(
+                                                                    &ext_id_agent,
+                                                                    cx,
+                                                                );
+                                                            }),
+                                                        )
+                                                        .child(SfSymbol::TERMINAL)
+                                                        .child("Agent"),
                                                 )
-                                                .child(SfSymbol::TRASH)
-                                                .child("Remove")
-                                                .into_any_element()
-                                        })
+                                                .children((!is_default).then(|| {
+                                                    h_flex()
+                                                        .gap_1()
+                                                        .items_center()
+                                                        .cursor_pointer()
+                                                        .text_xs()
+                                                        .text_color(BonTheme::text_secondary())
+                                                        .hover(|s| s.text_color(BonTheme::danger()))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |app, _, _, cx| {
+                                                                app.request_delete(
+                                                                    PendingDeleteAction::Extension(
+                                                                        ext_id_remove.clone(),
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            }),
+                                                        )
+                                                        .child(SfSymbol::TRASH)
+                                                        .child("Remove")
+                                                })),
+                                        )
                                         .child(
                                             {
                                                 let switch_anim_id = SharedString::from(format!(
@@ -1964,13 +2017,9 @@ pub fn render_proxies_view(
         ""
     };
     let tag_dropdown_label = if selected_pgrp == "All" {
-        format!("All Tag ({total_proxies})  {}", SfSymbol::CHEVRON_DOWN)
+        format!("All Tag ({total_proxies})")
     } else {
-        format!(
-            "#{selected_pgrp} ({})  {}",
-            filtered_proxies.len(),
-            SfSymbol::CHEVRON_DOWN
-        )
+        format!("#{selected_pgrp} ({})", filtered_proxies.len())
     };
 
     let app_for_tag_menu = cx.entity();
@@ -2015,7 +2064,9 @@ pub fn render_proxies_view(
                         )
                         .child(
                             Button::new("pmgr-tag-dropdown")
-                                .with_variant(BonTheme::row_action(cx))
+                                .min_w(px(140.))
+                                .outline()
+                                .dropdown_caret(true)
                                 .small()
                                 .label(tag_dropdown_label)
                                 .dropdown_menu(move |mut menu, _, _| {
@@ -2048,17 +2099,19 @@ pub fn render_proxies_view(
                                 }),
                         )
                         .children(
-                            (selected_pgrp != "All" && !selected_pgrp.eq_ignore_ascii_case("General"))
-                                .then(|| {
-                                    let t_del = selected_pgrp.clone();
-                                    Button::new("pmgr-del-cur-tag")
-                                        .with_variant(BonTheme::outline_danger(cx))
-                                        .small()
-                                        .label(format!("{}  #{selected_pgrp}", SfSymbol::TRASH))
-                                        .on_click(cx.listener(move |app, _, _, cx| {
-                                            app.delete_tag_and_reset(&t_del, cx);
-                                        }))
-                                }),
+                            (selected_pgrp != "All").then(|| {
+                                let t_del = selected_pgrp.clone();
+                                Button::new("pmgr-del-cur-tag")
+                                    .with_variant(BonTheme::outline_danger(cx))
+                                    .small()
+                                    .label(format!("{}  #{selected_pgrp}", SfSymbol::TRASH))
+                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                        app.request_delete(
+                                            PendingDeleteAction::Tag(t_del.clone()),
+                                            cx,
+                                        );
+                                    }))
+                            }),
                         )
                         .child(
                             Button::new("pmgr-refresh")
@@ -2151,7 +2204,7 @@ pub fn render_proxies_view(
                         .small()
                         .label("Delete")
                         .on_click(cx.listener(|app, _, _, cx| {
-                            app.delete_checked_saved_proxies(cx);
+                            app.request_delete(PendingDeleteAction::CheckedProxies, cx);
                         })),
                 )
                 .child(
@@ -2485,19 +2538,21 @@ pub fn render_proxies_view(
                                 )
                                 // Col 4: Tag
                                 .child(
-                                    div().w(px(80.)).flex_shrink_0().overflow_hidden().child(
-                                        h_flex().w_full().min_w_0().overflow_hidden().child(
-                                            div()
-                                                .max_w_full()
-                                                .truncate()
-                                                .px_1p5()
-                                                .py_0p5()
-                                                .rounded_sm()
-                                                .bg(BonTheme::accent_subtle())
-                                                .text_xs()
-                                                .text_color(BonTheme::accent())
-                                                .child(format!("#{}", sp.group_tag)),
-                                        ),
+                                    div().w(px(80.)).flex_shrink_0().overflow_hidden().children(
+                                        (!sp.group_tag.trim().is_empty()).then(|| {
+                                            h_flex().w_full().min_w_0().overflow_hidden().child(
+                                                div()
+                                                    .max_w_full()
+                                                    .truncate()
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(BonTheme::accent_subtle())
+                                                    .text_xs()
+                                                    .text_color(BonTheme::accent())
+                                                    .child(format!("#{}", sp.group_tag)),
+                                            )
+                                        }),
                                     ),
                                 )
                                 // Col 5: Protocol support (`HTTP` / `SOCKS5`)
@@ -2692,7 +2747,10 @@ pub fn render_proxies_view(
                                                         .on_click(move |_, _, cx| {
                                                             let did = del_id.clone();
                                                             app_d.update(cx, |app, cx| {
-                                                                app.delete_saved_proxy(&did, cx);
+                                                                app.request_delete(
+                                                                    PendingDeleteAction::Proxy(did),
+                                                                    cx,
+                                                                );
                                                             });
                                                         }),
                                                 )
@@ -2749,36 +2807,50 @@ fn render_batch_group_dropdown(
 ) -> impl IntoElement {
     let app_for_grp = cx.entity();
     let groups_list = app.saved_groups.clone();
-    let cur = if app.batch_selected_group.trim().is_empty() {
-        "General".to_string()
+    let cur = app.batch_selected_group.trim().to_string();
+    let display_cur = if cur.is_empty() {
+        "No group"
     } else {
-        app.batch_selected_group.clone()
+        cur.as_str()
     };
+    let cur_for_menu = cur.clone();
     Button::new(id)
-        .with_variant(BonTheme::row_action(cx))
+        .min_w(px(160.))
+        .outline()
+        .dropdown_caret(true)
         .small()
-        .label(format!(
-            "{}  {cur}  {}",
-            SfSymbol::FOLDER_FILL,
-            SfSymbol::CHEVRON_DOWN
-        ))
+        .label(format!("{}  {display_cur}", SfSymbol::FOLDER_FILL))
         .dropdown_menu(move |mut menu, _, _| {
-            for grp in &groups_list {
-                let g_val = grp.clone();
-                let app_pick = app_for_grp.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(format!("{}   {g_val}", SfSymbol::FOLDER_FILL)).on_click(
-                    move |_, _, cx| {
-                        let g = g_val.clone();
-                        app_pick.update(cx, |app, cx| {
-                            app.batch_selected_group = g;
+            let app_none = app_for_grp.clone();
+            menu = menu.item(
+                PopupMenuItem::new("No group")
+                    .checked(cur_for_menu.is_empty())
+                    .on_click(move |_, _, cx| {
+                        app_none.update(cx, |app, cx| {
+                            app.batch_selected_group = String::new();
                             cx.notify();
                         });
-                    },
-                ));
+                    }),
+            );
+            for grp in &groups_list {
+                let g_val = grp.clone();
+                let is_sel = g_val.eq_ignore_ascii_case(&cur_for_menu);
+                let app_pick = app_for_grp.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("{}   {g_val}", SfSymbol::FOLDER_FILL))
+                        .checked(is_sel)
+                        .on_click(move |_, _, cx| {
+                            let g = g_val.clone();
+                            app_pick.update(cx, |app, cx| {
+                                app.batch_selected_group = g;
+                                cx.notify();
+                            });
+                        }),
+                );
             }
             menu
         })
+        .into_any_element()
 }
 
 fn render_batch_browser_os_selector(
@@ -2941,6 +3013,16 @@ pub fn render_groups_subtab_view(
                 .min_h_0()
                 .gap_2p5()
                 .overflow_y_scroll()
+                .children(groups.is_empty().then(|| {
+                    div()
+                        .w_full()
+                        .py_8()
+                        .flex()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(BonTheme::text_secondary())
+                        .child("No groups yet. Click 'New group' to create one.")
+                }))
                 .children(groups.into_iter().map(|(grp, cnt)| {
                     let g_open = grp.clone();
                     let g_del = grp.clone();
@@ -3022,8 +3104,11 @@ pub fn render_groups_subtab_view(
                                         .ghost()
                                         .small()
                                         .label(SfSymbol::TRASH)
-                                        .on_click(cx.listener(move |app, _, window, cx| {
-                                            app.delete_group_and_reset(&g_del, window, cx);
+                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                            app.request_delete(
+                                                PendingDeleteAction::Group(g_del.clone()),
+                                                cx,
+                                            );
                                         })),
                                 )
                                 .child(
@@ -3599,9 +3684,11 @@ pub fn render_popup_modal(
                         .child(field_label("Or assign a specific proxy from Proxy manager:"))
                         .child(
                             Button::new("upx-pick-single-saved")
-                                .with_variant(BonTheme::row_action(cx))
+                                .min_w(px(210.))
+                                .outline()
+                                .dropdown_caret(true)
                                 .small()
-                                .label(format!("Pick single proxy  {}", SfSymbol::CHEVRON_DOWN))
+                                .label("Pick single proxy")
                                 .dropdown_menu(move |mut menu, _, _| {
                                     for sp in &proxies_for_menu {
                                         let sp_id = sp.id.clone();
@@ -3886,15 +3973,34 @@ pub fn render_popup_modal(
                                 .items_center()
                                 .child(
                                     Button::new("addpx-tag-dropdown")
-                                        .with_variant(BonTheme::row_action(cx))
+                                        .min_w(px(130.))
+                                        .outline()
+                                        .dropdown_caret(true)
                                         .small()
-                                        .label(format!("#{cur_tag}  {}", SfSymbol::CHEVRON_DOWN))
+                                        .label(if cur_tag.trim().is_empty() {
+                                            "No tag".to_string()
+                                        } else {
+                                            format!("#{cur_tag}")
+                                        })
                                         .dropdown_menu(move |mut menu, _, _| {
+                                            let app_none = app_for_tag.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new("No tag")
+                                                    .checked(cur_tag.trim().is_empty())
+                                                    .on_click(move |_, _, cx| {
+                                                        app_none.update(cx, |app, cx| {
+                                                            app.proxy_selected_tag = String::new();
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            );
                                             for t in &tags_list {
                                                 let t_val = t.clone();
+                                                let is_sel = t_val.eq_ignore_ascii_case(&cur_tag);
                                                 let app_pick = app_for_tag.clone();
                                                 menu = menu.item(
                                                     PopupMenuItem::new(format!("#{t_val}"))
+                                                        .checked(is_sel)
                                                         .on_click(move |_, _, cx| {
                                                             let chosen = t_val.clone();
                                                             app_pick.update(cx, |app, cx| {
@@ -4174,12 +4280,78 @@ pub fn render_popup_modal(
         }
         // 11. GenLogin `Remove the extension?` Confirmation Modal (`docs/genlogin-3.0/assets/menu-bar_extensions_10.png`)
         ActivePopupModal::RemoveExtension => {
-            let target_name = app
-                .pending_remove_ext_id
-                .as_ref()
-                .and_then(|id| app.extensions.iter().find(|e| &e.id == id))
-                .map(|e| e.name.clone())
-                .unwrap_or_else(|| "this extension".to_string());
+            let (title, desc, confirm_label) = match &app.pending_delete {
+                Some(PendingDeleteAction::Profile(id)) => {
+                    let name = app
+                        .profiles
+                        .iter()
+                        .find(|p| &p.id == id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "this profile".to_string());
+                    (
+                        "Delete profile?",
+                        format!("Are you sure you want to permanently delete '{name}'?"),
+                        "Yes, delete",
+                    )
+                }
+                Some(PendingDeleteAction::CheckedProfiles) => (
+                    "Delete selected profiles?",
+                    format!(
+                        "Are you sure you want to permanently delete {} selected profile(s)?",
+                        app.checked_profile_ids.len()
+                    ),
+                    "Yes, delete",
+                ),
+                Some(PendingDeleteAction::Group(g)) => (
+                    "Delete group?",
+                    format!("Are you sure you want to delete group '{g}'?"),
+                    "Yes, delete",
+                ),
+                Some(PendingDeleteAction::Proxy(id)) => {
+                    let label = app
+                        .saved_proxies
+                        .iter()
+                        .find(|p| &p.id == id)
+                        .map(|p| format!("{}:{}", p.config.host, p.config.port))
+                        .unwrap_or_else(|| "this proxy".to_string());
+                    (
+                        "Delete proxy?",
+                        format!("Are you sure you want to delete proxy '{label}'?"),
+                        "Yes, delete",
+                    )
+                }
+                Some(PendingDeleteAction::CheckedProxies) => (
+                    "Delete selected proxies?",
+                    format!(
+                        "Are you sure you want to delete {} selected proxy(s)?",
+                        app.checked_proxy_ids.len()
+                    ),
+                    "Yes, delete",
+                ),
+                Some(PendingDeleteAction::Tag(t)) => (
+                    "Delete proxy tag?",
+                    format!("Are you sure you want to delete tag '#{t}'?"),
+                    "Yes, delete",
+                ),
+                Some(PendingDeleteAction::Extension(id)) => {
+                    let name = app
+                        .extensions
+                        .iter()
+                        .find(|e| &e.id == id)
+                        .map(|e| e.name.clone())
+                        .unwrap_or_else(|| "this extension".to_string());
+                    (
+                        "Remove the extension?",
+                        format!("Are you sure to remove {name}?"),
+                        "Yes, remove",
+                    )
+                }
+                None => (
+                    "Confirm delete?",
+                    "Are you sure you want to delete this item?".to_string(),
+                    "Yes, delete",
+                ),
+            };
             v_flex()
                 .w(px(420.))
                 .p_5()
@@ -4218,7 +4390,7 @@ pub fn render_popup_modal(
                                         .text_base()
                                         .font_bold()
                                         .text_color(BonTheme::text_primary())
-                                        .child("Remove the extension?"),
+                                        .child(title),
                                 )
                                 .child(
                                     div()
@@ -4227,7 +4399,7 @@ pub fn render_popup_modal(
                                         .truncate()
                                         .text_xs()
                                         .text_color(BonTheme::text_secondary())
-                                        .child(format!("Are you sure to remove {target_name}?")),
+                                        .child(desc),
                                 ),
                         ),
                 )
@@ -4243,7 +4415,7 @@ pub fn render_popup_modal(
                                 .small()
                                 .label("No, keep it")
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.pending_remove_ext_id = None;
+                                    app.pending_delete = None;
                                     app.popup_modal = None;
                                     cx.notify();
                                 })),
@@ -4252,9 +4424,9 @@ pub fn render_popup_modal(
                             Button::new("remext-confirm")
                                 .danger()
                                 .small()
-                                .label("Yes, remove")
-                                .on_click(cx.listener(|app, _, _, cx| {
-                                    app.confirm_remove_extension(cx);
+                                .label(confirm_label)
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.confirm_pending_delete(window, cx);
                                 })),
                         ),
                 )

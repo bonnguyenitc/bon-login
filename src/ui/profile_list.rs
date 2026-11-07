@@ -7,7 +7,7 @@ use gpui_kit::*;
 use std::time::Duration;
 use crate::models::{Profile, ProfileStatus};
 use crate::ui::theme::{BonTheme, SfSymbol};
-use crate::ui::{ActivePopupModal, BonLoginApp};
+use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnVisibility {
@@ -549,9 +549,10 @@ fn build_profile_popup_menu(
         .item(
             PopupMenuItem::new(format!("{}   Delete", SfSymbol::TRASH))
                 .disabled(is_busy)
-                .on_click(move |_, window, cx| {
+                .on_click(move |_, _, cx| {
+                    let pid = pid_del.clone();
                     app_del.update(cx, |app, cx| {
-                        app.delete_profile(&pid_del, window, cx);
+                        app.request_delete(PendingDeleteAction::Profile(pid), cx);
                     });
                 }),
         )
@@ -749,7 +750,7 @@ fn render_profile_row(
                         .gap_1()
                         .items_center()
                         .overflow_hidden()
-                        .child(
+                        .children((!profile.group_tag.trim().is_empty()).then(|| {
                             div()
                                 .max_w_full()
                                 .truncate()
@@ -761,8 +762,8 @@ fn render_profile_row(
                                 .border_color(BonTheme::border())
                                 .text_xs()
                                 .text_color(BonTheme::text_secondary())
-                                .child(profile.group_tag.clone()),
-                        )
+                                .child(profile.group_tag.clone())
+                        }))
                 }))
                 // Col 4: Note (`Enter note`)
                 .children(cols.show_notes.then(|| {

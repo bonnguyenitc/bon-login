@@ -56,6 +56,17 @@ pub enum ActivePopupModal {
     InputUrlExtension,
     RemoveExtension,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDeleteAction {
+    Profile(String),
+    CheckedProfiles,
+    Group(String),
+    Proxy(String),
+    CheckedProxies,
+    Tag(String),
+    Extension(String),
+}
 pub struct BonLoginApp {
     pub db: Arc<Mutex<Database>>,
     pub profiles: Vec<Profile>,
@@ -65,7 +76,7 @@ pub struct BonLoginApp {
     pub extensions: Vec<BrowserExtension>,
     pub ext_url_input: Entity<InputState>,
     pub ext_file_input: Entity<InputState>,
-    pub pending_remove_ext_id: Option<String>,
+    pub pending_delete: Option<PendingDeleteAction>,
     pub downloading_ext: bool,
     pub checked_proxy_ids: HashSet<String>,
     pub checking_proxy_ids: HashSet<String>,
@@ -113,8 +124,8 @@ impl BonLoginApp {
     ) -> Self {
         let profiles = db.list_profiles().unwrap_or_default();
         let saved_proxies = db.list_proxies().unwrap_or_default();
-        let saved_groups = db.list_groups().unwrap_or_else(|_| vec!["General".to_string()]);
-        let saved_tags = db.list_tags().unwrap_or_else(|_| vec!["General".to_string()]);
+        let saved_groups = db.list_groups().unwrap_or_default();
+        let saved_tags = db.list_tags().unwrap_or_default();
         let extensions = db.list_extensions().unwrap_or_default();
         for ext in extensions.iter().filter(|e| e.enabled) {
             let _ = crate::launcher::ensure_extension_unpacked(ext);
@@ -177,14 +188,21 @@ impl BonLoginApp {
                 cx.background_executor()
                     .timer(Duration::from_millis(800))
                     .await;
+                let Ok(profile_ids) = this.read_with(cx, |app, _| {
+                    app.profiles.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
+                }) else {
+                    break;
+                };
                 let procs = monitor_procs.clone();
-                let exited = cx
+                let (exited, external_live) = cx
                     .background_executor()
                     .spawn(async move {
                         let mut exited = Vec::new();
+                        let mut in_proc_ids = HashSet::new();
                         if let Ok(mut map) = procs.lock() {
                             map.retain(|id, proc| {
                                 if proc.is_alive() {
+                                    in_proc_ids.insert(id.clone());
                                     true
                                 } else {
                                     proc.stop_gracefully();
@@ -193,15 +211,50 @@ impl BonLoginApp {
                                 }
                             });
                         }
-                        exited
+                        let mut external_live = HashMap::new();
+                        for pid in profile_ids {
+                            if !in_proc_ids.contains(&pid)
+                                && let Some(info) = crate::launcher::probe_live_runtime(&pid)
+                            {
+                                external_live.insert(pid, info);
+                            }
+                        }
+                        (exited, external_live)
                     })
                     .await;
                 let alive = this
                     .update(cx, |app, cx| {
-                        if !exited.is_empty() {
-                            for id in &exited {
-                                app.statuses.insert(id.clone(), ProfileStatus::Stopped);
+                        let mut changed = false;
+                        for id in &exited {
+                            app.statuses.insert(id.clone(), ProfileStatus::Stopped);
+                            changed = true;
+                        }
+                        let in_proc_keys: HashSet<String> = app
+                            .running_processes
+                            .lock()
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        for (pid, info) in &external_live {
+                            if !matches!(app.statuses.get(pid), Some(ProfileStatus::Running(cur)) if cur == info) {
+                                app.statuses.insert(pid.clone(), ProfileStatus::Running(info.clone()));
+                                changed = true;
                             }
+                        }
+                        let stale_ext: Vec<String> = app
+                            .statuses
+                            .iter()
+                            .filter_map(|(pid, st)| {
+                                (matches!(st, ProfileStatus::Running(_))
+                                    && !in_proc_keys.contains(pid)
+                                    && !external_live.contains_key(pid))
+                                .then(|| pid.clone())
+                            })
+                            .collect();
+                        for pid in stale_ext {
+                            app.statuses.insert(pid, ProfileStatus::Stopped);
+                            changed = true;
+                        }
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -213,6 +266,9 @@ impl BonLoginApp {
         })
         .detach();
 
+        let initial_group = saved_groups.first().cloned().unwrap_or_default();
+        let initial_tag = saved_tags.first().cloned().unwrap_or_default();
+
         Self {
             db: Arc::new(Mutex::new(db)),
             profiles,
@@ -222,13 +278,13 @@ impl BonLoginApp {
             extensions,
             ext_url_input,
             ext_file_input,
-            pending_remove_ext_id: None,
+            pending_delete: None,
             downloading_ext: false,
             checked_proxy_ids: HashSet::new(),
             checking_proxy_ids: HashSet::new(),
             selected_proxy_group: "All".to_string(),
             proxy_add_protocol: ProxyProtocol::Http,
-            proxy_selected_tag: "General".to_string(),
+            proxy_selected_tag: initial_tag,
             proxy_raw_input,
             proxy_expire_input,
             statuses: HashMap::new(),
@@ -250,7 +306,7 @@ impl BonLoginApp {
             active_view: WorkspaceView::Profiles,
             modal: None,
             batch_prefix_input,
-            batch_selected_group: "General".to_string(),
+            batch_selected_group: initial_group,
             batch_proxy_group: "None".to_string(),
             batch_count_input,
             batch_os: PlatformType::MacOS,
@@ -273,9 +329,26 @@ impl BonLoginApp {
             }
             if let Ok(glist) = db.list_groups() {
                 self.saved_groups = glist;
+                if !self.batch_selected_group.is_empty()
+                    && !self
+                        .saved_groups
+                        .iter()
+                        .any(|g| g.eq_ignore_ascii_case(&self.batch_selected_group))
+                {
+                    self.batch_selected_group =
+                        self.saved_groups.first().cloned().unwrap_or_default();
+                }
             }
             if let Ok(tlist) = db.list_tags() {
                 self.saved_tags = tlist;
+                if !self.proxy_selected_tag.is_empty()
+                    && !self
+                        .saved_tags
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(&self.proxy_selected_tag))
+                {
+                    self.proxy_selected_tag = self.saved_tags.first().cloned().unwrap_or_default();
+                }
             }
             if let Ok(elist) = db.list_extensions() {
                 self.extensions = elist;
@@ -428,11 +501,7 @@ impl BonLoginApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let group_tag = if self.proxy_selected_tag.trim().is_empty() {
-            "General".to_string()
-        } else {
-            self.proxy_selected_tag.trim().to_string()
-        };
+        let group_tag = self.proxy_selected_tag.trim().to_string();
         let raw = self.proxy_raw_input.read(cx).value().to_string();
         let tokens: Vec<&str> = raw
             .lines()
@@ -872,11 +941,7 @@ impl BonLoginApp {
                 s
             }
         };
-        let group = if self.batch_selected_group.trim().is_empty() {
-            "General".to_string()
-        } else {
-            self.batch_selected_group.trim().to_string()
-        };
+        let group = self.batch_selected_group.trim().to_string();
         let pool = self.proxies_for_batch_group();
         let requested_count = self
             .batch_count_input
@@ -917,7 +982,11 @@ impl BonLoginApp {
             self.select_profile(&id, window, cx);
         }
         self.active_view = WorkspaceView::Profiles;
-        self.banner_message = Some(format!("Created {count} profiles in folder '{group}'"));
+        self.banner_message = Some(if group.is_empty() {
+            format!("Created {count} profiles")
+        } else {
+            format!("Created {count} profiles in folder '{group}'")
+        });
         cx.notify();
     }
 
@@ -950,55 +1019,137 @@ impl BonLoginApp {
         self.reload_profiles();
 
         if next_enabled {
-            let ext_dir = crate::launcher::ensure_extension_unpacked(&ext).ok();
-            let is_placeholder = ext_dir.as_ref().is_none_or(|d| {
-                std::fs::read_to_string(d.join("content.js"))
-                    .is_ok_and(|c| c.contains("BonLogin Managed Extension"))
-            });
             let src_trimmed = ext.source_url.trim();
             let is_remote = BrowserExtension::extract_chrome_store_id(src_trimmed).is_some()
                 || src_trimmed.starts_with("http://")
                 || src_trimmed.starts_with("https://");
-            if is_placeholder && is_remote {
+            let target_dir = crate::launcher::app_support_dir()
+                .join("extensions")
+                .join(&ext.id);
+            if is_remote && crate::launcher::is_placeholder_extension_dir(&target_dir) {
                 let store_url = src_trimmed.to_string();
                 let eid = ext.id.clone();
                 let ename = ext.name.clone();
                 let tokio_handle = self.tokio_handle.clone();
+                self.banner_message = Some(format!("Downloading & activating {}...", ext.name));
                 cx.spawn(async move |this, cx| {
                     let res = tokio_handle
                         .spawn(async move {
                             let downloaded =
                                 crate::launcher::download_extension_from_url(&store_url).await?;
+                            let dst = crate::launcher::app_support_dir()
+                                .join("extensions")
+                                .join(&eid);
                             if downloaded.id != eid {
                                 let src = crate::launcher::app_support_dir()
                                     .join("extensions")
                                     .join(&downloaded.id);
-                                let dst = crate::launcher::app_support_dir()
-                                    .join("extensions")
-                                    .join(&eid);
                                 if src.exists() && src != dst {
                                     let _ = std::fs::remove_dir_all(&dst);
                                     let _ = std::fs::rename(&src, &dst);
                                 }
                             }
+                            crate::launcher::patch_unpacked_extension_for_agent(&dst, &eid, None);
                             Ok::<_, anyhow::Error>(())
                         })
                         .await;
-                    if let Ok(Ok(())) = res {
-                        let _ = this.update(cx, |app, cx| {
-                            app.banner_message =
-                                Some(format!("Activated & synced extension: {ename}"));
-                            cx.notify();
-                        });
-                    }
+                    let _ = this.update(cx, |app, cx| {
+                        match res {
+                            Ok(Ok(())) => {
+                                app.banner_message =
+                                    Some(format!("Activated & synced extension: {ename}"));
+                            }
+                            Ok(Err(e)) => {
+                                app.banner_message =
+                                    Some(format!("Extension sync failed ({ename}): {e}"));
+                            }
+                            Err(e) => {
+                                app.banner_message =
+                                    Some(format!("Extension task error ({ename}): {e}"));
+                            }
+                        }
+                        cx.notify();
+                    });
                 })
                 .detach();
+            } else {
+                let _ = crate::launcher::ensure_extension_unpacked(&ext);
+                self.banner_message = Some(format!("Enabled extension: {}", ext.name));
             }
-            self.banner_message = Some(format!("Enabled extension: {}", ext.name));
         } else {
             self.banner_message = Some(format!("Disabled extension: {}", ext.name));
         }
         cx.notify();
+    }
+
+    pub fn open_or_copy_extension_agent_cli(&mut self, ext_id: &str, cx: &mut Context<Self>) {
+        let Some(ext) = self.extensions.iter().find(|e| e.id == ext_id).cloned() else {
+            return;
+        };
+        let Some((_runtime_id, entry_url)) = crate::launcher::resolve_extension_runtime_info(&ext)
+        else {
+            self.banner_message = Some(format!("Enable '{}' first to unpack its manifest", ext.name));
+            cx.notify();
+            return;
+        };
+
+        let running_target = self
+            .selected_profile_id
+            .as_ref()
+            .and_then(|pid| {
+                let prof = self.profiles.iter().find(|p| &p.id == pid)?;
+                match self.statuses.get(pid) {
+                    Some(ProfileStatus::Running(info)) => {
+                        Some((prof.short_id(), info.ws_url.clone()))
+                    }
+                    _ => None,
+                }
+            })
+            .or_else(|| {
+                self.profiles.iter().find_map(|p| match self.statuses.get(&p.id) {
+                    Some(ProfileStatus::Running(info)) => {
+                        Some((p.short_id(), info.ws_url.clone()))
+                    }
+                    _ => None,
+                })
+            });
+
+        if let Some((short_id, ws_url)) = running_target {
+            let cli = format!(
+                "agent-browser --session bon_{short_id} tab new \"{entry_url}\" && agent-browser --session bon_{short_id} snapshot -i"
+            );
+            cx.write_to_clipboard(ClipboardItem::new_string(cli));
+            let ename = ext.name.clone();
+            let tokio_handle = self.tokio_handle.clone();
+            self.banner_message = Some(format!(
+                "Opening {} in bon_{short_id} & copied Agent CLI...",
+                ext.name
+            ));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let res = tokio_handle
+                    .spawn_blocking(move || {
+                        crate::launcher::agent_open_extension_tab(&short_id, &ws_url, &entry_url)
+                    })
+                    .await;
+                let _ = this.update(cx, |app, cx| {
+                    if let Ok(Ok(next_cmd)) = res {
+                        app.banner_message =
+                            Some(format!("Opened {ename} tab! Next: {next_cmd}"));
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            let cli = format!("agent-browser tab new \"{entry_url}\" && agent-browser snapshot -i");
+            cx.write_to_clipboard(ClipboardItem::new_string(cli));
+            self.banner_message = Some(format!(
+                "Copied {} Agent CLI ({entry_url})",
+                ext.name
+            ));
+            cx.notify();
+        }
     }
 
     pub fn pick_extension_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1147,33 +1298,61 @@ impl BonLoginApp {
         .detach();
     }
 
-    pub fn confirm_remove_extension(&mut self, cx: &mut Context<Self>) {
-        let Some(ext_id) = self.pending_remove_ext_id.take() else {
+    pub fn request_delete(&mut self, action: PendingDeleteAction, cx: &mut Context<Self>) {
+        self.pending_delete = Some(action);
+        self.popup_modal = Some(ActivePopupModal::RemoveExtension);
+        cx.notify();
+    }
+
+    pub fn confirm_pending_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.pending_delete.take() else {
             self.popup_modal = None;
             cx.notify();
             return;
         };
-        let ext_name = self
-            .extensions
-            .iter()
-            .find(|e| e.id == ext_id)
-            .map(|e| e.name.clone())
-            .unwrap_or_else(|| ext_id.clone());
-        let removed = self
-            .db
-            .lock()
-            .ok()
-            .and_then(|db| db.delete_extension(&ext_id).ok())
-            .unwrap_or(false);
-        if removed {
-            crate::launcher::remove_extension_files(&ext_id);
-            self.reload_profiles();
-            self.banner_message = Some(format!("Removed extension: {ext_name}"));
-        } else {
-            self.banner_message = Some("Default extensions cannot be deleted".to_string());
-        }
         self.popup_modal = None;
-        cx.notify();
+        match action {
+            PendingDeleteAction::Profile(id) => {
+                self.delete_profile(&id, window, cx);
+            }
+            PendingDeleteAction::CheckedProfiles => {
+                self.delete_checked_profiles(window, cx);
+            }
+            PendingDeleteAction::Group(grp) => {
+                self.delete_group_and_reset(&grp, window, cx);
+            }
+            PendingDeleteAction::Proxy(pid) => {
+                self.delete_saved_proxy(&pid, cx);
+            }
+            PendingDeleteAction::CheckedProxies => {
+                self.delete_checked_saved_proxies(cx);
+            }
+            PendingDeleteAction::Tag(tag) => {
+                self.delete_tag_and_reset(&tag, cx);
+            }
+            PendingDeleteAction::Extension(ext_id) => {
+                let ext_name = self
+                    .extensions
+                    .iter()
+                    .find(|e| e.id == ext_id)
+                    .map(|e| e.name.clone())
+                    .unwrap_or_else(|| ext_id.clone());
+                let removed = self
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.delete_extension(&ext_id).ok())
+                    .unwrap_or(false);
+                if removed {
+                    crate::launcher::remove_extension_files(&ext_id);
+                    self.reload_profiles();
+                    self.banner_message = Some(format!("Removed extension: {ext_name}"));
+                } else {
+                    self.banner_message = Some("Default extensions cannot be deleted".to_string());
+                }
+                cx.notify();
+            }
+        }
     }
 
     pub fn filtered_profiles(&self) -> Vec<Profile> {
@@ -1368,11 +1547,7 @@ impl BonLoginApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target_group = if self.batch_selected_group.trim().is_empty() {
-            "General".to_string()
-        } else {
-            self.batch_selected_group.trim().to_string()
-        };
+        let target_group = self.batch_selected_group.trim().to_string();
         let mut moved = 0usize;
         if let Ok(db) = self.db.lock() {
             for mut prof in self
@@ -1391,7 +1566,11 @@ impl BonLoginApp {
         if let Some(sel) = self.selected_profile_id.clone() {
             self.select_profile(&sel, window, cx);
         }
-        self.banner_message = Some(format!("Moved {moved} profile(s) to folder '{target_group}'"));
+        self.banner_message = Some(if target_group.is_empty() {
+            format!("Removed group from {moved} profile(s)")
+        } else {
+            format!("Moved {moved} profile(s) to folder '{target_group}'")
+        });
         cx.notify();
     }
 
@@ -1556,12 +1735,22 @@ impl BonLoginApp {
         };
         let short_id = prof.short_id();
         let cmd = if let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id) {
-            info.agent_browser_cli(&short_id)
+            let sid = short_id.clone();
+            let ws = info.ws_url.clone();
+            self.tokio_handle.spawn_blocking(move || {
+                let _ = crate::launcher::agent_sync_targets(&sid, &ws);
+            });
+            format!(
+                "{} && agent-browser --session bon_{short_id} snapshot -i -c",
+                info.agent_browser_cli(&short_id)
+            )
         } else {
-            format!("agent-browser --session bon_{short_id} snapshot -i")
+            format!("bon-login agent {short_id} snapshot -i -c")
         };
         cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
-        self.banner_message = Some(format!("Copied Agent CLI (session bon_{short_id})"));
+        self.banner_message = Some(format!(
+            "Copied Agent CLI & synced popups (session bon_{short_id})"
+        ));
         cx.notify();
     }
 
@@ -1573,22 +1762,13 @@ impl BonLoginApp {
     ) {
         if let Ok(db) = self.db.lock() {
             let _ = db.delete_group(group_name);
-            for mut p in self
-                .profiles
-                .iter()
-                .filter(|p| p.group_tag.eq_ignore_ascii_case(group_name))
-                .cloned()
-            {
-                p.group_tag = "General".to_string();
-                let _ = db.upsert_profile(&p);
-            }
         }
         self.reload_profiles();
         if self.selected_group.eq_ignore_ascii_case(group_name) {
             self.selected_group = "All".to_string();
         }
         if self.batch_selected_group.eq_ignore_ascii_case(group_name) {
-            self.batch_selected_group = "General".to_string();
+            self.batch_selected_group = self.saved_groups.first().cloned().unwrap_or_default();
         }
         if let Some(sel) = self.selected_profile_id.clone() {
             self.select_profile(&sel, window, cx);
@@ -1635,22 +1815,13 @@ impl BonLoginApp {
     pub fn delete_tag_and_reset(&mut self, tag_name: &str, cx: &mut Context<Self>) {
         if let Ok(db) = self.db.lock() {
             let _ = db.delete_tag(tag_name);
-            for mut sp in self
-                .saved_proxies
-                .iter()
-                .filter(|p| p.group_tag.eq_ignore_ascii_case(tag_name))
-                .cloned()
-            {
-                sp.group_tag = "General".to_string();
-                let _ = db.upsert_proxy(&sp);
-            }
         }
         self.reload_profiles();
         if self.selected_proxy_group.eq_ignore_ascii_case(tag_name) {
             self.selected_proxy_group = "All".to_string();
         }
         if self.proxy_selected_tag.eq_ignore_ascii_case(tag_name) {
-            self.proxy_selected_tag = "General".to_string();
+            self.proxy_selected_tag = self.saved_tags.first().cloned().unwrap_or_default();
         }
         self.banner_message = Some(format!("Removed proxy tag '#{tag_name}'"));
         cx.notify();
@@ -1917,11 +2088,22 @@ impl BonLoginApp {
     }
 
     pub fn stop_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let short_id = self
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| p.short_id())
+            .unwrap_or_default();
         if let Ok(mut map) = self.running_processes.lock()
             && let Some(mut proc) = map.remove(profile_id)
         {
             self.tokio_handle.spawn_blocking(move || {
                 proc.stop_gracefully();
+            });
+        } else {
+            let pid_s = profile_id.to_string();
+            self.tokio_handle.spawn_blocking(move || {
+                crate::launcher::stop_external_runtime(&pid_s, &short_id);
             });
         }
         self.statuses
@@ -2635,11 +2817,14 @@ impl Render for BonLoginApp {
                                                                                 ),
                                                                             )
                                                                             .on_click(
-                                                                                move |_, window, cx| {
+                                                                                move |_, _, cx| {
                                                                                     a4.update(
                                                                                         cx,
                                                                                         |app, cx| {
-                                                                                            app.delete_checked_profiles(window, cx);
+                                                                                            app.request_delete(
+                                                                                                PendingDeleteAction::CheckedProfiles,
+                                                                                                cx,
+                                                                                            );
                                                                                         },
                                                                                     );
                                                                                 },
