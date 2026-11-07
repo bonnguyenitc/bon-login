@@ -78,8 +78,13 @@ pub struct BonLoginApp {
     pub ext_file_input: Entity<InputState>,
     pub pending_delete: Option<PendingDeleteAction>,
     pub downloading_ext: bool,
+    pub ext_tasks: HashMap<String, (tokio::task::AbortHandle, Arc<std::sync::atomic::AtomicBool>)>,
+    pub ext_url_task: Option<(tokio::task::AbortHandle, Arc<std::sync::atomic::AtomicBool>)>,
     pub checked_proxy_ids: HashSet<String>,
     pub checking_proxy_ids: HashSet<String>,
+    pub proxy_check_tasks: HashMap<String, tokio::task::AbortHandle>,
+    pub modal_proxy_task: Option<tokio::task::AbortHandle>,
+    pub profile_tasks: HashMap<String, tokio::task::AbortHandle>,
     pub selected_proxy_group: String,
     pub proxy_add_protocol: ProxyProtocol,
     pub proxy_selected_tag: String,
@@ -280,8 +285,13 @@ impl BonLoginApp {
             ext_file_input,
             pending_delete: None,
             downloading_ext: false,
+            ext_tasks: HashMap::new(),
+            ext_url_task: None,
             checked_proxy_ids: HashSet::new(),
             checking_proxy_ids: HashSet::new(),
+            proxy_check_tasks: HashMap::new(),
+            modal_proxy_task: None,
+            profile_tasks: HashMap::new(),
             selected_proxy_group: "All".to_string(),
             proxy_add_protocol: ProxyProtocol::Http,
             proxy_selected_tag: initial_tag,
@@ -440,6 +450,12 @@ impl BonLoginApp {
             return;
         }
         let count = ids.len();
+        for id in &ids {
+            self.checking_proxy_ids.remove(id);
+            if let Some(handle) = self.proxy_check_tasks.remove(id) {
+                handle.abort();
+            }
+        }
         if let Ok(db) = self.db.lock() {
             for id in &ids {
                 let _ = db.delete_proxy(id);
@@ -559,6 +575,10 @@ impl BonLoginApp {
 
     pub fn delete_saved_proxy(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
         self.checked_proxy_ids.remove(proxy_id);
+        self.checking_proxy_ids.remove(proxy_id);
+        if let Some(handle) = self.proxy_check_tasks.remove(proxy_id) {
+            handle.abort();
+        }
         if let Ok(db) = self.db.lock() {
             let _ = db.delete_proxy(proxy_id);
         }
@@ -566,7 +586,6 @@ impl BonLoginApp {
         self.banner_message = Some("Deleted proxy".to_string());
         cx.notify();
     }
-
 
     pub fn check_saved_proxy(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
         let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
@@ -576,6 +595,9 @@ impl BonLoginApp {
         let proxy_name = sp.name.clone();
         let cfg = sp.config.clone();
         let cfg_for_profiles = cfg.clone();
+        if let Some(prev) = self.proxy_check_tasks.remove(&pid) {
+            prev.abort();
+        }
         self.checking_proxy_ids.insert(pid.clone());
         self.banner_message = Some(format!("Checking proxy '{proxy_name}' ({})...", cfg.display_short()));
         cx.notify();
@@ -584,22 +606,38 @@ impl BonLoginApp {
         let sem = self.proxy_check_sem.clone();
         let db = self.db.clone();
 
-        cx.spawn(async move |this, cx| {
-            let res: anyhow::Result<crate::models::GeoInfo> = tokio_handle
-                .spawn(async move {
-                    // shortcut: cap concurrent GeoIP checks at 5 to avoid 429 rate-limits
-                    let _permit = sem.acquire_owned().await;
-                    let mut tunnel = LocalProxyTunnel::start(cfg).await?;
-                    let port = tunnel.local_port();
-                    let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
-                    tunnel.stop();
-                    geo_res
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+        let join_handle = tokio_handle.spawn(async move {
+            // shortcut: cap concurrent GeoIP checks at 5 to avoid 429 rate-limits
+            let _permit = sem.acquire_owned().await;
+            let mut tunnel = LocalProxyTunnel::start(cfg).await?;
+            let port = tunnel.local_port();
+            let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+            tunnel.stop();
+            geo_res
+        });
+        let abort_handle = join_handle.abort_handle();
+        let task_id = abort_handle.id();
+        self.proxy_check_tasks.insert(pid.clone(), abort_handle);
 
+        cx.spawn(async move |this, cx| {
+            let join_res = join_handle.await;
             let _ = this.update(cx, |app, cx| {
-                app.checking_proxy_ids.remove(&pid);
+                if app
+                    .proxy_check_tasks
+                    .get(&pid)
+                    .is_some_and(|h| h.id() == task_id)
+                {
+                    app.proxy_check_tasks.remove(&pid);
+                    app.checking_proxy_ids.remove(&pid);
+                }
+                let res = match join_res {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => Err(anyhow::anyhow!("Join error: {e}")),
+                };
+                if !app.saved_proxies.iter().any(|p| p.id == pid) {
+                    return;
+                }
                 match res {
                     Ok(geo) => {
                         if let Ok(db_guard) = db.lock() {
@@ -730,11 +768,21 @@ impl BonLoginApp {
             .collect()
     }
 
+    fn cancel_modal_proxy_check(&mut self) {
+        if let Some(handle) = self.modal_proxy_task.take() {
+            handle.abort();
+        }
+        if let Some(m) = self.modal.as_mut() {
+            m.checking_proxy = false;
+        }
+    }
+
     pub fn fill_modal_proxy_from_group(
         &mut self,
         group_name: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_modal_proxy_check();
         let chosen_sp = group_name.and_then(|grp| {
             let candidates: Vec<&SavedProxy> = self
                 .saved_proxies
@@ -775,6 +823,7 @@ impl BonLoginApp {
         mode: ProxyEditMode,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_modal_proxy_check();
         if let Some(m) = self.modal.as_mut() {
             m.proxy_mode = mode;
             m.proxy_check_error = None;
@@ -791,6 +840,7 @@ impl BonLoginApp {
         proxy_id: &str,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_modal_proxy_check();
         let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
             return;
         };
@@ -821,6 +871,7 @@ impl BonLoginApp {
     }
 
     pub fn check_modal_proxy(&mut self, cx: &mut Context<Self>) {
+        self.cancel_modal_proxy_check();
         let Some(m) = self.modal.as_mut() else {
             return;
         };
@@ -839,20 +890,33 @@ impl BonLoginApp {
         let db = self.db.clone();
         let cfg_for_db = cfg.clone();
 
-        cx.spawn(async move |this, cx| {
-            let res: anyhow::Result<crate::models::GeoInfo> = tokio_handle
-                .spawn(async move {
-                    let _permit = sem.acquire_owned().await;
-                    let mut tunnel = LocalProxyTunnel::start(cfg).await?;
-                    let port = tunnel.local_port();
-                    let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
-                    tunnel.stop();
-                    geo_res
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+        let join_handle = tokio_handle.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let mut tunnel = LocalProxyTunnel::start(cfg).await?;
+            let port = tunnel.local_port();
+            let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+            tunnel.stop();
+            geo_res
+        });
+        let abort_handle = join_handle.abort_handle();
+        let task_id = abort_handle.id();
+        self.modal_proxy_task = Some(abort_handle);
 
+        cx.spawn(async move |this, cx| {
+            let join_res = join_handle.await;
             let _ = this.update(cx, |app, cx| {
+                if app
+                    .modal_proxy_task
+                    .as_ref()
+                    .is_some_and(|h| h.id() == task_id)
+                {
+                    app.modal_proxy_task = None;
+                }
+                let res = match join_res {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => Err(anyhow::anyhow!("Join error: {e}")),
+                };
                 if let Some(m) = app.modal.as_mut() {
                     m.checking_proxy = false;
                     match res {
@@ -1008,62 +1072,108 @@ impl BonLoginApp {
         }
     }
 
+    pub fn cancel_extension_task(&mut self, ext_id: &str) -> bool {
+        if let Some((handle, flag)) = self.ext_tasks.remove(ext_id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn close_popup_modal(&mut self, cx: &mut Context<Self>) {
+        if let Some((handle, flag)) = self.ext_url_task.take() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            handle.abort();
+        }
+        if self.downloading_ext {
+            self.downloading_ext = false;
+            self.banner_message = Some("Canceled extension download".to_string());
+        }
+        self.popup_modal = None;
+        cx.notify();
+    }
+
     pub fn toggle_extension(&mut self, ext_id: &str, cx: &mut Context<Self>) {
         let Some(ext) = self.extensions.iter().find(|e| e.id == ext_id).cloned() else {
             return;
         };
+        let was_downloading = self.cancel_extension_task(ext_id);
         let next_enabled = !ext.enabled;
         if let Ok(db) = self.db.lock() {
             let _ = db.set_extension_enabled(ext_id, next_enabled);
         }
         self.reload_profiles();
 
+        let target_dir = crate::launcher::app_support_dir()
+            .join("extensions")
+            .join(&ext.id);
+
         if next_enabled {
             let src_trimmed = ext.source_url.trim();
             let is_remote = BrowserExtension::extract_chrome_store_id(src_trimmed).is_some()
                 || src_trimmed.starts_with("http://")
                 || src_trimmed.starts_with("https://");
-            let target_dir = crate::launcher::app_support_dir()
-                .join("extensions")
-                .join(&ext.id);
             if is_remote && crate::launcher::is_placeholder_extension_dir(&target_dir) {
                 let store_url = src_trimmed.to_string();
                 let eid = ext.id.clone();
+                let eid_task = ext.id.clone();
                 let ename = ext.name.clone();
                 let tokio_handle = self.tokio_handle.clone();
+                let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag_for_task = cancel_flag.clone();
+                let flag_for_ui = cancel_flag.clone();
+
+                let join_handle = tokio_handle.spawn(async move {
+                    crate::launcher::download_extension_from_url_cancellable(
+                        &store_url,
+                        Some(&eid_task),
+                        &flag_for_task,
+                    )
+                    .await
+                });
+                self.ext_tasks
+                    .insert(eid.clone(), (join_handle.abort_handle(), cancel_flag));
                 self.banner_message = Some(format!("Downloading & activating {}...", ext.name));
+
                 cx.spawn(async move |this, cx| {
-                    let res = tokio_handle
-                        .spawn(async move {
-                            let downloaded =
-                                crate::launcher::download_extension_from_url(&store_url).await?;
-                            let dst = crate::launcher::app_support_dir()
-                                .join("extensions")
-                                .join(&eid);
-                            if downloaded.id != eid {
-                                let src = crate::launcher::app_support_dir()
-                                    .join("extensions")
-                                    .join(&downloaded.id);
-                                if src.exists() && src != dst {
-                                    let _ = std::fs::remove_dir_all(&dst);
-                                    let _ = std::fs::rename(&src, &dst);
-                                }
-                            }
-                            crate::launcher::patch_unpacked_extension_for_agent(&dst, &eid, None);
-                            Ok::<_, anyhow::Error>(())
-                        })
-                        .await;
+                    let res = join_handle.await;
                     let _ = this.update(cx, |app, cx| {
+                        if app
+                            .ext_tasks
+                            .get(&eid)
+                            .is_some_and(|(_, f)| Arc::ptr_eq(f, &flag_for_ui))
+                        {
+                            app.ext_tasks.remove(&eid);
+                        }
+                        let still_enabled = app
+                            .extensions
+                            .iter()
+                            .any(|e| e.id == eid && e.enabled);
+                        if flag_for_ui.load(std::sync::atomic::Ordering::SeqCst) || !still_enabled {
+                            cx.notify();
+                            return;
+                        }
                         match res {
-                            Ok(Ok(())) => {
+                            Ok(Ok(_)) => {
                                 app.banner_message =
                                     Some(format!("Activated & synced extension: {ename}"));
                             }
                             Ok(Err(e)) => {
+                                if let Ok(db) = app.db.lock() {
+                                    let _ = db.set_extension_enabled(&eid, false);
+                                }
+                                app.reload_profiles();
                                 app.banner_message =
                                     Some(format!("Extension sync failed ({ename}): {e}"));
                             }
+                            Err(e) if e.is_cancelled() => {}
                             Err(e) => {
+                                if let Ok(db) = app.db.lock() {
+                                    let _ = db.set_extension_enabled(&eid, false);
+                                }
+                                app.reload_profiles();
                                 app.banner_message =
                                     Some(format!("Extension task error ({ename}): {e}"));
                             }
@@ -1077,7 +1187,14 @@ impl BonLoginApp {
                 self.banner_message = Some(format!("Enabled extension: {}", ext.name));
             }
         } else {
-            self.banner_message = Some(format!("Disabled extension: {}", ext.name));
+            if was_downloading && crate::launcher::is_placeholder_extension_dir(&target_dir) {
+                crate::launcher::remove_extension_files(ext_id);
+            }
+            self.banner_message = Some(if was_downloading {
+                format!("Stopped download & disabled extension: {}", ext.name)
+            } else {
+                format!("Disabled extension: {}", ext.name)
+            });
         }
         cx.notify();
     }
@@ -1261,20 +1378,42 @@ impl BonLoginApp {
         if self.downloading_ext {
             return;
         }
+        if let Some((handle, flag)) = self.ext_url_task.take() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            handle.abort();
+        }
         self.downloading_ext = true;
         self.banner_message = Some("Downloading extension...".to_string());
         cx.notify();
 
         let db_arc = self.db.clone();
         let tokio_handle = self.tokio_handle.clone();
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_for_task = cancel_flag.clone();
+        let flag_for_ui = cancel_flag.clone();
         self.ext_url_input = cx.new(|cx| InputState::new(window, cx).placeholder("Input URL"));
 
+        let join_handle = tokio_handle.spawn(async move {
+            crate::launcher::download_extension_from_url_cancellable(&url, None, &flag_for_task)
+                .await
+        });
+        self.ext_url_task = Some((join_handle.abort_handle(), cancel_flag));
+
         cx.spawn(async move |this, cx| {
-            let res = tokio_handle
-                .spawn(async move { crate::launcher::download_extension_from_url(&url).await })
-                .await;
+            let res = join_handle.await;
             let _ = this.update(cx, |app, cx| {
-                app.downloading_ext = false;
+                if app
+                    .ext_url_task
+                    .as_ref()
+                    .is_some_and(|(_, f)| Arc::ptr_eq(f, &flag_for_ui))
+                {
+                    app.ext_url_task = None;
+                    app.downloading_ext = false;
+                }
+                if flag_for_ui.load(std::sync::atomic::Ordering::SeqCst) {
+                    cx.notify();
+                    return;
+                }
                 match res {
                     Ok(Ok(ext)) => {
                         let ext_name = ext.name.clone();
@@ -1288,6 +1427,7 @@ impl BonLoginApp {
                     Ok(Err(e)) => {
                         app.banner_message = Some(format!("Download Extension error: {e}"));
                     }
+                    Err(e) if e.is_cancelled() => {}
                     Err(e) => {
                         app.banner_message = Some(format!("Download task error: {e}"));
                     }
@@ -1331,6 +1471,7 @@ impl BonLoginApp {
                 self.delete_tag_and_reset(&tag, cx);
             }
             PendingDeleteAction::Extension(ext_id) => {
+                self.cancel_extension_task(&ext_id);
                 let ext_name = self
                     .extensions
                     .iter()
@@ -1456,6 +1597,16 @@ impl BonLoginApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(handle) = self.profile_tasks.remove(profile_id) {
+            handle.abort();
+        }
+        if let Ok(mut map) = self.running_processes.lock()
+            && let Some(mut proc) = map.remove(profile_id)
+        {
+            self.tokio_handle.spawn_blocking(move || {
+                proc.stop_gracefully();
+            });
+        }
         if let Ok(db) = self.db.lock() {
             let _ = db.delete_profile(profile_id);
         }
@@ -1527,7 +1678,12 @@ impl BonLoginApp {
         let ids: Vec<String> = self
             .checked_profile_ids
             .iter()
-            .filter(|id| matches!(self.statuses.get(*id), Some(ProfileStatus::Running(_))))
+            .filter(|id| {
+                matches!(
+                    self.statuses.get(*id),
+                    Some(ProfileStatus::Running(_) | ProfileStatus::Starting(_))
+                )
+            })
             .cloned()
             .collect();
         for id in ids {
@@ -1926,6 +2082,11 @@ impl BonLoginApp {
             return;
         }
         let count = deletable_ids.len();
+        for id in &deletable_ids {
+            if let Some(handle) = self.profile_tasks.remove(id) {
+                handle.abort();
+            }
+        }
         if let Ok(db) = self.db.lock() {
             for id in &deletable_ids {
                 let _ = db.delete_profile(id);
@@ -1954,6 +2115,9 @@ impl BonLoginApp {
         let pid = profile.id.clone();
         let was_running = matches!(self.statuses.get(&pid), Some(ProfileStatus::Running(_)));
         if !was_running {
+            if let Some(prev) = self.profile_tasks.remove(&pid) {
+                prev.abort();
+            }
             self.statuses.insert(
                 pid.clone(),
                 ProfileStatus::Starting("Checking proxy...".to_string()),
@@ -1967,24 +2131,42 @@ impl BonLoginApp {
         let db = self.db.clone();
         let proxy_for_sync = profile.proxy.clone();
 
-        cx.spawn(async move |this, cx| {
-            let res: anyhow::Result<crate::models::GeoInfo> = tokio_handle
-                .spawn(async move {
-                    let _permit = sem.acquire_owned().await;
-                    if let Some(proxy_cfg) = profile.proxy {
-                        let mut tunnel = LocalProxyTunnel::start(proxy_cfg).await?;
-                        let port = tunnel.local_port();
-                        let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
-                        tunnel.stop();
-                        geo_res
-                    } else {
-                        crate::geoip::resolve_geo_via_port(None).await
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("Task join error: {e}")));
+        let join_handle = tokio_handle.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            if let Some(proxy_cfg) = profile.proxy {
+                let mut tunnel = LocalProxyTunnel::start(proxy_cfg).await?;
+                let port = tunnel.local_port();
+                let geo_res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+                tunnel.stop();
+                geo_res
+            } else {
+                crate::geoip::resolve_geo_via_port(None).await
+            }
+        });
+        let abort_handle = join_handle.abort_handle();
+        let task_id = abort_handle.id();
+        if !was_running {
+            self.profile_tasks.insert(pid.clone(), abort_handle);
+        }
 
+        cx.spawn(async move |this, cx| {
+            let join_res = join_handle.await;
             let _ = this.update(cx, |app, cx| {
+                if app
+                    .profile_tasks
+                    .get(&pid)
+                    .is_some_and(|h| h.id() == task_id)
+                {
+                    app.profile_tasks.remove(&pid);
+                }
+                let res = match join_res {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => Err(anyhow::anyhow!("Task join error: {e}")),
+                };
+                if !app.profiles.iter().any(|p| p.id == pid) {
+                    return;
+                }
                 let still_running =
                     matches!(app.statuses.get(&pid), Some(ProfileStatus::Running(_)));
                 match res {
@@ -2039,6 +2221,9 @@ impl BonLoginApp {
         };
         let pid = profile.id.clone();
         let short_id = profile.short_id();
+        if let Some(prev) = self.profile_tasks.remove(&pid) {
+            prev.abort();
+        }
         self.statuses.insert(
             pid.clone(),
             ProfileStatus::Starting("Starting...".to_string()),
@@ -2048,13 +2233,37 @@ impl BonLoginApp {
         let tokio_handle = self.tokio_handle.clone();
         let db = self.db.clone();
 
-        cx.spawn(async move |this, cx| {
-            let res = tokio_handle
-                .spawn(async move { crate::launcher::launch_profile(&profile).await })
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("Launch task error: {e}")));
+        let join_handle =
+            tokio_handle.spawn(async move { crate::launcher::launch_profile(&profile).await });
+        let abort_handle = join_handle.abort_handle();
+        let task_id = abort_handle.id();
+        self.profile_tasks.insert(pid.clone(), abort_handle);
 
+        cx.spawn(async move |this, cx| {
+            let join_res = join_handle.await;
             let _ = this.update(cx, |app, cx| {
+                if app
+                    .profile_tasks
+                    .get(&pid)
+                    .is_some_and(|h| h.id() == task_id)
+                {
+                    app.profile_tasks.remove(&pid);
+                }
+                let still_starting =
+                    matches!(app.statuses.get(&pid), Some(ProfileStatus::Starting(_)));
+                let res = match join_res {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => Err(anyhow::anyhow!("Launch task error: {e}")),
+                };
+                if !still_starting || !app.profiles.iter().any(|p| p.id == pid) {
+                    if let Ok((mut running_proc, _)) = res {
+                        app.tokio_handle.spawn_blocking(move || {
+                            running_proc.stop_gracefully();
+                        });
+                    }
+                    return;
+                }
                 match res {
                     Ok((running_proc, maybe_geo)) => {
                         let info = running_proc.info.clone();
@@ -2088,6 +2297,12 @@ impl BonLoginApp {
     }
 
     pub fn stop_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let cancelled_starting = if let Some(handle) = self.profile_tasks.remove(profile_id) {
+            handle.abort();
+            true
+        } else {
+            false
+        };
         let short_id = self
             .profiles
             .iter()
@@ -2100,7 +2315,7 @@ impl BonLoginApp {
             self.tokio_handle.spawn_blocking(move || {
                 proc.stop_gracefully();
             });
-        } else {
+        } else if !cancelled_starting {
             let pid_s = profile_id.to_string();
             self.tokio_handle.spawn_blocking(move || {
                 crate::launcher::stop_external_runtime(&pid_s, &short_id);
@@ -2108,8 +2323,11 @@ impl BonLoginApp {
         }
         self.statuses
             .insert(profile_id.to_string(), ProfileStatus::Stopped);
-        self.banner_message =
-            Some("Stopped browser session (cookies flushed)".to_string());
+        self.banner_message = Some(if cancelled_starting {
+            "Stopped starting profile".to_string()
+        } else {
+            "Stopped browser session (cookies flushed)".to_string()
+        });
         cx.notify();
     }
 

@@ -949,6 +949,25 @@ pub fn install_extension_from_bytes(
     preferred_id: Option<&str>,
     source_url: &str,
 ) -> Result<BrowserExtension> {
+    install_extension_from_bytes_cancellable(
+        raw_bytes,
+        preferred_id,
+        source_url,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// Extracts `.crx` or `.zip` bytes into a staging directory first, aborting cleanly if `cancelled` is set.
+pub fn install_extension_from_bytes_cancellable(
+    raw_bytes: &[u8],
+    preferred_id: Option<&str>,
+    source_url: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<BrowserExtension> {
+    use std::sync::atomic::Ordering;
+    if cancelled.load(Ordering::SeqCst) {
+        bail!("Extension download cancelled");
+    }
     let crx_key_b64 = extract_crx_public_key_b64(raw_bytes, preferred_id);
     let zip_bytes = strip_crx_header(raw_bytes)?;
     let ext_id = preferred_id
@@ -962,15 +981,12 @@ pub fn install_extension_from_bytes(
         })
         .unwrap_or_else(|| format!("ext-{}", unix_now()));
 
-    let ext_root = app_support_dir().join("extensions");
-    std::fs::create_dir_all(&ext_root)?;
-    let dest_dir = ext_root.join(&ext_id);
-    if dest_dir.exists() {
-        let _ = std::fs::remove_dir_all(&dest_dir);
-    }
-    std::fs::create_dir_all(&dest_dir)?;
+    let nonce = rand::random::<u32>();
+    let stage_dir = std::env::temp_dir().join(format!("bonlogin_stage_{ext_id}_{nonce}"));
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    std::fs::create_dir_all(&stage_dir)?;
 
-    let tmp_zip = std::env::temp_dir().join(format!("bonlogin_{ext_id}.zip"));
+    let tmp_zip = std::env::temp_dir().join(format!("bonlogin_{ext_id}_{nonce}.zip"));
     std::fs::write(&tmp_zip, zip_bytes)?;
 
     let status = Command::new("/usr/bin/unzip")
@@ -979,7 +995,7 @@ pub fn install_extension_from_bytes(
             "-o",
             &tmp_zip.to_string_lossy(),
             "-d",
-            &dest_dir.to_string_lossy(),
+            &stage_dir.to_string_lossy(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -987,18 +1003,39 @@ pub fn install_extension_from_bytes(
         .status();
     let _ = std::fs::remove_file(&tmp_zip);
 
+    if cancelled.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        bail!("Extension download cancelled");
+    }
+
     if !status.is_ok_and(|s| s.success()) {
-        let _ = std::fs::remove_dir_all(&dest_dir);
+        let _ = std::fs::remove_dir_all(&stage_dir);
         bail!("Failed to extract archive (must be a valid .CRX or .ZIP extension)");
     }
 
-    flatten_single_nested_manifest_dir(&dest_dir);
-    if !dest_dir.join("manifest.json").is_file() {
-        let _ = std::fs::remove_dir_all(&dest_dir);
+    flatten_single_nested_manifest_dir(&stage_dir);
+    if !stage_dir.join("manifest.json").is_file() {
+        let _ = std::fs::remove_dir_all(&stage_dir);
         bail!("Archive does not contain a Chrome extension manifest.json");
     }
 
-    patch_unpacked_extension_for_agent(&dest_dir, &ext_id, crx_key_b64.as_deref());
+    patch_unpacked_extension_for_agent(&stage_dir, &ext_id, crx_key_b64.as_deref());
+    if cancelled.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        bail!("Extension download cancelled");
+    }
+
+    let ext_root = app_support_dir().join("extensions");
+    std::fs::create_dir_all(&ext_root)?;
+    let dest_dir = ext_root.join(&ext_id);
+    if dest_dir.exists() {
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+    if std::fs::rename(&stage_dir, &dest_dir).is_err() {
+        copy_dir_recursive(&stage_dir, &dest_dir)?;
+        let _ = std::fs::remove_dir_all(&stage_dir);
+    }
+
     let name = read_extension_name_from_dir(&dest_dir, &ext_id);
     let (icon_label, icon_bg) = pick_icon_badge(&name);
     Ok(BrowserExtension {
@@ -1016,12 +1053,30 @@ pub fn install_extension_from_bytes(
 
 /// Downloads an extension from a Chrome Web Store URL, 32-char ID, or direct `.crx`/`.zip` URL.
 pub async fn download_extension_from_url(url_or_id: &str) -> Result<BrowserExtension> {
+    download_extension_from_url_cancellable(
+        url_or_id,
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .await
+}
+
+/// Cancellable extension download that aborts before or during unpacking if `cancelled` becomes true.
+pub async fn download_extension_from_url_cancellable(
+    url_or_id: &str,
+    target_id_override: Option<&str>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<BrowserExtension> {
+    use std::sync::atomic::Ordering;
     let trimmed = url_or_id.trim();
     if trimmed.is_empty() {
         bail!("Please enter a Chrome Web Store URL or Extension link");
     }
+    if cancelled.load(Ordering::SeqCst) {
+        bail!("Extension download cancelled");
+    }
 
-    let (download_url, preferred_id) =
+    let (download_url, store_id_opt) =
         if let Some(store_id) = BrowserExtension::extract_chrome_store_id(trimmed) {
             let crx_url = format!(
                 "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=134.0.0.0&acceptformat=crx2,crx3&x=id%3D{store_id}%26uc"
@@ -1042,14 +1097,21 @@ pub async fn download_extension_from_url(url_or_id: &str) -> Result<BrowserExten
         .send()
         .await
         .with_context(|| format!("Failed to download from {download_url}"))?;
+    if cancelled.load(Ordering::SeqCst) {
+        bail!("Extension download cancelled");
+    }
     if !resp.status().is_success() {
         bail!("Download returned HTTP {}", resp.status());
     }
     let bytes = resp.bytes().await?;
+    if cancelled.load(Ordering::SeqCst) {
+        bail!("Extension download cancelled");
+    }
     if bytes.is_empty() {
         bail!("Downloaded empty response from store");
     }
-    install_extension_from_bytes(&bytes, preferred_id.as_deref(), trimmed)
+    let preferred_id = target_id_override.or(store_id_opt.as_deref());
+    install_extension_from_bytes_cancellable(&bytes, preferred_id, trimmed, cancelled)
 }
 
 /// Ensures an enabled extension has a valid unpacked MV3 directory on disk in `extensions/<id>`.
@@ -1177,16 +1239,22 @@ pub async fn sync_enabled_remote_extensions() {
     for ext in enabled_remote {
         let store_url = ext.source_url.trim().to_string();
         let eid = ext.id.clone();
-        if let Ok(downloaded) = download_extension_from_url(&store_url).await {
-            let dst = app_support_dir().join("extensions").join(&eid);
-            if downloaded.id != eid {
-                let src = app_support_dir().join("extensions").join(&downloaded.id);
-                if src.exists() && src != dst {
-                    let _ = std::fs::remove_dir_all(&dst);
-                    let _ = std::fs::rename(&src, &dst);
-                }
-            }
-            patch_unpacked_extension_for_agent(&dst, &eid, None);
+        let still_enabled = || {
+            crate::db::Database::open_fast()
+                .ok()
+                .and_then(|db| db.list_extensions().ok())
+                .is_some_and(|list| list.iter().any(|e| e.id == eid && e.enabled))
+        };
+        if !still_enabled() {
+            continue;
+        }
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        if download_extension_from_url_cancellable(&store_url, Some(&eid), &cancelled)
+            .await
+            .is_ok()
+            && !still_enabled()
+        {
+            remove_extension_files(&eid);
         }
     }
 }
@@ -1764,14 +1832,37 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         newly_resolved_geo.as_ref(),
     );
 
-    let mut child = match Command::new(&kernel.path)
+    struct SpawnedChildGuard {
+        child: Option<Child>,
+        profile_id: String,
+    }
+    impl Drop for SpawnedChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+                let _ = std::fs::remove_file(runtime_file_path(&self.profile_id));
+                let _ = std::fs::remove_file(
+                    app_support_dir()
+                        .join("profiles")
+                        .join(&self.profile_id)
+                        .join("DevToolsActivePort"),
+                );
+            }
+        }
+    }
+
+    let mut child_guard = match Command::new(&kernel.path)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(c) => c,
+        Ok(c) => SpawnedChildGuard {
+            child: Some(c),
+            profile_id: profile.id.clone(),
+        },
         Err(e) => {
             if let Some(mut tun) = tunnel.take() {
                 tun.stop();
@@ -1783,7 +1874,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         }
     };
 
-    let pid = child.id();
+    let pid = child_guard.child.as_ref().map(Child::id).unwrap_or(0);
     let mut cdp_endpoint: Option<(u16, String)> = None;
 
     for _ in 0..50 {
@@ -1794,7 +1885,9 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
             break;
         }
 
-        if let Ok(Some(status)) = child.try_wait() {
+        if let Some(c) = child_guard.child.as_mut()
+            && let Ok(Some(status)) = c.try_wait()
+        {
             if let Some(mut tun) = tunnel.take() {
                 tun.stop();
             }
@@ -1807,8 +1900,6 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     let (cdp_port, ws_url) = match cdp_endpoint {
         Some(v) => v,
         None => {
-            let _ = child.kill();
-            let _ = child.wait();
             if let Some(mut tun) = tunnel.take() {
                 tun.stop();
             }
@@ -1852,6 +1943,10 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         })
         .await;
     }
+    let child = child_guard
+        .child
+        .take()
+        .ok_or_else(|| anyhow!("Browser child process missing"))?;
     Ok((
         RunningProcess {
             profile_id: profile.id.clone(),
@@ -4223,5 +4318,33 @@ mod tests {
             p.proxy.as_ref().map(|x| x.display_short()).as_deref(),
             Some("198.51.100.7:1080")
         );
+    }
+
+    #[tokio::test]
+    async fn test_cancellable_extension_download_and_unpack() {
+        use std::sync::atomic::AtomicBool;
+        let cancelled = AtomicBool::new(true);
+        let test_id = "bon_test_cancelled_ext";
+        remove_extension_files(test_id);
+
+        let err = download_extension_from_url_cancellable(
+            "https://example.com/ext.zip",
+            Some(test_id),
+            &cancelled,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
+        assert!(!app_support_dir().join("extensions").join(test_id).exists());
+
+        let err2 = install_extension_from_bytes_cancellable(
+            b"PK\x03\x04dummy",
+            Some(test_id),
+            "https://example.com/ext.zip",
+            &cancelled,
+        )
+        .unwrap_err();
+        assert!(err2.to_string().contains("cancelled"));
+        assert!(!app_support_dir().join("extensions").join(test_id).exists());
     }
 }

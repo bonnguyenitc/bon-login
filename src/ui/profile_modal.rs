@@ -1789,7 +1789,7 @@ pub fn render_bulk_backup_view(
                             let ext_id_agent = ext.id.clone();
                             let is_enabled = ext.enabled;
                             let is_default = ext.is_default;
-
+                            let is_downloading = app.ext_tasks.contains_key(&ext.id);
                             v_flex()
                                 .w_0()
                                 .flex_1()
@@ -1819,15 +1819,26 @@ pub fn render_bulk_backup_view(
                                         .gap_3()
                                         .overflow_hidden()
                                         .child(
-                                            div()
+                                            v_flex()
                                                 .w_0()
                                                 .flex_1()
                                                 .min_w_0()
-                                                .truncate()
-                                                .text_xs()
-                                                .font_semibold()
-                                                .text_color(BonTheme::text_primary())
-                                                .child(ext.name.clone()),
+                                                .gap_0p5()
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .font_semibold()
+                                                        .text_color(BonTheme::text_primary())
+                                                        .child(ext.name.clone()),
+                                                )
+                                                .children(is_downloading.then(|| {
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(BonTheme::warning())
+                                                        .child("Downloading...")
+                                                })),
                                         )
                                         .child(
                                             if let Some(icon_img) = get_extension_icon(&ext) {
@@ -4196,8 +4207,7 @@ pub fn render_popup_modal(
                             .small()
                             .label("Cancel")
                             .on_click(cx.listener(|app, _, _, cx| {
-                                app.popup_modal = None;
-                                cx.notify();
+                                app.close_popup_modal(cx);
                             })),
                     )
                     .child(
@@ -4262,8 +4272,7 @@ pub fn render_popup_modal(
                                 .small()
                                 .label("Cancel")
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.popup_modal = None;
-                                    cx.notify();
+                                    app.close_popup_modal(cx);
                                 })),
                         )
                         .child(
@@ -4448,8 +4457,7 @@ pub fn render_popup_modal(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|app, _, _, cx| {
-                app.popup_modal = None;
-                cx.notify();
+                app.close_popup_modal(cx);
             }),
         )
         .child(

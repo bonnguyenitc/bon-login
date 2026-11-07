@@ -872,7 +872,7 @@ fn render_profile_row(
                         .justify_end()
                         .items_center()
                         .gap_1p5()
-                        .child(if is_running {
+                        .child(if is_running || is_starting {
                             let pid_stop = profile_id.clone();
                             Button::new(SharedString::from(format!("row-stop-{profile_id}")))
                                 .danger()
@@ -886,8 +886,7 @@ fn render_profile_row(
                             Button::new(SharedString::from(format!("row-launch-{profile_id}")))
                                 .with_variant(BonTheme::launch_cta(cx))
                                 .small()
-                                .disabled(is_starting)
-                                .label(if is_starting { "Wait..." } else { "Start" })
+                                .label("Start")
                                 .on_click(cx.listener(move |app, _, window, cx| {
                                     app.select_profile(&pid_launch, window, cx);
                                     app.launch_profile(&pid_launch, cx);
