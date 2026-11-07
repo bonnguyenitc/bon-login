@@ -982,7 +982,7 @@ impl BonLoginApp {
         let Some(mut p) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
             return;
         };
-        p.seed = rand::random::<u32>().max(1000);
+        p.seed = crate::models::Profile::random_seed();
         p.os_version = p.os_platform.os_version_for_seed(p.seed).to_string();
         p.brand_version = p.brand.version_for_seed(p.seed).to_string();
         p.hardware_concurrency = p.os_platform.optimal_cores_for_seed(p.seed);
@@ -1786,7 +1786,7 @@ impl BonLoginApp {
 
         if let Ok(db) = self.db.lock() {
             for (idx, mut prof) in targets.into_iter().enumerate() {
-                prof.seed = rand::random::<u32>().max(1000);
+                prof.seed = crate::models::Profile::random_seed();
                 prof.os_platform = target_os;
                 prof.os_version = target_os.os_version_for_seed(prof.seed).to_string();
                 prof.brand = target_brand;

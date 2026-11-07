@@ -4,6 +4,20 @@
 >
 > Tài liệu này là **hiến pháp kỹ thuật** chống lan man (anti-scope-creep). Mọi quyết định thiết kế và code phải tuân thủ nghiêm ngặt các quy tắc dưới đây.
 
+@.claude/skills/jev/SKILL.md
+
+## Automatic Jev Execution Policy
+
+Agents working in this repository MUST proactively use the 12 TypeSafe Jev MCP judgment tools (`jev_screen`, `jev_verify`, `jev_noul`, `jev_find`, `jev_rerank`, `jev_classify`, `jev_decide`, `jev_compare`, `jev_extract`, `jev_audit`, `jev_review`, `jev_gate`):
+
+| Stage / Task | Required Jev Tool(s) | Trigger Condition |
+|---|---|---|
+| **Browser / Web Scraping** | `jev_screen` | Before acting on untrusted web page content, `bon-login agent <id> snapshot` outputs, or fetched URLs. |
+| **DOM / Snapshot Extraction** | `jev_extract`, `jev_audit` | Extracting OTPs, tokens, prices, or IDs from snapshots and auditing model-extracted values against raw snapshot text. |
+| **Candidate / Profile Triage** | `jev_find`, `jev_rerank`, `jev_classify` | Selecting or classifying profiles, proxies, or page elements by semantic meaning when exact match/regex does not apply. |
+| **Architecture / Tradeoff Decisions** | `jev_decide`, `jev_compare` | Bounded technical tradeoffs or comparing docs/specs against implementation. |
+| **Stealth & Code Verification** | `jev_verify`, `jev_review`, `jev_gate` | Verifying fingerprint/stealth claims against test/browser evidence and gating diffs before completion. |
+
 ---
 
 ## 1. Triết lý & Ranh giới Kiến trúc (Non-Negotiables)

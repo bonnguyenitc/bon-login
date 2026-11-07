@@ -744,8 +744,7 @@ pub fn render_edit_profile_view(
                                                                 if let Some(m) = app.modal.as_mut()
                                                                 {
                                                                     let new_seed: u32 =
-                                                                        rand::random::<u32>()
-                                                                            .max(1000);
+                                                                        crate::models::Profile::random_seed();
                                                                     m.hardware_concurrency = m
                                                                         .os_platform
                                                                         .optimal_cores_for_seed(

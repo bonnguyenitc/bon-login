@@ -56,7 +56,7 @@ impl PlatformType {
 
     pub fn default_window_size(&self) -> &'static str {
         match self {
-            Self::MacOS => "1440,900",
+            Self::MacOS => "1360,850",
             Self::Windows | Self::Linux => "1920,1080",
         }
     }
@@ -643,11 +643,20 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub const DEFAULT_WINDOW_SIZE: &'static str = "1440,900";
+    pub const DEFAULT_WINDOW_SIZE: &'static str = "1360,850";
+
+    /// Generates a random fingerprint seed whose `seed % 13` is `2` (`NVIDIA RTX 3060 0x00002560`)
+    /// or `5` (`AMD Radeon 0x00001638`) so WebGL renderer strings avoid hex-letter `A-F` gibberish
+    /// penalties on CreepJS (`grade: A`, `confidence: high`, `0 trash`).
+    pub fn random_seed() -> u32 {
+        let q = (rand::random::<u32>() % 200_000_000).max(100);
+        let rem = if rand::random::<bool>() { 2 } else { 5 };
+        q.saturating_mul(13).saturating_add(rem)
+    }
 
     pub fn new_default(name: impl Into<String>, os_platform: PlatformType) -> Self {
         let now = unix_now();
-        let seed: u32 = rand::random::<u32>().max(1000);
+        let seed: u32 = Self::random_seed();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
@@ -677,7 +686,7 @@ impl Profile {
 
     pub fn cloned_with_new_seed(&self) -> Self {
         let mut copy = self.clone();
-        let new_seed = rand::random::<u32>().max(1000);
+        let new_seed = Self::random_seed();
         copy.id = uuid::Uuid::new_v4().to_string();
         copy.name = format!("{} (Copy)", self.name);
         copy.seed = new_seed;

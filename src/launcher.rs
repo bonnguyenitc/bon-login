@@ -1550,6 +1550,31 @@ pub fn save_prelaunch_cookies(short_id: &str, raw: &str) -> Result<()> {
 }
 
 /// Builds the exact `adryfish/fingerprint-chromium` + Patchright Stealth + WebRTC + DNS leak prevention flags.
+/// Maps a BCP-47 locale to the exact `.lproj` ICU locale bundled inside macOS `Chromium.app/Contents/Resources/`
+/// so `navigator.language`, `Intl.DateTimeFormat().resolvedOptions().locale`, and `(1).toLocaleString(undefined)`
+/// match on CreepJS (`localeEntropyIsTrusty == true` and `localeIntlEntropyIsTrusty == true`).
+pub fn chromium_icu_locale(locale: &str) -> String {
+    let trimmed = locale.trim().replace('_', "-");
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "en" | "en-us" => "en-US".to_string(),
+        "en-gb" | "en-uk" => "en-GB".to_string(),
+        "zh-cn" | "zh-hans" | "zh" => "zh-CN".to_string(),
+        "zh-tw" | "zh-hant" => "zh-TW".to_string(),
+        "zh-hk" => "zh-HK".to_string(),
+        "pt-br" => "pt-BR".to_string(),
+        "pt-pt" | "pt" => "pt-PT".to_string(),
+        "es-419" => "es-419".to_string(),
+        "fr-ca" => "fr-CA".to_string(),
+        "sr-latn" => "sr-Latn".to_string(),
+        _ => trimmed
+            .split('-')
+            .next()
+            .unwrap_or("en-US")
+            .to_ascii_lowercase(),
+    }
+}
+
 pub fn build_chromium_args(
     profile: &Profile,
     local_proxy_port: Option<u16>,
@@ -1569,8 +1594,9 @@ pub fn build_chromium_args(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| geo.map(|g| g.locale.as_str()).filter(|s| !s.is_empty()))
         .unwrap_or("en-US");
+    let icu_locale = chromium_icu_locale(locale);
 
-    let accept_lang = if let Some(custom_loc) = profile
+    let raw_accept_lang = if let Some(custom_loc) = profile
         .custom_locale
         .as_deref()
         .filter(|s| !s.trim().is_empty())
@@ -1581,6 +1607,16 @@ pub fn build_chromium_args(
             .filter(|s| !s.is_empty())
             .unwrap_or("en-US,en;q=0.9")
             .to_string()
+    };
+    let first_accept = raw_accept_lang
+        .split([',', ';'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let accept_lang = if first_accept.eq_ignore_ascii_case(&icu_locale) {
+        raw_accept_lang
+    } else {
+        format!("{icu_locale},{raw_accept_lang}")
     };
 
     // Note: Do not pass `--fingerprint-brand-version` or `--fingerprint-platform-version` so
@@ -1598,10 +1634,11 @@ pub fn build_chromium_args(
             "--fingerprint-hardware-concurrency={}",
             profile.hardware_concurrency
         ),
-        format!("--lang={locale}"),
+        format!("--lang={icu_locale}"),
         format!("--accept-lang={accept_lang}"),
+        "-AppleLanguages".to_string(),
+        format!("({locale})"),
     ];
-
     if let Some(tz) = timezone_opt {
         args.push(format!("--timezone={tz}"));
     }
@@ -1992,15 +2029,19 @@ fn cdp_http_get_body(cdp_port: u16, path: &str) -> Option<String> {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 
+    // shortcut: 1 MiB cap covers 1500+ open CDP targets without unbounded allocation
+    const MAX_CDP_HTTP_BYTES: usize = 1_048_576;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cdp_port);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{cdp_port}\r\n\r\n");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{cdp_port}\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).ok()?;
 
-    let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0u8; 2048];
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
     let header_end = loop {
         let n = stream.read(&mut chunk).ok()?;
         if n == 0 {
@@ -2021,17 +2062,22 @@ fn cdp_http_get_body(cdp_port: u16, path: &str) -> Option<String> {
             .eq_ignore_ascii_case("content-length")
             .then(|| v.trim().parse::<usize>().ok())
             .flatten()
-    })?;
-    while buf.len() < header_end + content_len {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            break;
+    });
+    let target_end = content_len
+        .map(|len| header_end.saturating_add(len).min(MAX_CDP_HTTP_BYTES))
+        .unwrap_or(MAX_CDP_HTTP_BYTES);
+    while buf.len() < target_end {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
-        buf.extend_from_slice(&chunk[..n]);
     }
-    std::str::from_utf8(buf.get(header_end..header_end + content_len)?)
-        .ok()
-        .map(ToString::to_string)
+    let body_slice = if let Some(len) = content_len {
+        buf.get(header_end..header_end.saturating_add(len))?
+    } else {
+        buf.get(header_end..)?
+    };
+    std::str::from_utf8(body_slice).ok().map(ToString::to_string)
 }
 
 fn extract_port_from_ws_url(ws_url: &str) -> Option<u16> {
@@ -2097,6 +2143,29 @@ fn sync_extension_targets_to_agent_browser(session: &str, cdp_port: u16) -> usiz
         }
     }
     attached
+}
+
+/// Returns true when an `agent-browser` command failed due to an unattached/stale CDP session
+/// rather than a page-level selector or script error.
+pub fn should_reconnect_agent_session(stderr: &[u8], stdout: &[u8]) -> bool {
+    let combined = format!(
+        "{} {}",
+        String::from_utf8_lossy(stderr).to_ascii_lowercase(),
+        String::from_utf8_lossy(stdout).to_ascii_lowercase()
+    );
+    [
+        "not connected",
+        "no browser",
+        "browser closed",
+        "target closed",
+        "connection closed",
+        "websocket",
+        "econnrefused",
+        "connect first",
+        "no active",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
 }
 
 pub fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<String> {
@@ -2186,6 +2255,18 @@ pub fn agent_sync_targets(short_id: &str, ws_url: &str) -> Result<serde_json::Va
 
 /// Blocks `agent-browser` commands/flags that invoke CDP `Emulation.*` or override BonLogin's C++ stealth fingerprint.
 pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
+    for raw in args {
+        let lower_raw = raw.to_ascii_lowercase();
+        if lower_raw.contains("object.defineproperty(navigator")
+            || lower_raw.contains("navigator.__definegetter__")
+            || lower_raw.contains("object.setprototypeof(navigator")
+        {
+            bail!(
+                "Blocked by BonLogin Stealth Guardrail: JS prototype mutation on `navigator` triggers anti-bot detection on BrowserScan/CreepJS. BonLogin already spoofs `navigator` at the C++ Blink layer."
+            );
+        }
+    }
+
     let flat_tokens: Vec<String> = args
         .iter()
         .flat_map(|a| a.split_whitespace())
@@ -2205,6 +2286,9 @@ pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
             "--executable-path",
             "--profile",
             "--engine",
+            "--headers",
+            "--device",
+            "--viewport",
         ] {
             if lower == forbidden_flag || lower.starts_with(&format!("{forbidden_flag}=")) {
                 bail!(
@@ -2504,7 +2588,7 @@ pub fn apply_profile_cli_flags(
             "--seed" => {
                 let raw = next_val()?.trim();
                 let new_seed: u32 = if raw.eq_ignore_ascii_case("random") {
-                    rand::random::<u32>().max(1000)
+                    Profile::random_seed()
                 } else {
                     raw.parse().context("Invalid --seed integer")?
                 };
@@ -2683,9 +2767,7 @@ pub fn ensure_profile_launched_via_supervisor(
     db: &crate::db::Database,
     profile: &Profile,
 ) -> Result<RuntimeInfo> {
-    let short_id = profile.short_id();
     if let Some(info) = probe_live_runtime(&profile.id) {
-        let _ = ensure_agent_browser_connected(&short_id, &info.ws_url);
         return Ok(info);
     }
 
@@ -2712,7 +2794,7 @@ pub fn ensure_profile_launched_via_supervisor(
             && info.pid > 0
         {
             let _ = db.touch_last_launched(&profile.id);
-            let _ = ensure_agent_browser_connected(&short_id, &info.ws_url);
+            let _ = ensure_agent_browser_connected(&profile.short_id(), &info.ws_url);
             return Ok(info);
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -2849,15 +2931,27 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 let profiles = db.list_profiles()?;
                 let profile = find_profile_by_query(&profiles, target)?.clone();
                 let short_id = profile.short_id();
-                let _info = ensure_profile_launched_via_supervisor(&db, &profile)?;
+                let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
                 let session = format!("bon_{short_id}");
-                let status = agent_browser_cmd_for_short_id(&short_id)
-                    .args(["--session", &session, "--input-mode", "human"])
-                    .args(rest)
-                    .status()
-                    .context("Failed to execute agent-browser")?;
-                if !status.success() {
-                    std::process::exit(status.code().unwrap_or(1));
+                let run_once = || {
+                    agent_browser_cmd_for_short_id(&short_id)
+                        .args(["--session", &session, "--input-mode", "human"])
+                        .args(rest)
+                        .output()
+                        .context("Failed to execute agent-browser")
+                };
+                let mut out = run_once()?;
+                if !out.status.success()
+                    && should_reconnect_agent_session(&out.stderr, &out.stdout)
+                {
+                    let _ = ensure_agent_browser_connected(&short_id, &info.ws_url);
+                    out = run_once()?;
+                }
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&out.stdout);
+                let _ = std::io::stderr().write_all(&out.stderr);
+                if !out.status.success() {
+                    std::process::exit(out.status.code().unwrap_or(1));
                 }
                 Ok(())
             }
@@ -3212,7 +3306,7 @@ fn run_profile_subcommand(
             let (mut targets, _) = select_profiles_by_target(&profiles, rest)?;
             let mut reseeded = Vec::new();
             for mut p in targets.drain(..) {
-                p.seed = rand::random::<u32>().max(1000);
+                p.seed = Profile::random_seed();
                 p.os_version = p.os_platform.os_version_for_seed(p.seed).to_string();
                 p.brand_version = p.brand.version_for_seed(p.seed).to_string();
                 p.hardware_concurrency = p.os_platform.optimal_cores_for_seed(p.seed);
@@ -4200,6 +4294,17 @@ mod tests {
         assert!(
             args.contains(&"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1".to_string())
         );
+        assert!(args.contains(&"--lang=vi".to_string()));
+        assert!(args.contains(&"--accept-lang=vi,vi-VN,vi,en-US;q=0.9,en;q=0.8".to_string()));
+        assert!(args.contains(&"-AppleLanguages".to_string()));
+        assert!(args.contains(&"(vi-VN)".to_string()));
+        assert_eq!(chromium_icu_locale("zh-CN"), "zh-CN");
+        assert_eq!(chromium_icu_locale("pt-BR"), "pt-BR");
+        assert_eq!(chromium_icu_locale("ja-JP"), "ja");
+        for _ in 0..20 {
+            let s = Profile::random_seed();
+            assert!(matches!(s % 13, 2 | 5));
+        }
     }
 
     #[test]
@@ -4236,13 +4341,11 @@ mod tests {
             if let Ok((mut s, _)) = listener.accept() {
                 let mut buf = [0u8; 512];
                 let _ = s.read(&mut buf);
-                let body = r#"[{"type":"service_worker"}]"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
+                // Response without Content-Length (closed at EOF) and >64KB payload
+                let pad = "x".repeat(70_000);
+                let body = format!(r#"[{{"type":"service_worker","pad":"{pad}"}}]"#);
+                let resp = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}");
                 let _ = s.write_all(resp.as_bytes());
-                keep_alive.push(s);
             }
             std::thread::sleep(Duration::from_secs(1));
         });
@@ -4453,7 +4556,29 @@ mod tests {
             ])
             .is_err()
         );
-
+        assert!(
+            validate_stealth_agent_args(&[
+                "eval".to_string(),
+                "Object.defineProperty(navigator, 'webdriver', {get: () => false})".to_string()
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_stealth_agent_args(&[
+                "--headers={\"X-Test\":\"1\"}".to_string(),
+                "open".to_string(),
+                "https://example.com".to_string()
+            ])
+            .is_err()
+        );
+        assert!(should_reconnect_agent_session(
+            b"Error: Browser not connected. Run connect first.",
+            b""
+        ));
+        assert!(!should_reconnect_agent_session(
+            b"Error: Element @e99 not found on page",
+            b""
+        ));
         let info = RuntimeInfo {
             pid: 1234,
             cdp_port: 55111,
