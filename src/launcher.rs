@@ -2175,7 +2175,7 @@ pub fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<St
             "--session",
             &session,
             "--input-mode",
-            "human",
+            "instant",
             "connect",
             ws_url,
         ])
@@ -2793,8 +2793,10 @@ pub fn ensure_profile_launched_via_supervisor(
         if let Some(info) = probe_live_runtime(&profile.id)
             && info.pid > 0
         {
+            let sid = profile.short_id();
+            clear_flow_session_cache(&sid);
             let _ = db.touch_last_launched(&profile.id);
-            let _ = ensure_agent_browser_connected(&profile.short_id(), &info.ws_url);
+            let _ = ensure_agent_browser_connected(&sid, &info.ws_url);
             return Ok(info);
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -2828,7 +2830,15 @@ fn print_cli_help() {
            bon-login launch <id|name|--group <g>|--all> [--pin-tab <t>] [--url <u>] Launch profile(s) & connect agent-browser\n  \
            bon-login stop <id|name|--group <g>|--all>                    Stop running profile(s) & flush cookies\n  \
            bon-login sync <id|name>                                      Sync OAuth popups & extension windows into tabs\n  \
-           bon-login agent <id|name> <agent-browser args...>             Run agent-browser with Stealth Guardrails\n\n\
+           bon-login agent <id|name> [--record <flow>] <ab args...>      Run agent-browser (auto-records DOM steps)\n\n\
+         AGENT FLOW PLAYBOOKS (`bon-login flow ...`):\n  \
+           bon-login flow list                                           List saved DOM flows & required {{vars}}\n  \
+           bon-login flow show <flow_name>                               Show steps & locators of a saved flow\n  \
+           bon-login flow save <flow_name> <id|name> [--var k=literal]   Save profile's recent agent steps as reusable flow\n  \
+           bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v] [--from-step <n>]\n  \
+           bon-login flow heal <flow_name> <step_idx> <id|name> <ab args...>  Self-heal broken step & update flow\n  \
+           bon-login flow history <id|name> [--clear]                    Inspect or clear auto-recorded profile steps\n  \
+           bon-login flow delete <flow_name>                             Delete a saved flow\n\n\
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
            bon-login profile list [--group <g>] [--search <q>]\n  \
            bon-login profile show <id|name>\n  \
@@ -2918,43 +2928,8 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 println!("{}", serde_json::to_string_pretty(&res)?);
                 Ok(())
             }
-            "agent" | "ab" => {
-                let target = args.get(1).ok_or_else(|| {
-                    anyhow!("Usage: bon-login agent <short_id|name> <agent-browser args...>")
-                })?;
-                let rest = &args[2..];
-                if rest.is_empty() {
-                    bail!("Usage: bon-login agent <short_id|name> <agent-browser args...>");
-                }
-                validate_stealth_agent_args(rest)?;
-                let db = crate::db::Database::open_default()?;
-                let profiles = db.list_profiles()?;
-                let profile = find_profile_by_query(&profiles, target)?.clone();
-                let short_id = profile.short_id();
-                let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
-                let session = format!("bon_{short_id}");
-                let run_once = || {
-                    agent_browser_cmd_for_short_id(&short_id)
-                        .args(["--session", &session, "--input-mode", "human"])
-                        .args(rest)
-                        .output()
-                        .context("Failed to execute agent-browser")
-                };
-                let mut out = run_once()?;
-                if !out.status.success()
-                    && should_reconnect_agent_session(&out.stderr, &out.stdout)
-                {
-                    let _ = ensure_agent_browser_connected(&short_id, &info.ws_url);
-                    out = run_once()?;
-                }
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(&out.stdout);
-                let _ = std::io::stderr().write_all(&out.stderr);
-                if !out.status.success() {
-                    std::process::exit(out.status.code().unwrap_or(1));
-                }
-                Ok(())
-            }
+            "agent" | "ab" => run_agent_cli(&args[1..]),
+            "flow" | "flows" => run_flow_subcommand(&args[1..]),
             "profile" | "profiles" => run_profile_subcommand(tokio_handle, &args[1..]),
             "proxy" | "proxies" => run_proxy_subcommand(tokio_handle, &args[1..]),
             "group" | "groups" => run_group_subcommand(&args[1..]),
@@ -4229,6 +4204,1596 @@ fn run_kernel_subcommand(args: &[String]) -> Result<()> {
         other => bail!("Unknown kernel subcommand '{other}' (expected status or install)"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Agent Flow Playbooks (Record @eN -> Stable Locators, Replay & Self-Heal)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub struct SnapshotRefMeta {
+    pub role: String,
+    pub name: String,
+    pub unique: bool,
+    #[serde(default)]
+    pub role_index: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefDomAttrs {
+    pub data_testid: String,
+    pub id: String,
+    pub name: String,
+    pub placeholder: String,
+    pub aria_label: String,
+    pub href: String,
+    pub input_type: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FlowStep {
+    pub op: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locators: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct AgentFlow {
+    pub name: String,
+    #[serde(default)]
+    pub domain: String,
+    pub updated_at: i64,
+    pub steps: Vec<FlowStep>,
+}
+
+pub fn flows_dir() -> PathBuf {
+    let dir = app_support_dir().join("flows");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn sanitize_flow_name(raw: &str) -> Result<String> {
+    let clean: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim_matches('_').to_string();
+    if clean.is_empty() {
+        bail!("Invalid flow name '{raw}'");
+    }
+    Ok(clean)
+}
+
+fn flow_file_path(name: &str) -> Result<PathBuf> {
+    let clean = sanitize_flow_name(name)?;
+    Ok(flows_dir().join(format!("{clean}.json")))
+}
+
+fn snap_cache_path(short_id: &str) -> PathBuf {
+    flows_dir().join(format!("_snap_{short_id}.json"))
+}
+
+fn history_flow_path(short_id: &str) -> PathBuf {
+    flows_dir().join(format!("_history_{short_id}.json"))
+}
+
+fn clear_flow_session_cache(short_id: &str) {
+    let _ = std::fs::remove_file(snap_cache_path(short_id));
+    let _ = std::fs::remove_file(history_flow_path(short_id));
+}
+
+fn load_snap_cache(short_id: &str) -> std::collections::HashMap<String, SnapshotRefMeta> {
+    std::fs::read_to_string(snap_cache_path(short_id))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_snap_cache(
+    short_id: &str,
+    map: &std::collections::HashMap<String, SnapshotRefMeta>,
+) {
+    if let Ok(json) = serde_json::to_string(map) {
+        let _ = std::fs::write(snap_cache_path(short_id), json);
+    }
+}
+
+pub fn parse_snapshot_refs(
+    stdout: &str,
+) -> std::collections::HashMap<String, SnapshotRefMeta> {
+    let mut raw_entries: Vec<(String, String, String)> = Vec::new();
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout)
+        && let Some(refs_obj) = val
+            .get("data")
+            .and_then(|d| d.get("refs"))
+            .and_then(|r| r.as_object())
+    {
+        for (k, v) in refs_obj {
+            let key = k.trim_start_matches('@').to_string();
+            let role = v
+                .get("role")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let name = v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            raw_entries.push((key, role, name));
+        }
+        raw_entries.sort_by_key(|(k, _, _)| k.trim_start_matches('e').parse::<u32>().unwrap_or(0));
+    }
+    if raw_entries.is_empty() {
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("- ") {
+                if let Some(ref_pos) = rest.find("ref=e") {
+                    let after_ref = &rest[ref_pos + 4..];
+                    let ref_key: String = after_ref
+                        .chars()
+                        .take_while(|c| *c == 'e' || c.is_ascii_digit())
+                        .collect();
+                    if ref_key.len() > 1 {
+                        let before_bracket = rest[..ref_pos]
+                            .rfind('[')
+                            .map(|idx| rest[..idx].trim())
+                            .unwrap_or(rest);
+                        let role = before_bracket
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = if let Some(q1) = before_bracket.find('"')
+                            && let Some(q2) = before_bracket.rfind('"')
+                            && q2 > q1
+                        {
+                            before_bracket[q1 + 1..q2].replace("\\\"", "\"")
+                        } else {
+                            String::new()
+                        };
+                        raw_entries.push((ref_key, role, name));
+                    }
+                }
+            } else if let Some(after_at) = trimmed.strip_prefix('@') {
+                let ref_key: String = after_at
+                    .chars()
+                    .take_while(|c| *c == 'e' || c.is_ascii_digit())
+                    .collect();
+                if ref_key.starts_with('e')
+                    && ref_key.len() > 1
+                    && let Some(b1) = trimmed.find('[')
+                    && let Some(b2) = trimmed[b1 + 1..].find(']')
+                {
+                    let bracket_inner = &trimmed[b1 + 1..b1 + 1 + b2];
+                    let role = bracket_inner
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let after_bracket = &trimmed[b1 + 1 + b2 + 1..];
+                    let name = if let Some(q1) = after_bracket.find('"')
+                        && let Some(q2) = after_bracket[q1 + 1..].find('"')
+                    {
+                        after_bracket[q1 + 1..q1 + 1 + q2].to_string()
+                    } else {
+                        String::new()
+                    };
+                    raw_entries.push((ref_key, role, name));
+                }
+            }
+        }
+    }
+
+    let mut counts: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    for (_, role, name) in &raw_entries {
+        if !role.is_empty() && !name.is_empty() {
+            *counts.entry((role.clone(), name.clone())).or_insert(0) += 1;
+        }
+    }
+
+    let mut role_indices: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut map = std::collections::HashMap::new();
+    for (key, role, name) in raw_entries {
+        let unique = !role.is_empty()
+            && !name.is_empty()
+            && counts
+                .get(&(role.clone(), name.clone()))
+                .copied()
+                .unwrap_or(0)
+                == 1;
+        let role_counter = role_indices.entry(role.to_ascii_lowercase()).or_insert(0);
+        let role_index = *role_counter;
+        *role_counter += 1;
+        map.insert(
+            key,
+            SnapshotRefMeta {
+                role,
+                name,
+                unique,
+                role_index,
+            },
+        );
+    }
+    map
+}
+
+pub fn build_jev_find_payload(
+    step: &FlowStep,
+    snap_map: &std::collections::HashMap<String, SnapshotRefMeta>,
+) -> serde_json::Value {
+    let mut sorted: Vec<(&String, &SnapshotRefMeta)> = snap_map.iter().collect();
+    sorted.sort_by_key(|(k, _)| k.trim_start_matches('e').parse::<u32>().unwrap_or(0));
+    let candidates: Vec<serde_json::Value> = sorted
+        .into_iter()
+        .filter(|(_, m)| !matches!(m.role.as_str(), "heading" | "paragraph"))
+        .take(250)
+        .map(|(k, m)| {
+            let label = if m.name.is_empty() {
+                format!("[@{k}] {}", m.role)
+            } else {
+                let short_name: String = m.name.chars().take(300).collect();
+                format!("[@{k}] {} · {short_name}", m.role)
+            };
+            serde_json::json!({
+                "id": format!("@{k}"),
+                "text": label,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "query": format!(
+            "Interactive control for '{}' operation matching prior locators: {}",
+            step.op,
+            step.locators.join(", ")
+        ),
+        "candidates": candidates,
+        "top_k": 3,
+    })
+}
+
+pub fn split_shell_words(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match in_quote {
+            Some(q) if c == q => in_quote = None,
+            Some('"') if c == '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => in_quote = Some(c),
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+fn is_ref_token(s: &str) -> bool {
+    let rest = s.strip_prefix("@e").unwrap_or("");
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+fn css_attr_escape(val: &str) -> String {
+    val.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+pub fn build_stable_locators(
+    ref_token: &str,
+    snap: Option<&SnapshotRefMeta>,
+    attrs: &RefDomAttrs,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    fn push_unique(out: &mut Vec<String>, loc: String) {
+        if !loc.is_empty() && !out.contains(&loc) {
+            out.push(loc);
+        }
+    }
+
+    if !attrs.data_testid.is_empty() {
+        push_unique(
+            &mut out,
+            format!("[data-testid=\"{}\"]", css_attr_escape(&attrs.data_testid)),
+        );
+    }
+    if !attrs.id.is_empty()
+        && !attrs.id.contains(':')
+        && !attrs.id.contains(' ')
+        && !attrs.id.chars().all(|c| c.is_ascii_digit())
+    {
+        push_unique(
+            &mut out,
+            format!("[id=\"{}\"]", css_attr_escape(&attrs.id)),
+        );
+    }
+    if !attrs.name.is_empty() {
+        push_unique(
+            &mut out,
+            format!("[name=\"{}\"]", css_attr_escape(&attrs.name)),
+        );
+    }
+    if let Some(s) = snap
+        && !s.role.is_empty()
+        && !s.name.is_empty()
+        && s.unique
+    {
+        push_unique(&mut out, format!("role:{}:{}", s.role, s.name));
+    }
+    if !attrs.placeholder.is_empty() {
+        push_unique(
+            &mut out,
+            format!("[placeholder=\"{}\"]", css_attr_escape(&attrs.placeholder)),
+        );
+    }
+    if !attrs.aria_label.is_empty() {
+        push_unique(
+            &mut out,
+            format!("[aria-label=\"{}\"]", css_attr_escape(&attrs.aria_label)),
+        );
+    }
+    if let Some(s) = snap
+        && !s.role.is_empty()
+        && !s.name.is_empty()
+    {
+        push_unique(&mut out, format!("role:{}:{}", s.role, s.name));
+    }
+    if !attrs.href.is_empty()
+        && !attrs.href.starts_with('#')
+        && !attrs.href.starts_with("javascript:")
+    {
+        push_unique(
+            &mut out,
+            format!("a[href=\"{}\"]", css_attr_escape(&attrs.href)),
+        );
+    }
+    if matches!(
+        attrs.input_type.as_str(),
+        "email" | "password" | "search" | "tel" | "url" | "submit" | "checkbox" | "radio" | "file"
+    ) {
+        push_unique(
+            &mut out,
+            format!("input[type=\"{}\"]", css_attr_escape(&attrs.input_type)),
+        );
+    }
+    if out.is_empty()
+        && let Some(s) = snap
+        && !s.role.is_empty()
+    {
+        push_unique(&mut out, format!("role:{}:", s.role));
+    }
+    if out.is_empty() {
+        push_unique(&mut out, ref_token.to_string());
+    }
+    out
+}
+
+pub fn match_ref_dom_attrs_from_nodes(
+    refs: &[String],
+    snap_map: &std::collections::HashMap<String, SnapshotRefMeta>,
+    nodes: &[serde_json::Value],
+) -> std::collections::HashMap<String, RefDomAttrs> {
+    let mut map = std::collections::HashMap::new();
+    for r in refs {
+        let key = r.trim_start_matches('@');
+        let Some(snap) = snap_map.get(key) else {
+            continue;
+        };
+        let matched = if !snap.name.is_empty() {
+            nodes
+                .iter()
+                .find(|n| {
+                    let nr = n.get("role").and_then(|v| v.as_str()).unwrap_or_default();
+                    let na = n
+                        .get("accName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    nr.eq_ignore_ascii_case(&snap.role) && na.eq_ignore_ascii_case(&snap.name)
+                })
+                .or_else(|| {
+                    nodes.iter().find(|n| {
+                        n.get("accName")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|na| na.eq_ignore_ascii_case(&snap.name))
+                    })
+                })
+        } else {
+            None
+        }
+        .or_else(|| {
+            nodes
+                .iter()
+                .filter(|n| {
+                    n.get("role")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|nr| nr.eq_ignore_ascii_case(&snap.role))
+                })
+                .nth(snap.role_index)
+        });
+        if let Some(node) = matched {
+            let get_s = |field: &str| -> String {
+                node.get(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            map.insert(
+                r.clone(),
+                RefDomAttrs {
+                    data_testid: get_s("testid"),
+                    id: get_s("id"),
+                    name: get_s("name"),
+                    placeholder: get_s("placeholder"),
+                    aria_label: get_s("ariaLabel"),
+                    href: get_s("href"),
+                    input_type: get_s("type"),
+                },
+            );
+        }
+    }
+    map
+}
+
+fn fetch_refs_dom_attrs(
+    short_id: &str,
+    session: &str,
+    refs: &[String],
+    snap_map: &std::collections::HashMap<String, SnapshotRefMeta>,
+) -> std::collections::HashMap<String, RefDomAttrs> {
+    if refs.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let js = r#"JSON.stringify(Array.from(document.querySelectorAll('input,button,a,select,textarea,[role],[data-testid]')).slice(0, 300).map(el => ({
+        role: (el.getAttribute('role') || (el.tagName==='BUTTON'||(el.tagName==='INPUT'&&/^(submit|button|reset)$/i.test(el.type))?'button':el.tagName==='A'?'link':el.tagName==='SELECT'?'combobox':el.tagName==='INPUT'&&el.type==='checkbox'?'checkbox':el.tagName==='INPUT'&&el.type==='radio'?'radio':(el.tagName==='INPUT'||el.tagName==='TEXTAREA')?'textbox':'')).toLowerCase(),
+        accName: (el.getAttribute('aria-label') || (el.labels && el.labels[0] ? el.labels[0].innerText : '') || el.getAttribute('placeholder') || el.getAttribute('title') || el.innerText || el.value || '').trim(),
+        testid: el.getAttribute('data-testid') || '',
+        id: el.id || '',
+        name: el.getAttribute('name') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        ariaLabel: el.getAttribute('aria-label') || '',
+        href: el.getAttribute('href') || '',
+        type: el.getAttribute('type') || ''
+    })))"#;
+    let Ok(out) = agent_browser_cmd_for_short_id(short_id)
+        .args(["--session", session, "eval", js])
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    if !out.status.success() {
+        return std::collections::HashMap::new();
+    }
+    let raw_out = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let json_str = serde_json::from_str::<String>(&raw_out).unwrap_or(raw_out);
+    let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) else {
+        return std::collections::HashMap::new();
+    };
+    match_ref_dom_attrs_from_nodes(refs, snap_map, &nodes)
+}
+
+fn strip_leading_agent_flags(tokens: &[String]) -> &[String] {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        match tokens[idx].as_str() {
+            "--json" | "--bail" | "--omit-command" | "--headed" | "--full" | "-i" | "-c"
+            | "--interactive" | "--compact" => idx += 1,
+            _ => break,
+        }
+    }
+    &tokens[idx..]
+}
+
+fn unpack_agent_commands(ab_args: &[String]) -> Vec<Vec<String>> {
+    let trimmed = strip_leading_agent_flags(ab_args);
+    if trimmed.first().is_some_and(|c| c == "batch") {
+        let mut sub_cmds = Vec::new();
+        for arg in &trimmed[1..] {
+            if arg.starts_with('-') {
+                continue;
+            }
+            let words = split_shell_words(arg);
+            if !words.is_empty() {
+                sub_cmds.push(words);
+            }
+        }
+        sub_cmds
+    } else if !trimmed.is_empty() {
+        vec![trimmed.to_vec()]
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn build_flow_step_from_cmd(
+    raw_tokens: &[String],
+    snap_map: &std::collections::HashMap<String, SnapshotRefMeta>,
+    dom_attrs: &std::collections::HashMap<String, RefDomAttrs>,
+) -> Option<FlowStep> {
+    let tokens = strip_leading_agent_flags(raw_tokens);
+    let cmd = tokens.first()?.as_str();
+    let resolve_target = |target: &str| -> Vec<String> {
+        if is_ref_token(target) {
+            let key = target.trim_start_matches('@');
+            let snap = snap_map.get(key);
+            let attrs = dom_attrs.get(target).cloned().unwrap_or_default();
+            build_stable_locators(target, snap, &attrs)
+        } else {
+            vec![target.to_string()]
+        }
+    };
+
+    match cmd {
+        "open" | "goto" | "navigate" => {
+            let url = tokens.iter().skip(1).find(|s| !s.starts_with('-'))?.clone();
+            Some(FlowStep {
+                op: "open".to_string(),
+                locators: Vec::new(),
+                value: Some(url),
+                extra_args: Vec::new(),
+                optional: false,
+            })
+        }
+        "click" | "dblclick" | "hover" | "focus" | "check" | "uncheck" | "scrollintoview"
+        | "scrollinto" => {
+            let target = tokens.get(1)?;
+            let op = if cmd == "scrollinto" {
+                "scrollintoview"
+            } else {
+                cmd
+            };
+            Some(FlowStep {
+                op: op.to_string(),
+                locators: resolve_target(target),
+                value: None,
+                extra_args: tokens[2..].to_vec(),
+                optional: false,
+            })
+        }
+        "fill" | "type" | "select" | "upload" => {
+            let target = tokens.get(1)?;
+            let val = tokens.get(2)?.clone();
+            Some(FlowStep {
+                op: cmd.to_string(),
+                locators: resolve_target(target),
+                value: Some(val),
+                extra_args: tokens[3..].to_vec(),
+                optional: false,
+            })
+        }
+        "press" | "key" => {
+            let key = tokens.get(1)?.clone();
+            Some(FlowStep {
+                op: "press".to_string(),
+                locators: Vec::new(),
+                value: Some(key),
+                extra_args: Vec::new(),
+                optional: false,
+            })
+        }
+        "scroll" => {
+            let dir = tokens.get(1)?.clone();
+            Some(FlowStep {
+                op: "scroll".to_string(),
+                locators: Vec::new(),
+                value: Some(dir),
+                extra_args: tokens[2..].to_vec(),
+                optional: false,
+            })
+        }
+        "wait" => {
+            let first_arg = tokens.get(1)?;
+            if is_ref_token(first_arg) {
+                Some(FlowStep {
+                    op: "wait".to_string(),
+                    locators: resolve_target(first_arg),
+                    value: None,
+                    extra_args: tokens[2..].to_vec(),
+                    optional: false,
+                })
+            } else {
+                Some(FlowStep {
+                    op: "wait".to_string(),
+                    locators: Vec::new(),
+                    value: None,
+                    extra_args: tokens[1..].to_vec(),
+                    optional: false,
+                })
+            }
+        }
+        "find" => {
+            let kind = tokens.get(1)?.as_str();
+            match kind {
+                "role" => {
+                    let role = tokens.get(2)?;
+                    let action = tokens.get(3).map(String::as_str).unwrap_or("click");
+                    let mut name = String::new();
+                    let mut value: Option<String> = None;
+                    let mut idx = 4;
+                    while idx < tokens.len() {
+                        match tokens[idx].as_str() {
+                            "--name" => {
+                                name = tokens.get(idx + 1).cloned().unwrap_or_default();
+                                idx += 2;
+                            }
+                            "--exact" => idx += 1,
+                            other if !other.starts_with('-') => {
+                                value = Some(other.to_string());
+                                idx += 1;
+                            }
+                            _ => idx += 1,
+                        }
+                    }
+                    Some(FlowStep {
+                        op: action.to_string(),
+                        locators: vec![format!("role:{role}:{name}")],
+                        value,
+                        extra_args: Vec::new(),
+                        optional: false,
+                    })
+                }
+                "text" | "label" | "placeholder" | "testid" => {
+                    let target_val = tokens.get(2)?;
+                    let action = tokens.get(3).map(String::as_str).unwrap_or("click");
+                    let value = tokens
+                        .iter()
+                        .skip(4)
+                        .find(|s| !s.starts_with('-'))
+                        .cloned();
+                    let loc = match kind {
+                        "text" => format!("text:{target_val}"),
+                        "label" => format!("label:{target_val}"),
+                        "placeholder" => {
+                            format!("[placeholder=\"{}\"]", css_attr_escape(target_val))
+                        }
+                        "testid" => format!("[data-testid=\"{}\"]", css_attr_escape(target_val)),
+                        _ => unreachable!(),
+                    };
+                    Some(FlowStep {
+                        op: action.to_string(),
+                        locators: vec![loc],
+                        value,
+                        extra_args: Vec::new(),
+                        optional: false,
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn prepare_recorded_steps(
+    short_id: &str,
+    session: &str,
+    ab_args: &[String],
+) -> Vec<FlowStep> {
+    let cmds = unpack_agent_commands(ab_args);
+    if cmds.is_empty() {
+        return Vec::new();
+    }
+    let mut refs_to_query = Vec::new();
+    for c in &cmds {
+        for tok in c {
+            if is_ref_token(tok) && !refs_to_query.contains(tok) {
+                refs_to_query.push(tok.clone());
+            }
+        }
+    }
+    let snap_map = load_snap_cache(short_id);
+    let dom_attrs = if refs_to_query.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        fetch_refs_dom_attrs(short_id, session, &refs_to_query, &snap_map)
+    };
+    cmds.iter()
+        .filter_map(|c| build_flow_step_from_cmd(c, &snap_map, &dom_attrs))
+        .collect()
+}
+
+fn extract_domain_from_url(url: &str) -> String {
+    let without_proto = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    without_proto
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<AgentFlow>(&s).ok())
+        .unwrap_or_else(|| AgentFlow {
+            name: default_name.to_string(),
+            domain: String::new(),
+            updated_at: unix_now_secs(),
+            steps: Vec::new(),
+        })
+}
+
+fn save_flow_to_path(path: &Path, flow: &mut AgentFlow) -> Result<()> {
+    flow.updated_at = unix_now_secs();
+    if flow.domain.is_empty() {
+        if let Some(first_url) = flow
+            .steps
+            .iter()
+            .find(|s| s.op == "open")
+            .and_then(|s| s.value.as_deref())
+        {
+            flow.domain = extract_domain_from_url(first_url);
+        }
+    }
+    let json = serde_json::to_string_pretty(flow)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+fn append_steps_to_flow_path(path: &Path, name: &str, new_steps: &[FlowStep]) {
+    if new_steps.is_empty() {
+        return;
+    }
+    let mut flow = load_flow_from_path(path, name);
+    for step in new_steps {
+        if flow.steps.last() != Some(step) {
+            flow.steps.push(step.clone());
+        }
+    }
+    let _ = save_flow_to_path(path, &mut flow);
+}
+
+pub fn extract_flow_vars(flow: &AgentFlow) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut scan_str = |s: &str| {
+        let mut rest = s;
+        while let Some(start) = rest.find("{{") {
+            let after = &rest[start + 2..];
+            if let Some(end) = after.find("}}") {
+                let v = after[..end].trim();
+                if !v.is_empty() && !vars.iter().any(|x| x == v) {
+                    vars.push(v.to_string());
+                }
+                rest = &after[end + 2..];
+            } else {
+                break;
+            }
+        }
+    };
+    for step in &flow.steps {
+        if let Some(v) = &step.value {
+            scan_str(v);
+        }
+        for l in &step.locators {
+            scan_str(l);
+        }
+        for a in &step.extra_args {
+            scan_str(a);
+        }
+    }
+    vars
+}
+
+pub fn parameterize_flow_steps(
+    steps: &mut [FlowStep],
+    literal_to_var: &[(String, String)],
+) {
+    for (var_name, literal) in literal_to_var {
+        if literal.is_empty() {
+            continue;
+        }
+        let placeholder = format!("{{{{{var_name}}}}}");
+        for step in steps.iter_mut() {
+            if step.op == "open" {
+                continue;
+            }
+            if let Some(val) = &mut step.value {
+                *val = val.replace(literal, &placeholder);
+            }
+            for extra in &mut step.extra_args {
+                *extra = extra.replace(literal, &placeholder);
+            }
+        }
+    }
+}
+
+pub fn substitute_flow_vars(
+    input: &str,
+    vars: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut out = input.to_string();
+    for (k, v) in vars {
+        out = out.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    out
+}
+fn parse_var_flag(args: &[String], idx: usize) -> Option<((String, String), usize)> {
+    if args.get(idx)? == "--var" {
+        let (k, v) = args.get(idx + 1)?.split_once('=')?;
+        Some(((k.trim().to_string(), v.to_string()), 2))
+    } else if let Some(kv) = args.get(idx)?.strip_prefix("--var=") {
+        let (k, v) = kv.split_once('=')?;
+        Some(((k.trim().to_string(), v.to_string()), 1))
+    } else {
+        None
+    }
+}
+
+fn run_agent_browser_with_reconnect(
+    short_id: &str,
+    session: &str,
+    ws_url: &str,
+    args: &[String],
+) -> Result<std::process::Output> {
+    validate_stealth_agent_args(args)?;
+    let run_once = || {
+        agent_browser_cmd_for_short_id(short_id)
+            .args(["--session", session, "--input-mode", "instant"])
+            .args(args)
+            .output()
+            .context("Failed to execute agent-browser")
+    };
+    let mut out = run_once()?;
+    if !out.status.success() && should_reconnect_agent_session(&out.stderr, &out.stdout) {
+        let _ = ensure_agent_browser_connected(short_id, ws_url);
+        out = run_once()?;
+    }
+    Ok(out)
+}
+
+fn run_agent_cli(args: &[String]) -> Result<()> {
+    let mut inline_record_flow: Option<String> = None;
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == "--record" {
+            let flow_name = args
+                .get(idx + 1)
+                .ok_or_else(|| anyhow!("Missing flow name after --record"))?;
+            inline_record_flow = Some(sanitize_flow_name(flow_name)?);
+            idx += 2;
+        } else if let Some(flow_name) = args[idx].strip_prefix("--record=") {
+            inline_record_flow = Some(sanitize_flow_name(flow_name)?);
+            idx += 1;
+        } else {
+            filtered.push(args[idx].clone());
+            idx += 1;
+        }
+    }
+
+    let target = filtered.first().ok_or_else(|| {
+        anyhow!("Usage: bon-login agent <short_id|name> [--record <flow>] <agent-browser args...>")
+    })?;
+    let rest = &filtered[1..];
+    if rest.is_empty() {
+        bail!("Usage: bon-login agent <short_id|name> [--record <flow>] <agent-browser args...>");
+    }
+    validate_stealth_agent_args(rest)?;
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let profile = find_profile_by_query(&profiles, target)?.clone();
+    let short_id = profile.short_id();
+    let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
+    let session = format!("bon_{short_id}");
+
+    let prepared_steps = prepare_recorded_steps(&short_id, &session, rest);
+    let out = run_agent_browser_with_reconnect(&short_id, &session, &info.ws_url, rest)?;
+
+    if out.status.success() {
+        let has_snapshot = unpack_agent_commands(rest)
+            .iter()
+            .any(|c| c.first().is_some_and(|op| op == "snapshot"));
+        if has_snapshot {
+            let stdout_str = String::from_utf8_lossy(&out.stdout);
+            let parsed = parse_snapshot_refs(&stdout_str);
+            if !parsed.is_empty() {
+                save_snap_cache(&short_id, &parsed);
+            }
+        }
+        if !prepared_steps.is_empty() {
+            append_steps_to_flow_path(
+                &history_flow_path(&short_id),
+                &format!("history_{short_id}"),
+                &prepared_steps,
+            );
+            if let Some(flow_name) = inline_record_flow
+                && let Ok(fp) = flow_file_path(&flow_name)
+            {
+                append_steps_to_flow_path(&fp, &flow_name, &prepared_steps);
+            }
+        }
+    }
+
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(&out.stdout);
+    let _ = std::io::stderr().write_all(&out.stderr);
+    if !out.status.success() {
+        std::process::exit(out.status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+pub fn build_locator_candidate_commands(
+    op: &str,
+    locator: &str,
+    value: Option<&str>,
+    extra_args: &[String],
+) -> Vec<Vec<String>> {
+    if let Some(rest) = locator.strip_prefix("role:") {
+        let (role, name) = rest.split_once(':').unwrap_or((rest, ""));
+        let find_action = match op {
+            "click" | "fill" | "check" | "hover" => Some(op),
+            "type" => Some("fill"),
+            _ => None,
+        };
+        if let Some(act) = find_action {
+            let mut candidates = Vec::new();
+            if !name.is_empty() {
+                let mut exact_cmd = vec![
+                    "find".to_string(),
+                    "role".to_string(),
+                    role.to_string(),
+                    act.to_string(),
+                    "--name".to_string(),
+                    name.to_string(),
+                    "--exact".to_string(),
+                ];
+                if let Some(v) = value {
+                    exact_cmd.push(v.to_string());
+                }
+                candidates.push(exact_cmd);
+
+                let mut sub_cmd = vec![
+                    "find".to_string(),
+                    "role".to_string(),
+                    role.to_string(),
+                    act.to_string(),
+                    "--name".to_string(),
+                    name.to_string(),
+                ];
+                if let Some(v) = value {
+                    sub_cmd.push(v.to_string());
+                }
+                candidates.push(sub_cmd);
+            } else {
+                let mut role_only = vec![
+                    "find".to_string(),
+                    "role".to_string(),
+                    role.to_string(),
+                    act.to_string(),
+                ];
+                if let Some(v) = value {
+                    role_only.push(v.to_string());
+                }
+                candidates.push(role_only);
+            }
+            return candidates;
+        }
+        return Vec::new();
+    }
+
+    if let Some(text) = locator.strip_prefix("text:") {
+        let mut cmd = vec![
+            "find".to_string(),
+            "text".to_string(),
+            text.to_string(),
+            op.to_string(),
+        ];
+        if let Some(v) = value {
+            cmd.push(v.to_string());
+        }
+        return vec![cmd];
+    }
+
+    if let Some(label) = locator.strip_prefix("label:") {
+        let mut cmd = vec![
+            "find".to_string(),
+            "label".to_string(),
+            label.to_string(),
+            op.to_string(),
+        ];
+        if let Some(v) = value {
+            cmd.push(v.to_string());
+        }
+        return vec![cmd];
+    }
+
+    let mut cmd = vec![op.to_string(), locator.to_string()];
+    if let Some(v) = value {
+        cmd.push(v.to_string());
+    }
+    cmd.extend_from_slice(extra_args);
+    vec![cmd]
+}
+
+fn execute_single_flow_step(
+    short_id: &str,
+    session: &str,
+    ws_url: &str,
+    step: &FlowStep,
+    vars: &std::collections::HashMap<String, String>,
+) -> std::result::Result<(usize, String), String> {
+    let run_ab = |args: &[String]| -> std::result::Result<std::process::Output, String> {
+        let out = run_agent_browser_with_reconnect(short_id, session, ws_url, args)
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(out)
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let out_s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Err(if !err.is_empty() { err } else { out_s })
+        }
+    };
+
+    let sub_value = step.value.as_ref().map(|v| substitute_flow_vars(v, vars));
+    let sub_extra: Vec<String> = step
+        .extra_args
+        .iter()
+        .map(|a| substitute_flow_vars(a, vars))
+        .collect();
+
+    if step.locators.is_empty() {
+        let mut cmd = vec![step.op.clone()];
+        if let Some(v) = &sub_value {
+            cmd.push(v.clone());
+        }
+        cmd.extend_from_slice(&sub_extra);
+        return run_ab(&cmd).map(|_| (0, step.op.clone()));
+    }
+
+    let mut last_err = String::new();
+    for (loc_idx, raw_loc) in step.locators.iter().enumerate() {
+        let loc = substitute_flow_vars(raw_loc, vars);
+        let candidates =
+            build_locator_candidate_commands(&step.op, &loc, sub_value.as_deref(), &sub_extra);
+
+        if candidates.is_empty()
+            && let Some(rest) = loc.strip_prefix("role:")
+        {
+            let (role, name) = rest.split_once(':').unwrap_or((rest, ""));
+            match run_ab(&[
+                "snapshot".to_string(),
+                "-i".to_string(),
+                "-c".to_string(),
+                "--json".to_string(),
+            ]) {
+                Ok(snap_out) => {
+                    let snap_map = parse_snapshot_refs(&String::from_utf8_lossy(&snap_out.stdout));
+                    if let Some((ref_key, _)) = snap_map.iter().find(|(_, m)| {
+                        m.role.eq_ignore_ascii_case(role)
+                            && (name.is_empty() || m.name.eq_ignore_ascii_case(name))
+                    }) {
+                        let mut cmd = vec![step.op.clone(), format!("@{ref_key}")];
+                        if let Some(v) = &sub_value {
+                            cmd.push(v.clone());
+                        }
+                        cmd.extend_from_slice(&sub_extra);
+                        match run_ab(&cmd) {
+                            Ok(_) => return Ok((loc_idx, loc)),
+                            Err(e) => last_err = e,
+                        }
+                    } else {
+                        last_err = format!("Element not found for {loc}");
+                    }
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        for cmd in candidates {
+            match run_ab(&cmd) {
+                Ok(_) => return Ok((loc_idx, loc)),
+                Err(e) => last_err = e,
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn normalize_single_cmd_tokens(raw: &[String]) -> Vec<String> {
+    let mut seen_cmd = false;
+    let mut normalized_target = false;
+    raw.iter()
+        .map(|s| {
+            if !seen_cmd {
+                if !s.starts_with('-') {
+                    seen_cmd = true;
+                }
+                return s.clone();
+            }
+            if !normalized_target && !s.starts_with('-') {
+                normalized_target = true;
+                if s.strip_prefix('e')
+                    .is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+                {
+                    return format!("@{s}");
+                }
+            }
+            s.clone()
+        })
+        .collect()
+}
+
+pub fn normalize_heal_agent_args(raw: &[String]) -> Vec<String> {
+    if strip_leading_agent_flags(raw)
+        .first()
+        .is_some_and(|c| c == "batch")
+    {
+        let mut seen_batch = false;
+        raw.iter()
+            .map(|s| {
+                if !seen_batch {
+                    if s == "batch" {
+                        seen_batch = true;
+                    }
+                    return s.clone();
+                }
+                if s.starts_with('-') {
+                    return s.clone();
+                }
+                let words = normalize_single_cmd_tokens(&split_shell_words(s));
+                words
+                    .into_iter()
+                    .map(|w| {
+                        if w.chars().any(char::is_whitespace) {
+                            format!("\"{}\"", w.replace('"', "\\\""))
+                        } else {
+                            w
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    } else {
+        normalize_single_cmd_tokens(raw)
+    }
+}
+
+fn run_flow_subcommand(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[] } else { &args[1..] };
+
+    match sub {
+        "list" | "ls" => {
+            let mut items = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(flows_dir()) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if fname.starts_with('_') || !fname.ends_with(".json") {
+                        continue;
+                    }
+                    let stem = fname.trim_end_matches(".json");
+                    let flow = load_flow_from_path(&path, stem);
+                    let vars = extract_flow_vars(&flow);
+                    items.push(serde_json::json!({
+                        "name": flow.name,
+                        "domain": flow.domain,
+                        "steps_count": flow.steps.len(),
+                        "vars": vars,
+                        "updated_at": flow.updated_at,
+                        "path": path,
+                    }));
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&items)?);
+            Ok(())
+        }
+        "show" | "get" | "info" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login flow show <flow_name>"))?;
+            let path = flow_file_path(name)?;
+            if !path.is_file() {
+                bail!("Flow '{}' not found at {}", name, path.display());
+            }
+            let flow = load_flow_from_path(&path, name);
+            let vars = extract_flow_vars(&flow);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name": flow.name,
+                    "domain": flow.domain,
+                    "updated_at": flow.updated_at,
+                    "vars": vars,
+                    "steps_count": flow.steps.len(),
+                    "steps": flow.steps,
+                    "path": path,
+                }))?
+            );
+            Ok(())
+        }
+        "save" => {
+            let flow_raw = rest.first().ok_or_else(|| {
+                anyhow!(
+                    "Usage: bon-login flow save <flow_name> <profile_id|name> [--var key=literal ...]"
+                )
+            })?;
+            let prof_target = rest.get(1).ok_or_else(|| {
+                anyhow!(
+                    "Usage: bon-login flow save <flow_name> <profile_id|name> [--var key=literal ...]"
+                )
+            })?;
+            let flow_name = sanitize_flow_name(flow_raw)?;
+            let db = crate::db::Database::open_default()?;
+            let profiles = db.list_profiles()?;
+            let profile = find_profile_by_query(&profiles, prof_target)?;
+            let short_id = profile.short_id();
+            let hist_path = history_flow_path(&short_id);
+            let mut hist = load_flow_from_path(&hist_path, &flow_name);
+            if hist.steps.is_empty() {
+                bail!(
+                    "No recorded steps found in session history for profile '{}' (bon_{short_id})",
+                    profile.name
+                );
+            }
+            let mut var_pairs = Vec::new();
+            let mut idx = 2;
+            while idx < rest.len() {
+                if let Some((kv, step)) = parse_var_flag(rest, idx) {
+                    var_pairs.push(kv);
+                    idx += step;
+                } else {
+                    idx += 1;
+                }
+            }
+            parameterize_flow_steps(&mut hist.steps, &var_pairs);
+            hist.name = flow_name.clone();
+            let out_path = flow_file_path(&flow_name)?;
+            save_flow_to_path(&out_path, &mut hist)?;
+            let vars = extract_flow_vars(&hist);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "name": hist.name,
+                    "domain": hist.domain,
+                    "steps_count": hist.steps.len(),
+                    "vars": vars,
+                    "steps": hist.steps,
+                    "path": out_path,
+                }))?
+            );
+            Ok(())
+        }
+        "history" => {
+            let prof_target = rest.first().ok_or_else(|| {
+                anyhow!("Usage: bon-login flow history <profile_id|name> [--clear]")
+            })?;
+            let clear = rest.iter().any(|a| a == "--clear");
+            let db = crate::db::Database::open_default()?;
+            let profiles = db.list_profiles()?;
+            let profile = find_profile_by_query(&profiles, prof_target)?;
+            let short_id = profile.short_id();
+            if clear {
+                clear_flow_session_cache(&short_id);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "profile_short_id": short_id,
+                        "cleared": true,
+                    }))?
+                );
+                return Ok(());
+            }
+            let hist = load_flow_from_path(&history_flow_path(&short_id), &format!("history_{short_id}"));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "profile_short_id": short_id,
+                    "steps_count": hist.steps.len(),
+                    "steps": hist.steps,
+                }))?
+            );
+            Ok(())
+        }
+        "run" | "replay" => {
+            let flow_raw = rest.first().ok_or_else(|| {
+                anyhow!(
+                    "Usage: bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v ...] [--from-step <n>]"
+                )
+            })?;
+            let flow_name = sanitize_flow_name(flow_raw)?;
+            let path = flow_file_path(&flow_name)?;
+            if !path.is_file() {
+                bail!("Flow '{}' not found at {}", flow_name, path.display());
+            }
+            let mut flow = load_flow_from_path(&path, &flow_name);
+            if flow.steps.is_empty() {
+                bail!("Flow '{}' has 0 steps", flow_name);
+            }
+            let db = crate::db::Database::open_default()?;
+            let profiles = db.list_profiles()?;
+            let (targets, consumed) =
+                select_profiles_by_target(&profiles, &rest[1..]).map_err(|_| {
+                    anyhow!(
+                        "Usage: bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v ...] [--from-step <n>]"
+                    )
+                })?;
+
+            let mut cli_vars: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut from_step: usize = 0;
+            let mut idx = 1 + consumed;
+            while idx < rest.len() {
+                if let Some(((k, v), step)) = parse_var_flag(rest, idx) {
+                    cli_vars.insert(k, v);
+                    idx += step;
+                } else if matches!(rest[idx].as_str(), "--from-step" | "--from") {
+                    if let Some(n) = rest.get(idx + 1).and_then(|s| s.parse::<usize>().ok()) {
+                        from_step = n;
+                    }
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            }
+
+            let mut profile_results = Vec::new();
+            let mut flow_dirty = false;
+            let mut any_failed = false;
+
+            for profile in &targets {
+                let short_id = profile.short_id();
+                let info = ensure_profile_launched_via_supervisor(&db, profile)?;
+                let session = format!("bon_{short_id}");
+
+                let mut vars = cli_vars.clone();
+                vars.entry("profile.name".to_string())
+                    .or_insert_with(|| profile.name.clone());
+                vars.entry("profile.short_id".to_string())
+                    .or_insert_with(|| short_id.clone());
+                vars.entry("profile.notes".to_string())
+                    .or_insert_with(|| profile.notes.clone());
+
+                let mut executed = Vec::new();
+                let mut failed_info: Option<serde_json::Value> = None;
+
+                for step_idx in from_step..flow.steps.len() {
+                    let step = flow.steps[step_idx].clone();
+                    match execute_single_flow_step(&short_id, &session, &info.ws_url, &step, &vars)
+                    {
+                        Ok((winning_loc_idx, matched_locator)) => {
+                            if winning_loc_idx > 0
+                                && winning_loc_idx < flow.steps[step_idx].locators.len()
+                            {
+                                let winner =
+                                    flow.steps[step_idx].locators.remove(winning_loc_idx);
+                                flow.steps[step_idx].locators.insert(0, winner);
+                                flow_dirty = true;
+                            }
+                            executed.push(serde_json::json!({
+                                "step": step_idx,
+                                "op": step.op,
+                                "matched_locator": matched_locator,
+                                "status": "ok",
+                            }));
+                        }
+                        Err(err_msg) => {
+                            if step.optional {
+                                executed.push(serde_json::json!({
+                                    "step": step_idx,
+                                    "op": step.op,
+                                    "status": "skipped_optional",
+                                }));
+                                continue;
+                            }
+                            any_failed = true;
+                            let snap_out = agent_browser_cmd_for_short_id(&short_id)
+                                .args(["--session", &session, "snapshot", "-i", "-c"])
+                                .output()
+                                .ok();
+                            let snap_txt = snap_out
+                                .as_ref()
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                .unwrap_or_default();
+                            let parsed = if !snap_txt.is_empty() {
+                                let p = parse_snapshot_refs(&snap_txt);
+                                if !p.is_empty() {
+                                    save_snap_cache(&short_id, &p);
+                                }
+                                p
+                            } else {
+                                std::collections::HashMap::new()
+                            };
+                            let jev_find_payload = build_jev_find_payload(&step, &parsed);
+                            failed_info = Some(serde_json::json!({
+                                "failed_step": step_idx,
+                                "step": step,
+                                "error": err_msg,
+                                "snapshot": snap_txt,
+                                "jev_find_payload": jev_find_payload,
+                                "heal_cli": format!(
+                                    "bon-login flow heal {flow_name} {step_idx} {short_id} <agent-browser cmd...>"
+                                ),
+                                "resume_cli": format!(
+                                    "bon-login flow run {flow_name} {short_id} --from-step {}",
+                                    step_idx + 1
+                                ),
+                            }));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(fail) = failed_info {
+                    profile_results.push(serde_json::json!({
+                        "ok": false,
+                        "profile_short_id": short_id,
+                        "profile_name": profile.name,
+                        "executed_steps": executed,
+                        "failure": fail,
+                    }));
+                } else {
+                    profile_results.push(serde_json::json!({
+                        "ok": true,
+                        "profile_short_id": short_id,
+                        "profile_name": profile.name,
+                        "executed_steps": executed,
+                    }));
+                }
+            }
+
+            if flow_dirty {
+                let _ = save_flow_to_path(&path, &mut flow);
+            }
+
+            let out_json = if profile_results.len() == 1 {
+                profile_results.remove(0)
+            } else {
+                serde_json::json!({
+                    "ok": !any_failed,
+                    "flow": flow_name,
+                    "results": profile_results,
+                })
+            };
+            println!("{}", serde_json::to_string_pretty(&out_json)?);
+            if any_failed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        "heal" => {
+            if rest.len() < 4 {
+                bail!(
+                    "Usage: bon-login flow heal <flow_name> <step_index> <profile_id|name> <agent-browser args...>"
+                );
+            }
+            let flow_name = sanitize_flow_name(&rest[0])?;
+            let step_idx: usize = rest[1]
+                .parse()
+                .context("step_index must be a non-negative integer")?;
+            let prof_target = &rest[2];
+            let ab_args = normalize_heal_agent_args(&rest[3..]);
+            validate_stealth_agent_args(&ab_args)?;
+
+            let path = flow_file_path(&flow_name)?;
+            if !path.is_file() {
+                bail!("Flow '{}' not found at {}", flow_name, path.display());
+            }
+            let mut flow = load_flow_from_path(&path, &flow_name);
+            if step_idx >= flow.steps.len() {
+                bail!(
+                    "step_index {step_idx} out of range (flow '{}' has {} steps)",
+                    flow_name,
+                    flow.steps.len()
+                );
+            }
+
+            let db = crate::db::Database::open_default()?;
+            let profiles = db.list_profiles()?;
+            let profile = find_profile_by_query(&profiles, prof_target)?;
+            let short_id = profile.short_id();
+            let info = ensure_profile_launched_via_supervisor(&db, profile)?;
+            let session = format!("bon_{short_id}");
+
+            let mut healed_steps = prepare_recorded_steps(&short_id, &session, &ab_args);
+            let healed_step = healed_steps.pop().ok_or_else(|| {
+                anyhow!("Command did not produce a recordable DOM step for healing")
+            })?;
+
+            let out =
+                run_agent_browser_with_reconnect(&short_id, &session, &info.ws_url, &ab_args)?;
+            if !out.status.success() {
+                bail!(
+                    "Heal command failed on live browser: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+
+            let mut updated_step = healed_step;
+            // Preserve parameterized {{var}} value from original step if the op still takes a value
+            if let Some(orig_val) = &flow.steps[step_idx].value
+                && orig_val.contains("{{")
+                && updated_step.value.is_some()
+            {
+                updated_step.value = Some(orig_val.clone());
+            }
+            flow.steps[step_idx] = updated_step.clone();
+            save_flow_to_path(&path, &mut flow)?;
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "flow": flow_name,
+                    "healed_step_index": step_idx,
+                    "updated_step": updated_step,
+                    "resume_cli": format!(
+                        "bon-login flow run {flow_name} {short_id} --from-step {}",
+                        step_idx + 1
+                    ),
+                }))?
+            );
+            Ok(())
+        }
+        "delete" | "rm" | "remove" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login flow delete <flow_name>"))?;
+            let path = flow_file_path(name)?;
+            let existed = path.is_file();
+            if existed {
+                std::fs::remove_file(&path)?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "deleted": sanitize_flow_name(name)?,
+                    "existed": existed,
+                }))?
+            );
+            Ok(())
+        }
+        other => bail!(
+            "Unknown flow subcommand '{other}' (expected list, show, save, run, heal, history, delete)"
+        ),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4495,6 +6060,42 @@ mod tests {
             "Expected extension popup controls in snapshot: {snap_txt}"
         );
 
+        let parsed_ext_snap = parse_snapshot_refs(&snap_txt);
+        save_snap_cache(&short_id, &parsed_ext_snap);
+        let grab_ref = parsed_ext_snap
+            .iter()
+            .find(|(_, m)| m.name.contains("Grab Active Tab Cookies"))
+            .map(|(k, _)| format!("@{k}"))
+            .expect("should find Grab Active Tab Cookies ref in parsed snapshot");
+        let recorded = prepare_recorded_steps(
+            &short_id,
+            &format!("bon_{short_id}"),
+            &["click".to_string(), grab_ref],
+        );
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].op, "click");
+
+        let fallback_step = FlowStep {
+            op: "click".to_string(),
+            locators: vec![
+                "#nonexistent_missing_id".to_string(),
+                "role:button:Grab Active Tab Cookies".to_string(),
+            ],
+            value: None,
+            extra_args: Vec::new(),
+            optional: false,
+        };
+        let (win_idx, matched_loc) = execute_single_flow_step(
+            &short_id,
+            &format!("bon_{short_id}"),
+            &running.info.ws_url,
+            &fallback_step,
+            &std::collections::HashMap::new(),
+        )
+        .expect("fallback locator should succeed when primary selector is missing");
+        assert_eq!(win_idx, 1);
+        assert_eq!(matched_loc, "role:button:Grab Active Tab Cookies");
+
         let (state_path, state_json) =
             agent_export_state(&short_id, &running.info.ws_url).expect("export state should work");
         assert!(state_path.is_file());
@@ -4507,6 +6108,7 @@ mod tests {
             let _ = db.set_extension_enabled("cookie-token-grabber", prev_enabled);
         }
         let _ = wipe_profile_data(&profile.id);
+        clear_flow_session_cache(&short_id);
         if let Ok(dir) = profile_user_data_dir(&profile.id) {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -4680,5 +6282,196 @@ mod tests {
         .unwrap_err();
         assert!(err2.to_string().contains("cancelled"));
         assert!(!app_support_dir().join("extensions").join(test_id).exists());
+    }
+    #[test]
+    fn test_flow_snapshot_parsing_locators_and_parameterization() {
+        let snap_txt = "\
+- heading \"Sign In\" [level=1, ref=e1]\n\
+- textbox \"Email\" [ref=e2]\n\
+- textbox [ref=e3]\n\
+- button \"Continue\" [ref=e4]\n\
+- button \"Continue\" [ref=e5]\n";
+        let snap_map = parse_snapshot_refs(snap_txt);
+        assert_eq!(
+            snap_map.get("e2"),
+            Some(&SnapshotRefMeta {
+                role: "textbox".to_string(),
+                name: "Email".to_string(),
+                unique: true,
+                role_index: 0,
+            })
+        );
+        assert_eq!(
+            snap_map.get("e3"),
+            Some(&SnapshotRefMeta {
+                role: "textbox".to_string(),
+                name: String::new(),
+                unique: false,
+                role_index: 1,
+            })
+        );
+        assert_eq!(snap_map.get("e4").map(|m| m.unique), Some(false));
+
+        let dom_nodes = vec![
+            serde_json::json!({"role": "textbox", "accName": "Email", "id": "email_input", "name": "user_email"}),
+            serde_json::json!({"role": "textbox", "accName": "", "id": "secret_code", "name": "otp"}),
+        ];
+        let matched_unnamed = match_ref_dom_attrs_from_nodes(
+            &["@e3".to_string()],
+            &snap_map,
+            &dom_nodes,
+        );
+        assert_eq!(
+            matched_unnamed.get("@e3").map(|a| (a.id.as_str(), a.name.as_str())),
+            Some(("secret_code", "otp"))
+        );
+        let mut dom_attrs = std::collections::HashMap::new();
+        dom_attrs.insert(
+            "@e2".to_string(),
+            RefDomAttrs {
+                data_testid: "login-email".to_string(),
+                id: "email_input".to_string(),
+                name: "user_email".to_string(),
+                placeholder: "Enter email".to_string(),
+                input_type: "email".to_string(),
+                ..Default::default()
+            },
+        );
+        let step = build_flow_step_from_cmd(
+            &[
+                "fill".to_string(),
+                "@e2".to_string(),
+                "alice@example.com".to_string(),
+            ],
+            &snap_map,
+            &dom_attrs,
+        )
+        .expect("should build fill step");
+        assert_eq!(step.op, "fill");
+        assert_eq!(
+            step.locators,
+            vec![
+                "[data-testid=\"login-email\"]",
+                "[id=\"email_input\"]",
+                "[name=\"user_email\"]",
+                "role:textbox:Email",
+                "[placeholder=\"Enter email\"]",
+                "input[type=\"email\"]",
+            ]
+        );
+
+        let open_step = FlowStep {
+            op: "open".to_string(),
+            locators: Vec::new(),
+            value: Some("https://x.com/login".to_string()),
+            extra_args: Vec::new(),
+            optional: false,
+        };
+        let mut steps = vec![open_step, step];
+        parameterize_flow_steps(
+            &mut steps,
+            &[
+                ("username".to_string(), "alice@example.com".to_string()),
+                ("short".to_string(), "login".to_string()),
+            ],
+        );
+        assert_eq!(steps[0].value.as_deref(), Some("https://x.com/login"));
+        assert_eq!(steps[1].value.as_deref(), Some("{{username}}"));
+
+        let bad_stealth_step = FlowStep {
+            op: "set".to_string(),
+            locators: Vec::new(),
+            value: Some("viewport".to_string()),
+            extra_args: vec!["1920".to_string(), "1080".to_string()],
+            optional: false,
+        };
+        let err = execute_single_flow_step(
+            "12345678",
+            "bon_12345678",
+            "ws://127.0.0.1:9222/devtools/browser/test",
+            &bad_stealth_step,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap_err();
+        let jev_payload = build_jev_find_payload(&steps[1], &snap_map);
+        assert_eq!(
+            jev_payload["candidates"][0]["id"].as_str(),
+            Some("@e2")
+        );
+        assert_eq!(
+            jev_payload["candidates"][0]["text"].as_str(),
+            Some("[@e2] textbox · Email")
+        );
+        assert_eq!(
+            normalize_heal_agent_args(&[
+                "fill".to_string(),
+                "e3".to_string(),
+                "e100".to_string()
+            ]),
+            vec!["fill", "@e3", "e100"]
+        );
+        assert_eq!(
+            normalize_heal_agent_args(&[
+                "click".to_string(),
+                "--new-tab".to_string(),
+                "e4".to_string()
+            ]),
+            vec!["click", "--new-tab", "@e4"]
+        );
+        assert_eq!(
+            normalize_heal_agent_args(&[
+                "batch".to_string(),
+                "--bail".to_string(),
+                "fill e2 \"e100\"".to_string(),
+                "click e5".to_string()
+            ]),
+            vec!["batch", "--bail", "fill @e2 e100", "click @e5"]
+        );
+        let mut long_snap = std::collections::HashMap::new();
+        long_snap.insert(
+            "e9".to_string(),
+            SnapshotRefMeta {
+                role: "link".to_string(),
+                name: "x".repeat(500),
+                unique: true,
+                role_index: 0,
+            },
+        );
+        let long_payload = build_jev_find_payload(&steps[1], &long_snap);
+        assert!(
+            long_payload["candidates"][0]["text"]
+                .as_str()
+                .unwrap()
+                .len()
+                < 320
+        );
+        assert!(err.contains("Stealth Guardrail"));
+        let flow = AgentFlow {
+            name: "test_login".to_string(),
+            domain: "example.com".to_string(),
+            updated_at: 0,
+            steps,
+        };
+        assert_eq!(extract_flow_vars(&flow), vec!["username".to_string()]);
+
+        let cmds = build_locator_candidate_commands(
+            "fill",
+            "role:textbox:Email",
+            Some("bob@example.com"),
+            &[],
+        );
+        assert_eq!(
+            cmds[0],
+            vec![
+                "find",
+                "role",
+                "textbox",
+                "fill",
+                "--name",
+                "Email",
+                "--exact",
+                "bob@example.com"
+            ]
+        );
     }
 }
