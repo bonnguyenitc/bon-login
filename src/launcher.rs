@@ -2514,6 +2514,7 @@ pub fn apply_profile_cli_flags(
                     .os_version_for_seed(new_seed)
                     .to_string();
                 profile.brand_version = profile.brand.version_for_seed(new_seed).to_string();
+                profile.hardware_concurrency = profile.os_platform.optimal_cores_for_seed(new_seed);
                 idx += 2;
             }
             "--cores" => {
@@ -2568,6 +2569,16 @@ pub fn apply_profile_cli_flags(
             }
             "--notes" => {
                 profile.notes = next_val()?.to_string();
+                idx += 2;
+            }
+            "--cookies" => {
+                let raw = next_val()?;
+                let payload = if Path::new(raw).is_file() {
+                    std::fs::read_to_string(raw)?
+                } else {
+                    raw.to_string()
+                };
+                save_prelaunch_cookies(&profile.short_id(), &payload)?;
                 idx += 2;
             }
             "--proxy" => {
@@ -2657,9 +2668,12 @@ fn saved_proxy_summary_json(p: &SavedProxy) -> serde_json::Value {
         "protocol": p.config.protocol.as_str(),
         "host": p.config.host,
         "port": p.config.port,
+        "display": p.config.display_short(),
+        "editable": p.config.to_editable_string(),
         "has_auth": p.config.username.is_some(),
         "geo": p.resolved_geo,
         "last_error": p.last_error,
+        "started_at": p.format_started_at(),
         "expired_at": p.expired_at,
         "expired_label": p.format_expired_at(),
     })
@@ -2729,40 +2743,43 @@ fn print_cli_help() {
          BROWSER & AGENT CONTROL:\n  \
            bon-login                                                     Open GPUI Desktop App\n  \
            bon-login list [--group <g>] [--search <q>]                   List profiles & live CDP/Agent status (JSON)\n  \
-           bon-login launch <id|name|--group <g>> [--pin-tab <t>] [--url <u>] Launch profile(s) & connect agent-browser\n  \
+           bon-login launch <id|name|--group <g>|--all> [--pin-tab <t>] [--url <u>] Launch profile(s) & connect agent-browser\n  \
            bon-login stop <id|name|--group <g>|--all>                    Stop running profile(s) & flush cookies\n  \
            bon-login sync <id|name>                                      Sync OAuth popups & extension windows into tabs\n  \
            bon-login agent <id|name> <agent-browser args...>             Run agent-browser with Stealth Guardrails\n\n\
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
            bon-login profile list [--group <g>] [--search <q>]\n  \
            bon-login profile show <id|name>\n  \
-           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge|brave|opera]\n                            [--group <g>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>]\n                            [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>]\n  \
+           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge|brave|opera]\n                            [--group <g>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>]\n                            [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--cookies <file_or_json>]\n  \
            bon-login profile update <id|name|--group <g>|--all> [same flags as create]\n  \
+           bon-login profile reseed <id|name|--group <g>|--all>\n  \
            bon-login profile clone <id|name> [--count <n>] [--name <prefix>]\n  \
            bon-login profile batch-create --count <n> [--prefix <p>] [--group <g>] [--os <os>] [--brand <b>] [--proxy-tag <tag>]\n  \
-           bon-login profile check-proxy <id|name|--all>\n  \
+           bon-login profile check-proxy <id|name|--group <g>|--all>\n  \
            bon-login profile export-cookies <id|name> [--out <file>]\n  \
            bon-login profile import-cookies <id|name> <file_or_json>\n  \
-           bon-login profile wipe <id|name>\n  \
+           bon-login profile wipe <id|name|--group <g>|--all>\n  \
            bon-login profile delete <id|name|--group <g>|--all>\n  \
            bon-login profile backup [--out <file>]\n  \
            bon-login profile restore <file>\n\n\
          PROXY MANAGER (`bon-login proxy ...`):\n  \
            bon-login proxy list [--tag <t>]\n  \
            bon-login proxy add <raw_proxy_or_file> [--protocol http|socks5] [--tag <t>] [--name <n>] [--expire <days_or_date>]\n  \
+           bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>]\n  \
            bon-login proxy check <id|name|--tag <t>|--all>\n  \
-           bon-login proxy extend <id|name|--tag <t>|--all> <days>\n  \
-           bon-login proxy assign <proxy_id_or_name|--tag <t>> --to <profile_id|name|--group <g>|--all>\n  \
+           bon-login proxy extend <id|name|--tag <t>|--all> <days|0|clear>\n  \
+           bon-login proxy assign <proxy_id_or_name|--tag <t>|--all|none> --to <profile_id|name|--group <g>|--all>\n  \
+           bon-login proxy export [--tag <t>] [--out <file>]\n  \
            bon-login proxy delete <id|name|--tag <t>|--all>\n\n\
          GROUPS & TAGS (`bon-login group ...` / `bon-login tag ...`):\n  \
-           bon-login group list | add <name> | delete <name> | move <profile_id|name> <group>\n  \
+           bon-login group list | add <name> | delete <name> | move <id|name|--group <g>|--all> <group|none>\n  \
            bon-login tag list   | add <name> | delete <name>\n\n\
          EXTENSIONS (`bon-login ext ...`):\n  \
            bon-login ext list\n  \
-           bon-login ext enable <id|name> | disable <id|name>\n  \
+           bon-login ext enable <id|name|--all> | disable <id|name|--all>\n  \
            bon-login ext add <file_or_folder_or_store_url_or_id>\n  \
            bon-login ext remove <id|name>\n  \
-           bon-login ext open <ext_id|name> --profile <profile_id|name>\n\n\
+           bon-login ext open <ext_id|name> [--profile <profile_id|name>]\n\n\
          KERNEL (`bon-login kernel ...`):\n  \
            bon-login kernel status | install"
     );
@@ -3190,29 +3207,56 @@ fn run_profile_subcommand(
             println!("{}", serde_json::to_string_pretty(&created)?);
             Ok(())
         }
+        "reseed" | "new-fingerprint" => {
+            let profiles = db.list_profiles()?;
+            let (mut targets, _) = select_profiles_by_target(&profiles, rest)?;
+            let mut reseeded = Vec::new();
+            for mut p in targets.drain(..) {
+                p.seed = rand::random::<u32>().max(1000);
+                p.os_version = p.os_platform.os_version_for_seed(p.seed).to_string();
+                p.brand_version = p.brand.version_for_seed(p.seed).to_string();
+                p.hardware_concurrency = p.os_platform.optimal_cores_for_seed(p.seed);
+                p.gpu_spoofing = GpuSpoofMode::SeedGenerated;
+                db.upsert_profile(&p)?;
+                reseeded.push(profile_summary_json(&p));
+            }
+            if reseeded.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&reseeded[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&reseeded)?);
+            }
+            Ok(())
+        }
         "check-proxy" => {
             let profiles = db.list_profiles()?;
+            let saved_proxies = db.list_proxies()?;
             let (targets, _) = select_profiles_by_target(&profiles, rest)?;
             let mut out = Vec::new();
             for p in targets {
-                let Some(cfg) = &p.proxy else {
-                    out.push(serde_json::json!({
-                        "id": p.id,
-                        "short_id": p.short_id(),
-                        "name": p.name,
-                        "ok": true,
-                        "mode": "Direct",
-                    }));
-                    continue;
+                let res = if let Some(cfg) = &p.proxy {
+                    tokio_handle.block_on(check_proxy_config_live(cfg))
+                } else {
+                    tokio_handle.block_on(crate::geoip::resolve_geo_via_port(None))
                 };
-                match tokio_handle.block_on(check_proxy_config_live(cfg)) {
+                match res {
                     Ok(geo) => {
                         let _ = db.update_resolved_geo(&p.id, Some(&geo));
+                        if let Some(cfg) = &p.proxy {
+                            for sp in &saved_proxies {
+                                if sp.config.protocol == cfg.protocol
+                                    && sp.config.host == cfg.host
+                                    && sp.config.port == cfg.port
+                                {
+                                    let _ = db.update_saved_proxy_check(&sp.id, Some(&geo), None);
+                                }
+                            }
+                        }
                         out.push(serde_json::json!({
                             "id": p.id,
                             "short_id": p.short_id(),
                             "name": p.name,
                             "ok": true,
+                            "mode": if p.proxy.is_some() { "Proxy" } else { "Direct" },
                             "geo": geo,
                         }));
                     }
@@ -3222,6 +3266,7 @@ fn run_profile_subcommand(
                             "short_id": p.short_id(),
                             "name": p.name,
                             "ok": false,
+                            "mode": if p.proxy.is_some() { "Proxy" } else { "Direct" },
                             "error": e.to_string(),
                         }));
                     }
@@ -3312,19 +3357,21 @@ fn run_profile_subcommand(
             Ok(())
         }
         "wipe" => {
-            let target = rest
-                .first()
-                .ok_or_else(|| anyhow!("Usage: bon-login profile wipe <id|name>"))?;
             let profiles = db.list_profiles()?;
-            let p = find_profile_by_query(&profiles, target)?;
-            stop_external_runtime(&p.id, &p.short_id());
-            wipe_profile_data(&p.id)?;
+            let (targets, _) = select_profiles_by_target(&profiles, rest).map_err(|_| {
+                anyhow!("Usage: bon-login profile wipe <id|name|--group <g>|--all>")
+            })?;
+            let mut wiped = Vec::new();
+            for p in targets {
+                stop_external_runtime(&p.id, &p.short_id());
+                wipe_profile_data(&p.id)?;
+                wiped.push(p.short_id());
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": true,
-                    "wiped": p.short_id(),
-                    "name": p.name,
+                    "wiped": wiped,
                 }))?
             );
             Ok(())
@@ -3515,14 +3562,116 @@ fn run_proxy_subcommand(
             println!("{}", serde_json::to_string_pretty(&added)?);
             Ok(())
         }
+        "update" | "edit" | "set" => {
+            let proxies = db.list_proxies()?;
+            let (mut targets, consumed) = select_proxies_by_target(&proxies, rest)?;
+            let flags = &rest[consumed..];
+            if flags.is_empty() {
+                bail!("Usage: bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>]");
+            }
+            let mut idx = 0;
+            let mut new_name: Option<String> = None;
+            let mut new_tag: Option<String> = None;
+            let mut new_expire: Option<Option<i64>> = None;
+            while idx < flags.len() {
+                match flags[idx].as_str() {
+                    "--name" => {
+                        new_name = flags.get(idx + 1).map(|s| s.trim().to_string());
+                        idx += 2;
+                    }
+                    "--tag" | "--group" => {
+                        let t = flags.get(idx + 1).map(|s| s.trim().trim_start_matches('#')).unwrap_or("");
+                        new_tag = Some(if t.eq_ignore_ascii_case("none") {
+                            String::new()
+                        } else {
+                            t.to_string()
+                        });
+                        idx += 2;
+                    }
+                    "--expire" => {
+                        let v = flags.get(idx + 1).map(|s| s.trim()).unwrap_or("");
+                        if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("clear") || v == "0" {
+                            new_expire = Some(None);
+                        } else {
+                            new_expire = Some(SavedProxy::parse_expiration_input(v));
+                        }
+                        idx += 2;
+                    }
+                    other => bail!("Unknown proxy update flag '{other}'"),
+                }
+            }
+            let count = targets.len();
+            let mut updated = Vec::new();
+            for (i, mut sp) in targets.drain(..).enumerate() {
+                if let Some(n) = &new_name {
+                    sp.name = if count == 1 {
+                        n.clone()
+                    } else {
+                        format!("{n}-{:02}", i + 1)
+                    };
+                }
+                if let Some(t) = &new_tag {
+                    sp.group_tag = t.clone();
+                }
+                if let Some(exp) = new_expire {
+                    sp.expired_at = exp;
+                }
+                db.upsert_proxy(&sp)?;
+                updated.push(saved_proxy_summary_json(&sp));
+            }
+            println!("{}", serde_json::to_string_pretty(&updated)?);
+            Ok(())
+        }
+        "export" | "copy" => {
+            let tag_filter = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--tag").then(|| w[1].trim_start_matches('#').to_string()));
+            let out_file = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
+            let proxies = db.list_proxies()?;
+            let lines: Vec<String> = proxies
+                .iter()
+                .filter(|p| {
+                    tag_filter
+                        .as_deref()
+                        .is_none_or(|t| p.group_tag.eq_ignore_ascii_case(t))
+                })
+                .map(|p| p.config.to_editable_string())
+                .collect();
+            if let Some(path) = out_file {
+                std::fs::write(&path, lines.join("\n"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "path": path,
+                        "count": lines.len(),
+                    }))?
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&lines)?);
+            }
+            Ok(())
+        }
         "check" => {
             let proxies = db.list_proxies()?;
+            let profiles = db.list_profiles()?;
             let (targets, _) = select_proxies_by_target(&proxies, rest)?;
             let mut results = Vec::new();
             for sp in targets {
                 match tokio_handle.block_on(check_proxy_config_live(&sp.config)) {
                     Ok(geo) => {
                         let _ = db.update_saved_proxy_check(&sp.id, Some(&geo), None);
+                        for prof in &profiles {
+                            if prof.proxy.as_ref().is_some_and(|p| {
+                                p.protocol == sp.config.protocol
+                                    && p.host == sp.config.host
+                                    && p.port == sp.config.port
+                            }) {
+                                let _ = db.update_resolved_geo(&prof.id, Some(&geo));
+                            }
+                        }
                         results.push(serde_json::json!({
                             "id": sp.id,
                             "name": sp.name,
@@ -3552,17 +3701,26 @@ fn run_proxy_subcommand(
             let (targets, consumed) = select_proxies_by_target(&proxies, rest)?;
             let days_raw = rest
                 .get(consumed)
-                .ok_or_else(|| anyhow!("Usage: bon-login proxy extend <id|name|--tag <t>|--all> <days>"))?;
-            let days: i64 = days_raw
-                .trim_start_matches('+')
-                .trim_end_matches(['d', 'D'])
-                .parse()
-                .context("Invalid days integer")?;
+                .ok_or_else(|| anyhow!("Usage: bon-login proxy extend <id|name|--tag <t>|--all> <days|0|clear>"))?
+                .trim();
+            let days: i64 = if days_raw.eq_ignore_ascii_case("clear") || days_raw.eq_ignore_ascii_case("none") {
+                0
+            } else {
+                days_raw
+                    .trim_start_matches('+')
+                    .trim_end_matches(['d', 'D'])
+                    .parse()
+                    .context("Invalid days integer")?
+            };
             let now = unix_now();
             let mut updated = Vec::new();
             for mut sp in targets {
-                let base = sp.expired_at.unwrap_or(now).max(now);
-                sp.expired_at = Some(base + days * 86_400);
+                sp.expired_at = if days <= 0 {
+                    None
+                } else {
+                    let base = sp.expired_at.unwrap_or(now).max(now);
+                    Some(base + days * 86_400)
+                };
                 db.upsert_proxy(&sp)?;
                 updated.push(serde_json::json!({
                     "id": sp.id,
@@ -3575,28 +3733,47 @@ fn run_proxy_subcommand(
             Ok(())
         }
         "assign" => {
-            let proxies = db.list_proxies()?;
-            let (proxy_pool, consumed) = select_proxies_by_target(&proxies, rest)?;
+            let first = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login proxy assign <proxy|--tag <t>|--all|none> --to <profile|--group <g>|--all>"))?;
+            let clear_proxy = first.eq_ignore_ascii_case("none") || first.eq_ignore_ascii_case("direct");
+            let (proxy_pool, consumed) = if clear_proxy {
+                (Vec::new(), 1)
+            } else {
+                let proxies = db.list_proxies()?;
+                select_proxies_by_target(&proxies, rest)?
+            };
             let after = &rest[consumed..];
             let to_idx = after
                 .iter()
                 .position(|a| a == "--to")
-                .ok_or_else(|| anyhow!("Usage: bon-login proxy assign <proxy|--tag <t>> --to <profile|--group <g>|--all>"))?;
+                .ok_or_else(|| anyhow!("Usage: bon-login proxy assign <proxy|--tag <t>|--all|none> --to <profile|--group <g>|--all>"))?;
             let prof_args = &after[to_idx + 1..];
             let profiles = db.list_profiles()?;
             let (mut target_profiles, _) = select_profiles_by_target(&profiles, prof_args)?;
             let mut assigned = Vec::new();
             for (idx, mut p) in target_profiles.drain(..).enumerate() {
-                let chosen = &proxy_pool[idx % proxy_pool.len()];
-                p.proxy = Some(chosen.config.clone());
-                p.resolved_geo = chosen.resolved_geo.clone();
-                db.upsert_profile(&p)?;
-                assigned.push(serde_json::json!({
-                    "profile_short_id": p.short_id(),
-                    "profile_name": p.name,
-                    "proxy": chosen.config.display_short(),
-                    "proxy_name": chosen.name,
-                }));
+                if clear_proxy {
+                    p.proxy = None;
+                    p.resolved_geo = None;
+                    db.upsert_profile(&p)?;
+                    assigned.push(serde_json::json!({
+                        "profile_short_id": p.short_id(),
+                        "profile_name": p.name,
+                        "proxy": "Direct",
+                    }));
+                } else {
+                    let chosen = &proxy_pool[idx % proxy_pool.len()];
+                    p.proxy = Some(chosen.config.clone());
+                    p.resolved_geo = chosen.resolved_geo.clone();
+                    db.upsert_profile(&p)?;
+                    assigned.push(serde_json::json!({
+                        "profile_short_id": p.short_id(),
+                        "profile_name": p.name,
+                        "proxy": chosen.config.display_short(),
+                        "proxy_name": chosen.name,
+                    }));
+                }
             }
             println!("{}", serde_json::to_string_pretty(&assigned)?);
             Ok(())
@@ -3666,30 +3843,35 @@ fn run_group_subcommand(args: &[String]) -> Result<()> {
             Ok(())
         }
         "move" | "assign" => {
-            let target = rest
-                .first()
-                .ok_or_else(|| anyhow!("Usage: bon-login group move <profile_id|name> <group_name>"))?;
-            let group_name = rest
-                .get(1)
-                .ok_or_else(|| anyhow!("Usage: bon-login group move <profile_id|name> <group_name>"))?
-                .trim();
             let profiles = db.list_profiles()?;
-            let mut p = find_profile_by_query(&profiles, target)?.clone();
-            p.group_tag = if group_name.eq_ignore_ascii_case("none") {
+            let (mut targets, consumed) = select_profiles_by_target(&profiles, rest).map_err(|_| {
+                anyhow!("Usage: bon-login group move <id|name|--group <g>|--all> <group_name|none>")
+            })?;
+            let group_name = rest
+                .get(consumed)
+                .ok_or_else(|| anyhow!("Usage: bon-login group move <id|name|--group <g>|--all> <group_name|none>"))?
+                .trim();
+            let next_group = if group_name.eq_ignore_ascii_case("none") {
                 String::new()
             } else {
                 group_name.to_string()
             };
-            db.upsert_profile(&p)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+            let mut moved = Vec::new();
+            for mut p in targets.drain(..) {
+                p.group_tag = next_group.clone();
+                db.upsert_profile(&p)?;
+                moved.push(serde_json::json!({
                     "ok": true,
                     "short_id": p.short_id(),
                     "name": p.name,
                     "group": p.group_tag,
-                }))?
-            );
+                }));
+            }
+            if moved.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&moved[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&moved)?);
+            }
             Ok(())
         }
         other => bail!("Unknown group subcommand '{other}'"),
@@ -3779,32 +3961,45 @@ fn run_ext_subcommand(
             let enable = sub == "enable";
             let target = rest
                 .first()
-                .ok_or_else(|| anyhow!("Usage: bon-login ext {sub} <id|name>"))?;
+                .ok_or_else(|| anyhow!("Usage: bon-login ext {sub} <id|name|--all>"))?;
             let exts = db.list_extensions()?;
-            let mut ext = find_extension_by_query(&exts, target)?.clone();
-            ext.enabled = enable;
-            if enable {
-                let dir = ensure_extension_unpacked(&ext)?;
-                if is_placeholder_extension_dir(&dir) && !ext.source_url.trim().is_empty() {
-                    let downloaded =
-                        tokio_handle.block_on(download_extension_from_url(&ext.source_url))?;
-                    ext.folder_path = downloaded.folder_path;
+            let targets: Vec<BrowserExtension> = if target == "--all" || target == "all" {
+                exts
+            } else {
+                let mut list = Vec::new();
+                for tok in target.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    list.push(find_extension_by_query(&exts, tok)?.clone());
                 }
-            }
-            db.upsert_extension(&ext)?;
-            db.set_extension_enabled(&ext.id, enable)?;
-            let rt = resolve_extension_runtime_info(&ext);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+                list
+            };
+            let mut results = Vec::new();
+            for mut ext in targets {
+                ext.enabled = enable;
+                if enable {
+                    let dir = ensure_extension_unpacked(&ext)?;
+                    if is_placeholder_extension_dir(&dir) && !ext.source_url.trim().is_empty() {
+                        let downloaded =
+                            tokio_handle.block_on(download_extension_from_url(&ext.source_url))?;
+                        ext.folder_path = downloaded.folder_path;
+                    }
+                }
+                db.upsert_extension(&ext)?;
+                db.set_extension_enabled(&ext.id, enable)?;
+                let rt = resolve_extension_runtime_info(&ext);
+                results.push(serde_json::json!({
                     "ok": true,
                     "id": ext.id,
                     "name": ext.name,
                     "enabled": enable,
                     "runtime_id": rt.as_ref().map(|(id, _)| id),
                     "entry_url": rt.as_ref().map(|(_, url)| url),
-                }))?
-            );
+                }));
+            }
+            if results.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&results[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            }
             Ok(())
         }
         "add" | "install" => {
@@ -3863,18 +4058,32 @@ fn run_ext_subcommand(
         "open" => {
             let ext_target = rest
                 .first()
-                .ok_or_else(|| anyhow!("Usage: bon-login ext open <ext_id|name> --profile <profile_id|name>"))?;
+                .ok_or_else(|| anyhow!("Usage: bon-login ext open <ext_id|name> [--profile <profile_id|name>]"))?;
             let prof_target = rest
                 .windows(2)
                 .find_map(|w| (w[0] == "--profile" || w[0] == "-p").then(|| w[1].as_str()))
-                .or_else(|| rest.get(1).map(String::as_str))
-                .ok_or_else(|| anyhow!("Usage: bon-login ext open <ext_id|name> --profile <profile_id|name>"))?;
+                .or_else(|| {
+                    rest.get(1)
+                        .filter(|s| !s.starts_with('-'))
+                        .map(String::as_str)
+                });
             let exts = db.list_extensions()?;
             let ext = find_extension_by_query(&exts, ext_target)?;
             let (runtime_id, entry_url) = resolve_extension_runtime_info(ext)
                 .ok_or_else(|| anyhow!("Could not resolve extension entry URL for '{}'", ext.name))?;
             let profiles = db.list_profiles()?;
-            let profile = find_profile_by_query(&profiles, prof_target)?;
+            let profile = if let Some(q) = prof_target {
+                find_profile_by_query(&profiles, q)?
+            } else {
+                profiles
+                    .iter()
+                    .find(|p| probe_live_runtime(&p.id).is_some())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "No running profile found. Specify `--profile <id|name>` or launch a profile first."
+                        )
+                    })?
+            };
             let info = ensure_profile_launched_via_supervisor(&db, profile)?;
             let cli = agent_open_extension_tab(&profile.short_id(), &info.ws_url, &entry_url)?;
             println!(
