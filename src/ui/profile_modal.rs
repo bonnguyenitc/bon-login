@@ -4614,6 +4614,185 @@ pub fn render_popup_modal(
                         ),
                 )
         }
+
+        ActivePopupModal::ArrangeWindows => {
+            let displays = cx.displays();
+            let disp_list: Vec<(usize, i32, i32)> = if displays.is_empty() {
+                vec![(0, 1440, 900)]
+            } else {
+                displays
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let b = d.bounds();
+                        (i, f32::from(b.size.width) as i32, f32::from(b.size.height) as i32)
+                    })
+                    .collect()
+            };
+            let sel_idx = app.arrange_display_idx.min(disp_list.len().saturating_sub(1));
+            let (_, mon_w, mon_h) = disp_list[sel_idx];
+            let usable_w = mon_w.max(500);
+            let usable_h = (mon_h - 25).max(360);
+            let target_count = app.running_targets_for_arrange().len();
+            let auto_n = target_count.max(1);
+            let auto_cols = (auto_n as f32).sqrt().ceil().max(1.0) as i32;
+            let auto_rows = ((auto_n as i32 + auto_cols - 1) / auto_cols).max(1);
+            let presets: Vec<(String, i32, i32)> = vec![
+                (
+                    format!("Auto Fit ({auto_n})"),
+                    (usable_w / auto_cols).max(500),
+                    (usable_h / auto_rows).max(360),
+                ),
+                ("2×1 Split".to_string(), (usable_w / 2).max(500), usable_h),
+                ("2×2 Grid".to_string(), (usable_w / 2).max(500), (usable_h / 2).max(360)),
+                ("3×2 Grid".to_string(), (usable_w / 3).max(500), (usable_h / 2).max(360)),
+                ("4×2 Grid".to_string(), (usable_w / 4).max(500), (usable_h / 2).max(360)),
+            ];
+            let cur_size_raw = app.arrange_size_input.read(cx).value().to_string();
+            let fit_hint = if let Some((w, h)) = crate::launcher::parse_window_size(&cur_size_raw) {
+                let cw = w.clamp(500, usable_w);
+                let ch = h.clamp(360, usable_h);
+                let cols = (usable_w / cw).max(1);
+                let rows = (usable_h / ch).max(1);
+                format!(
+                    "Fits {cols} col(s) × {rows} row(s) ({cw}×{ch}px each) on Display {} ({mon_w}×{mon_h})",
+                    sel_idx + 1
+                )
+            } else {
+                "Enter Width,Height (min 500×360 on macOS Chromium)".to_string()
+            };
+
+            v_flex()
+                .w(px(500.))
+                .p_5()
+                .gap_3p5()
+                .rounded_lg()
+                .bg(BonTheme::bg_elevated())
+                .border_1()
+                .border_color(BonTheme::border_active())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_bold()
+                                .text_color(BonTheme::text_primary())
+                                .child(format!(
+                                    "{}  Auto-Fix & Tile Open Browsers",
+                                    SfSymbol::PC
+                                )),
+                        )
+                        .child(
+                            Button::new("arr-close")
+                                .ghost()
+                                .small()
+                                .label(SfSymbol::XMARK)
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .child(field_label("1. Monitor"))
+                        .child(
+                            h_flex().w_full().gap_2().flex_wrap().children(
+                                disp_list.into_iter().map(|(idx, dw, dh)| {
+                                    let active = idx == sel_idx;
+                                    Button::new(SharedString::from(format!("arr-disp-{idx}")))
+                                        .with_variant(BonTheme::toggle_pill(cx, active))
+                                        .small()
+                                        .label(format!(
+                                            "{}  Display {} ({dw}×{dh})",
+                                            SfSymbol::PC,
+                                            idx + 1
+                                        ))
+                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                            app.arrange_display_idx = idx;
+                                            cx.notify();
+                                        }))
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .child(field_label("2. Monitor Size Presets"))
+                        .child(
+                            h_flex().w_full().gap_1p5().flex_wrap().children(
+                                presets.into_iter().enumerate().map(|(i, (lbl, pw, ph))| {
+                                    let val_str = format!("{pw},{ph}");
+                                    let active = cur_size_raw.trim() == val_str;
+                                    Button::new(SharedString::from(format!("arr-preset-{i}")))
+                                        .with_variant(BonTheme::toggle_pill(cx, active))
+                                        .small()
+                                        .label(format!("{lbl} ({pw}×{ph})"))
+                                        .on_click(cx.listener(move |app, _, window, cx| {
+                                            app.set_arrange_size_text(val_str.clone(), window, cx);
+                                            if !app.running_targets_for_arrange().is_empty() {
+                                                app.arrange_open_browsers(cx);
+                                            }
+                                        }))
+                                }),
+                            ),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(field_label("3. Custom Browser Size (Width,Height)"))
+                        .child(Input::new(&app.arrange_size_input))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
+                                .child(fit_hint),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(BonTheme::border())
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("arr-cancel")
+                                .with_variant(BonTheme::row_action(cx))
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("arr-apply")
+                                .with_variant(BonTheme::primary_cta(cx))
+                                .small()
+                                .disabled(target_count == 0)
+                                .label(if target_count > 0 {
+                                    format!("Apply to {target_count} open browser(s)")
+                                } else {
+                                    "No open browsers".to_string()
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    app.arrange_open_browsers(cx);
+                                })),
+                        ),
+                )
+        }
     };
 
     let modal_anim_id = SharedString::from(format!("popup-modal-{modal_kind:?}"));

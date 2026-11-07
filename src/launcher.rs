@@ -2844,6 +2844,267 @@ fn extract_port_from_ws_url(ws_url: &str) -> Option<u16> {
     port_str.parse().ok()
 }
 
+/// Parses `"W,H"`, `"WxH"`, or `"W×H"` into `(width, height)` clamped to sensible bounds.
+pub fn parse_window_size(raw: &str) -> Option<(i32, i32)> {
+    let cleaned = raw.trim().replace(['×', 'x', 'X', ' '], ",");
+    let mut parts = cleaned.split(',').filter(|s| !s.is_empty());
+    let w: i32 = parts.next()?.parse().ok()?;
+    let h: i32 = parts.next()?.parse().ok()?;
+    (w >= 200 && h >= 200).then_some((w.min(7680), h.min(4320)))
+}
+
+/// Computes `(left, top, width, height)` for `count` windows tiled across a monitor `(mon_x, mon_y, mon_w, mon_h)`.
+/// Reserves `25px` at the top of the monitor for the macOS menu bar and cascades overflow layers by `24px`.
+pub fn compute_tile_bounds(
+    mon_x: i32,
+    mon_y: i32,
+    mon_w: i32,
+    mon_h: i32,
+    win_w: i32,
+    win_h: i32,
+    count: usize,
+) -> Vec<(i32, i32, i32, i32)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let usable_y = mon_y + 25;
+    let usable_w = mon_w.max(500);
+    let usable_h = (mon_h - 25).max(360);
+    // shortcut: Chromium macOS enforces ~500px minimum normal window width
+    let w = win_w.clamp(500, usable_w);
+    let h = win_h.clamp(360, usable_h);
+    let cols = (usable_w / w).max(1) as usize;
+    let rows = (usable_h / h).max(1) as usize;
+    let per_layer = (cols * rows).max(1);
+
+    (0..count)
+        .map(|i| {
+            let layer = (i / per_layer) as i32;
+            let cell = i % per_layer;
+            let col = (cell % cols) as i32;
+            let row = (cell / cols) as i32;
+            let cascade = (layer * 24) % 120;
+            let left = (mon_x + col * w + cascade).min(mon_x + usable_w - w);
+            let top = (usable_y + row * h + cascade).min(usable_y + usable_h - h);
+            (left, top, w, h)
+        })
+        .collect()
+}
+
+/// Resizes and positions a running Chromium window via Browser-domain CDP (`Browser.setWindowBounds`),
+/// preserving 100% stealth (no `Emulation.*` or `Runtime.enable`).
+pub fn cdp_set_window_bounds(
+    cdp_port: u16,
+    ws_url: &str,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+
+    let list_body = cdp_http_get_body(cdp_port, "/json/list")
+        .context("Failed to query CDP /json/list")?;
+    let targets: serde_json::Value = serde_json::from_str(list_body.trim())?;
+    let target_id = targets
+        .as_array()
+        .and_then(|arr| {
+            let find_page = |skip_internal: bool| {
+                arr.iter().find_map(|t| {
+                    let ty = t.get("type")?.as_str()?;
+                    let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                    let ok_url = !skip_internal
+                        || (!url.starts_with("chrome-extension://")
+                            && !url.starts_with("devtools://"));
+                    (matches!(ty, "page" | "app") && ok_url)
+                        .then(|| t.get("id")?.as_str().map(ToString::to_string))
+                        .flatten()
+                })
+            };
+            find_page(true).or_else(|| find_page(false))
+        })
+        .context("No open browser window target found")?;
+
+    let ws_path = ws_url
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|s| s.split_once('/'))
+        .map(|(_, path)| format!("/{path}"))
+        .context("Invalid CDP WebSocket URL")?;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cdp_port);
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(350))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+
+    let handshake = format!(
+        "GET {ws_path} HTTP/1.1\r\n\
+         Host: 127.0.0.1:{cdp_port}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(handshake.as_bytes())?;
+
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            bail!("Unexpected EOF during CDP WebSocket handshake");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if buf.len() > 16384 {
+            bail!("CDP WebSocket handshake header too large");
+        }
+    };
+    if !buf[..header_end].starts_with(b"HTTP/1.1 101") {
+        bail!("CDP WebSocket upgrade rejected");
+    }
+    buf.drain(..header_end);
+
+    fn ws_send(stream: &mut TcpStream, msg: &str) -> Result<()> {
+        let payload = msg.as_bytes();
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let mut frame = Vec::with_capacity(14 + payload.len());
+        frame.push(0x81);
+        if payload.len() < 126 {
+            frame.push(0x80 | (payload.len() as u8));
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        stream.write_all(&frame)?;
+        Ok(())
+    }
+
+    fn ws_recv_id(
+        stream: &mut TcpStream,
+        buf: &mut Vec<u8>,
+        expected_id: u64,
+    ) -> Result<serde_json::Value> {
+        let mut chunk = [0u8; 2048];
+        for _ in 0..16 {
+            while buf.len() < 2 {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    bail!("EOF reading CDP WebSocket frame");
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let opcode = buf[0] & 0x0f;
+            let len0 = (buf[1] & 0x7f) as usize;
+            let (hdr_len, payload_len) = if len0 < 126 {
+                (2usize, len0)
+            } else if len0 == 126 {
+                while buf.len() < 4 {
+                    let n = stream.read(&mut chunk)?;
+                    if n == 0 {
+                        bail!("EOF reading CDP frame length");
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                (4, u16::from_be_bytes([buf[2], buf[3]]) as usize)
+            } else {
+                while buf.len() < 10 {
+                    let n = stream.read(&mut chunk)?;
+                    if n == 0 {
+                        bail!("EOF reading CDP 64-bit frame length");
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&buf[2..10]);
+                (10, u64::from_be_bytes(arr) as usize)
+            };
+            while buf.len() < hdr_len + payload_len {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    bail!("EOF reading CDP frame payload");
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let data: Vec<u8> = buf.drain(..hdr_len + payload_len).skip(hdr_len).collect();
+            if opcode == 0x1
+                && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data)
+                && val.get("id").and_then(|v| v.as_u64()) == Some(expected_id)
+            {
+                if let Some(err) = val.get("error") {
+                    bail!("CDP error: {err}");
+                }
+                return Ok(val);
+            }
+        }
+        bail!("Timed out waiting for CDP response id={expected_id}")
+    }
+
+    let get_win = serde_json::json!({
+        "id": 1,
+        "method": "Browser.getWindowForTarget",
+        "params": { "targetId": target_id }
+    });
+    ws_send(&mut stream, &get_win.to_string())?;
+    let win_resp = ws_recv_id(&mut stream, &mut buf, 1)?;
+    let window_id = win_resp
+        .get("result")
+        .and_then(|r| r.get("windowId"))
+        .and_then(|w| w.as_i64())
+        .context("Missing windowId in Browser.getWindowForTarget")?;
+    let win_state = win_resp
+        .get("result")
+        .and_then(|r| r.get("bounds"))
+        .and_then(|b| b.get("windowState"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("normal");
+
+    if win_state != "normal" {
+        let restore = serde_json::json!({
+            "id": 2,
+            "method": "Browser.setWindowBounds",
+            "params": {
+                "windowId": window_id,
+                "bounds": { "windowState": "normal" }
+            }
+        });
+        ws_send(&mut stream, &restore.to_string())?;
+        let _ = ws_recv_id(&mut stream, &mut buf, 2)?;
+    }
+
+    let set_bounds = serde_json::json!({
+        "id": 3,
+        "method": "Browser.setWindowBounds",
+        "params": {
+            "windowId": window_id,
+            "bounds": {
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height
+            }
+        }
+    });
+    ws_send(&mut stream, &set_bounds.to_string())?;
+    let _ = ws_recv_id(&mut stream, &mut buf, 3)?;
+
+    let activate = serde_json::json!({
+        "id": 4,
+        "method": "Target.activateTarget",
+        "params": { "targetId": target_id }
+    });
+    let _ = ws_send(&mut stream, &activate.to_string());
+    let _ = ws_recv_id(&mut stream, &mut buf, 4);
+    Ok(())
+}
+
 /// Attaches any `chrome-extension://` page tabs that opened at browser startup (before `agent-browser connect`)
 /// so they appear in `agent-browser --session bon_<id> tab`.
 fn sync_extension_targets_to_agent_browser(session: &str, cdp_port: u16) -> usize {
@@ -7327,5 +7588,98 @@ mod tests {
                 "bob@example.com"
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_window_size_and_compute_tile_bounds() {
+        assert_eq!(parse_window_size("960,600"), Some((960, 600)));
+        assert_eq!(parse_window_size(" 800 x 700 "), Some((800, 700)));
+        assert_eq!(parse_window_size("720×540"), Some((720, 540)));
+        assert_eq!(parse_window_size("100,100"), None);
+
+        let bounds = compute_tile_bounds(0, 0, 1920, 1080, 960, 500, 5);
+        assert_eq!(bounds.len(), 5);
+        assert_eq!(bounds[0], (0, 25, 960, 500));
+        assert_eq!(bounds[1], (960, 25, 960, 500));
+        assert_eq!(bounds[2], (0, 525, 960, 500));
+        assert_eq!(bounds[3], (960, 525, 960, 500));
+        // 5th window cascades on second layer (+24px offset)
+        assert_eq!(bounds[4], (24, 49, 960, 500));
+
+        // Loopback test for `cdp_set_window_bounds` (HTTP /json/list + WebSocket Browser.setWindowBounds)
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // 1. Serve /json/list
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut b1 = [0u8; 512];
+            let _ = s1.read(&mut b1);
+            let body = r#"[{"id":"target-1","type":"page","url":"https://example.com"}]"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s1.write_all(resp.as_bytes()).unwrap();
+
+            // 2. Serve WebSocket upgrade + 3 CDP requests (getWindowForTarget, setWindowBounds normal, setWindowBounds rect)
+            let (mut s2, _) = listener.accept().unwrap();
+            let mut b2 = [0u8; 1024];
+            let _ = s2.read(&mut b2);
+            s2.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+
+            fn read_masked_text(s: &mut std::net::TcpStream) -> String {
+                let mut h = [0u8; 2];
+                s.read_exact(&mut h).unwrap();
+                let len = (h[1] & 0x7f) as usize;
+                let len = if len == 126 {
+                    let mut ext = [0u8; 2];
+                    s.read_exact(&mut ext).unwrap();
+                    u16::from_be_bytes(ext) as usize
+                } else {
+                    len
+                };
+                let mut mask = [0u8; 4];
+                s.read_exact(&mut mask).unwrap();
+                let mut payload = vec![0u8; len];
+                s.read_exact(&mut payload).unwrap();
+                for (i, b) in payload.iter_mut().enumerate() {
+                    *b ^= mask[i & 3];
+                }
+                String::from_utf8(payload).unwrap()
+            }
+            fn write_unmasked_text(s: &mut std::net::TcpStream, msg: &str) {
+                let bytes = msg.as_bytes();
+                let mut f = vec![0x81, bytes.len() as u8];
+                f.extend_from_slice(bytes);
+                s.write_all(&f).unwrap();
+            }
+
+            let req1 = read_masked_text(&mut s2);
+            assert!(req1.contains("Browser.getWindowForTarget"));
+            write_unmasked_text(
+                &mut s2,
+                r#"{"id":1,"result":{"windowId":7,"bounds":{"windowState":"maximized"}}}"#,
+            );
+
+            let req2 = read_masked_text(&mut s2);
+            assert!(req2.contains(r#""windowState":"normal""#));
+            write_unmasked_text(&mut s2, r#"{"id":2,"result":{}}"#);
+
+            let req3 = read_masked_text(&mut s2);
+            assert!(req3.contains(r#""width":960"#) && req3.contains(r#""height":600"#));
+            write_unmasked_text(&mut s2, r#"{"id":3,"result":{}}"#);
+
+            let req4 = read_masked_text(&mut s2);
+            assert!(req4.contains("Target.activateTarget"));
+            write_unmasked_text(&mut s2, r#"{"id":4,"result":{}}"#);
+        });
+
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/mock");
+        cdp_set_window_bounds(port, &ws_url, 10, 25, 960, 600).unwrap();
+        server.join().unwrap();
     }
 }

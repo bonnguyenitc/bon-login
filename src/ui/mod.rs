@@ -54,6 +54,7 @@ pub enum ActivePopupModal {
     UploadExtension,
     InputUrlExtension,
     RemoveExtension,
+    ArrangeWindows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +113,8 @@ pub struct BonLoginApp {
     pub batch_count_input: Entity<InputState>,
     pub batch_os: PlatformType,
     pub batch_brand: BrowserBrand,
+    pub arrange_display_idx: usize,
+    pub arrange_size_input: Entity<InputState>,
     pub banner_message: Option<String>,
     banner_timer_for: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -182,6 +185,12 @@ impl BonLoginApp {
 
         let ext_file_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Path to .CRX or .ZIP file (or click Upload file to browse)")
+        });
+
+        let arrange_size_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Width,Height (e.g. 960,600)")
+                .default_value("960,600")
         });
 
         let search_sub = cx.subscribe_in(&search_input, window, {
@@ -327,6 +336,8 @@ impl BonLoginApp {
             batch_count_input,
             batch_os: PlatformType::MacOS,
             batch_brand: BrowserBrand::Chrome,
+            arrange_display_idx: 0,
+            arrange_size_input,
             banner_message: None,
             banner_timer_for: None,
             _subscriptions: vec![search_sub],
@@ -1811,6 +1822,114 @@ impl BonLoginApp {
         cx.notify();
     }
 
+    pub fn set_arrange_size_text(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.arrange_size_input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        cx.notify();
+    }
+
+    pub fn running_targets_for_arrange(&self) -> Vec<(u16, String)> {
+        let use_checked = self.profiles.iter().any(|p| {
+            self.checked_profile_ids.contains(&p.id)
+                && matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_)))
+        });
+        self.profiles
+            .iter()
+            .filter(|p| !use_checked || self.checked_profile_ids.contains(&p.id))
+            .filter_map(|p| match self.statuses.get(&p.id) {
+                Some(ProfileStatus::Running(info)) => Some((info.cdp_port, info.ws_url.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn arrange_open_browsers(&mut self, cx: &mut Context<Self>) {
+        let targets = self.running_targets_for_arrange();
+        if targets.is_empty() {
+            self.banner_message = Some("No open browsers to arrange".to_string());
+            cx.notify();
+            return;
+        }
+        let raw_size = self.arrange_size_input.read(cx).value().to_string();
+        let Some((win_w, win_h)) = crate::launcher::parse_window_size(&raw_size) else {
+            self.banner_message =
+                Some("Invalid window size (use Width,Height e.g. 960,600)".to_string());
+            cx.notify();
+            return;
+        };
+
+        let displays = cx.displays();
+        let disp_idx = self.arrange_display_idx.min(displays.len().saturating_sub(1));
+        self.arrange_display_idx = disp_idx;
+        let (mon_x, mon_y, mon_w, mon_h) = displays
+            .get(disp_idx)
+            .map(|d| {
+                let b = d.bounds();
+                (
+                    f32::from(b.origin.x) as i32,
+                    f32::from(b.origin.y) as i32,
+                    f32::from(b.size.width) as i32,
+                    f32::from(b.size.height) as i32,
+                )
+            })
+            .unwrap_or((0, 0, 1440, 900));
+
+        let placements = crate::launcher::compute_tile_bounds(
+            mon_x,
+            mon_y,
+            mon_w,
+            mon_h,
+            win_w,
+            win_h,
+            targets.len(),
+        );
+        let tokio_handle = self.tokio_handle.clone();
+        let disp_num = disp_idx + 1;
+        cx.spawn(async move |this, cx| {
+            let (ok_count, total, applied_w, applied_h) = tokio_handle
+                .spawn_blocking(move || {
+                    let total = targets.len();
+                    let (applied_w, applied_h) = placements
+                        .first()
+                        .map(|&(_, _, w, h)| (w, h))
+                        .unwrap_or((win_w, win_h));
+                    let ok_count = std::thread::scope(|s| {
+                        let handles: Vec<_> = targets
+                            .into_iter()
+                            .zip(placements)
+                            .map(|((cdp_port, ws_url), (left, top, w, h))| {
+                                s.spawn(move || {
+                                    crate::launcher::cdp_set_window_bounds(
+                                        cdp_port, &ws_url, left, top, w, h,
+                                    )
+                                    .is_ok()
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .filter_map(|h| h.join().ok().filter(|&ok| ok))
+                            .count()
+                    });
+                    (ok_count, total, applied_w, applied_h)
+                })
+                .await
+                .unwrap_or((0, 0, win_w, win_h));
+            let _ = this.update(cx, |app, cx| {
+                app.banner_message = Some(format!(
+                    "Arranged {ok_count}/{total} open browser(s) to {applied_w}×{applied_h} on Display {disp_num}"
+                ));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
 
     pub fn delete_profile(
         &mut self,
@@ -2933,6 +3052,27 @@ impl Render for BonLoginApp {
                                     .flex_shrink_0()
                                     .gap_2p5()
                                     .items_center()
+                                    .child({
+                                        let running_total = self
+                                            .statuses
+                                            .values()
+                                            .filter(|st| matches!(st, ProfileStatus::Running(_)))
+                                            .count();
+                                        let label = if running_total > 0 {
+                                            format!("{}  Arrange ({running_total})", SfSymbol::PC)
+                                        } else {
+                                            format!("{}  Arrange", SfSymbol::PC)
+                                        };
+                                        Button::new("top-arrange-windows")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .label(label)
+                                            .on_click(cx.listener(|app, _, _, cx| {
+                                                app.popup_modal =
+                                                    Some(ActivePopupModal::ArrangeWindows);
+                                                cx.notify();
+                                            }))
+                                    })
                                     .child(
                                         Button::new("top-quick-add")
                                             .with_variant(BonTheme::outline_blue(cx))
@@ -3111,6 +3251,27 @@ impl Render for BonLoginApp {
                                                                         app.stop_checked_profiles(
                                                                             cx,
                                                                         );
+                                                                    },
+                                                                ))
+                                                        },
+                                                    ))
+                                                    .children((checked_running_count > 0).then(
+                                                        || {
+                                                            Button::new("batch-arrange-sel")
+                                                                .with_variant(
+                                                                    BonTheme::outline_blue(cx),
+                                                                )
+                                                                .small()
+                                                                .label(format!(
+                                                                    "{}  Arrange {checked_running_count}",
+                                                                    SfSymbol::PC
+                                                                ))
+                                                                .on_click(cx.listener(
+                                                                    |app, _, _, cx| {
+                                                                        app.popup_modal = Some(
+                                                                            ActivePopupModal::ArrangeWindows,
+                                                                        );
+                                                                        cx.notify();
                                                                     },
                                                                 ))
                                                         },
