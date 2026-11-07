@@ -1,78 +1,109 @@
 ---
 name: bon-login-agent
-description: Control BonLogin anti-detect browser profiles via `bon-login` CLI and `agent-browser` without breaking C++ stealth fingerprints or leaking DNS/WebRTC.
+description: Full CLI control plane for BonLogin anti-detect browser (profiles, proxies, groups, tags, extensions, kernel, and `agent-browser` automation with Stealth Guardrails).
 ---
 
-# BonLogin + `agent-browser` Control Skill
+# BonLogin Full CLI & `agent-browser` Control Skill
 
-Use this skill whenever automating or inspecting anti-detect browser profiles managed by **BonLogin**.
+Every feature in **BonLogin** has a direct CLI subcommand that outputs structured JSON and syncs two-way with the GPUI desktop app.
 
-## 1. Headless CLI Control Plane (`bon-login`)
-
-Never launch `Chromium` or `agent-browser` standalone when working with a BonLogin profile—doing so bypasses `LocalProxyTunnel` (SOCKS5/HTTP auth + ATYP `0x03` remote DNS), Fail-Closed GeoIP verification, and `--fingerprint=<seed>`.
-
-Always use the `bon-login` binary (or `cargo run --release --`):
+## 1. Browser & Agent Control (`list`, `launch`, `stop`, `sync`, `agent`)
 
 ```bash
-# 1. List all profiles and live CDP / agent-browser sessions (JSON)
-bon-login list
+# List all profiles with live CDP / agent-browser status (JSON)
+bon-login list [--group <g>] [--search <q>]
 
-# 2. Launch a profile by short_id, session name (bon_<id8>), or profile name
-#    Automatically starts LocalProxyTunnel, verifies GeoIP (Fail-Closed),
-#    spawns adryfish Chromium 148, and connects `agent-browser --session bon_<id8> --input-mode human`
-bon-login launch <short_id_or_name> [--url https://example.com]
+# Launch a profile (or an entire group) with LocalProxyTunnel + Fail-Closed GeoIP + adryfish Chromium 148
+bon-login launch <short_id|name|--group <g>> [--pin-tab <tag>] [--url <url>]
 
-# 3. Create an isolated pinned-tab session for multi-agent parallel work on the same profile
-bon-login launch <short_id_or_name> --pin-tab worker1 --url https://x.com
+# Run agent-browser with Stealth Guardrails (auto-launches profile if stopped)
+bon-login agent <short_id|name> snapshot -i -c
+bon-login agent <short_id|name> batch --bail 'fill @e2 "user"' 'click @e3'
 
-# 4. Run agent-browser with Stealth Guardrails (auto-launches profile if stopped)
-bon-login agent <short_id_or_name> snapshot -i -c
+# Re-sync newly opened OAuth popups / Web3 extension windows into agent-browser tabs
+bon-login sync <short_id|name>
 
-# 5. Re-sync newly opened OAuth popups or Web3 extension windows into agent-browser tabs
-bon-login sync <short_id_or_name>
-
-# 6. Gracefully stop a profile (SIGTERM -> flushes SQLite cookies -> closes tunnel & daemon)
-bon-login stop <short_id_or_name>
-bon-login stop --all
+# Stop running profile(s) gracefully (SIGTERM -> flush SQLite cookies -> close tunnel & daemon)
+bon-login stop <short_id|name|--group <g>|--all>
 ```
 
-## 2. Fast `agent-browser` Patterns (`--session bon_<id8>`)
+## 2. Profile Management (`bon-login profile ...`)
 
-Once launched, each profile is bound to session `bon_<id8>` with `--input-mode human`, `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, and isolated downloads in `~/Library/Application Support/com.bonlogin.app/downloads/bon_<id8>/`.
+```bash
+bon-login profile list [--group <g>] [--search <q>]
+bon-login profile show <id|name>
 
-- **Semantic Accessibility Snapshot (80–95% fewer tokens than HTML):**
-  ```bash
-  agent-browser --session bon_<id8> snapshot -i -c
-  ```
-- **Batch Form Fill & Click in One Round-Trip:**
-  ```bash
-  agent-browser --session bon_<id8> batch --bail \
-    'fill @e2 "user@example.com"' \
-    'fill @e3 "secret"' \
-    'click @e4'
-  ```
-- **Set-of-Mark (SoM) Visual Annotation for Canvas / Captcha / WebGL:**
-  ```bash
-  agent-browser --session bon_<id8> screenshot --annotate
-  ```
-- **Interacting with Chrome Extensions & Wallets (MetaMask, Phantom, CapSolver):**
-  BonLogin patches unpacked extensions so popup/options pages work as normal tabs while `chrome.tabs.query({active: true})` still resolves the active web tab:
-  ```bash
-  bon-login sync <id8>
-  agent-browser --session bon_<id8> tab
-  ```
+# Create profile (proxies are assigned from Proxy Manager via --proxy or --proxy-tag)
+bon-login profile create "FB Ads US 01" --os windows --brand chrome --group Facebook --proxy-tag US-Resi
 
-## 3. Stealth Guardrails (NEVER Run These Commands)
+# Update single profile, a whole group, or --all
+bon-login profile update <id|name|--group <g>|--all> \
+  [--name <n>] [--os macos|windows|linux] [--brand chrome|edge|brave|opera] \
+  [--group <g|none>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>] \
+  [--seed <u32|random>] [--cores <n>] [--gpu native|seed] \
+  [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off] \
+  [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>] \
+  [--startup-url <url>] [--notes <txt>]
 
-`adryfish/fingerprint-chromium` spoofs hardware, screen, UA, Client Hints, WebGL, Audio, and Timezone at the **C++ Blink/V8 layer**.
+# Clone & Batch Create
+bon-login profile clone <id|name> [--count 5] [--name "ClonePrefix"]
+bon-login profile batch-create --count 10 --prefix "TikTok" --group TikTok --os windows --proxy-tag VN-ISP
 
-**NEVER** invoke the following `agent-browser` commands/flags on a BonLogin session, because they trigger CDP `Emulation.*` or `Network.*` overrides detectable by CreepJS, BrowserScan, Cloudflare Turnstile, and DataDome:
+# Check Proxy, Cookies/State Import & Export, Wipe, Delete, Backup & Restore
+bon-login profile check-proxy <id|name|--all>
+bon-login profile export-cookies <id|name> [--out ./state.json]
+bon-login profile import-cookies <id|name> <./cookies.json_or_raw_json>
+bon-login profile wipe <id|name>
+bon-login profile delete <id|name|--group <g>|--all>
+bon-login profile backup [--out ./backup.json]
+bon-login profile restore ./backup.json
+```
 
-- ❌ `agent-browser set viewport ...`
-- ❌ `agent-browser set device ...`
-- ❌ `agent-browser set geo ...`
-- ❌ `agent-browser set media ...`
-- ❌ `agent-browser set headers ...`
-- ❌ `agent-browser --user-agent ...` / `--proxy ...` / `--args ...`
+## 3. Proxy Manager (`bon-login proxy ...`)
 
-(`bon-login agent <id8> ...` automatically blocks these forbidden flags/subcommands.)
+```bash
+bon-login proxy list [--tag <t>]
+
+# Add single proxy or import multi-line proxy file (supports host:port:user:pass:name, socks5://user:pass@host:port)
+bon-login proxy add "socks5:160.250.60.55:45042:user1:pass1:VN Proxy 01" --tag VN-ISP --expire +30d
+bon-login proxy add ./proxies.txt --protocol socks5 --tag US-Resi --expire 24/12/2026
+
+# Check live GeoIP & latency through LocalProxyTunnel
+bon-login proxy check <id|name|--tag <t>|--all>
+
+# Extend expiration (+days), Assign to profiles (round-robin if --tag), or Delete
+bon-login proxy extend <id|name|--tag <t>|--all> +30d
+bon-login proxy assign <proxy_id|name|--tag <t>> --to <profile_id|name|--group <g>|--all>
+bon-login proxy delete <id|name|--tag <t>|--all>
+```
+
+## 4. Groups & Proxy Tags (`bon-login group ...` / `bon-login tag ...`)
+
+```bash
+bon-login group list
+bon-login group add "AirDrop"
+bon-login group move <profile_id|name> "AirDrop"
+bon-login group delete "AirDrop"
+
+bon-login tag list
+bon-login tag add "US-Resi"
+bon-login tag delete "US-Resi"
+```
+
+## 5. Extensions (`bon-login ext ...`) & Kernel (`bon-login kernel ...`)
+
+```bash
+bon-login ext list
+bon-login ext enable <id|name>
+bon-login ext disable <id|name>
+bon-login ext add <local_crx_zip_dir_or_chrome_store_url_or_32char_id>
+bon-login ext remove <id|name>
+bon-login ext open <ext_id|name> --profile <profile_id|name>
+
+bon-login kernel status
+bon-login kernel install
+```
+
+## 6. Stealth Guardrails
+
+Never call `agent-browser set viewport|device|geo|media|headers` or `--user-agent|--proxy|--args` on a BonLogin profile—those invoke CDP `Emulation.*` overrides that expose automation on BrowserScan/CreepJS. Always mutate fingerprint or proxy settings via `bon-login profile update` instead.

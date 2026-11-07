@@ -1,4 +1,7 @@
-use crate::models::{BrowserExtension, GeoInfo, Profile, RuntimeInfo, unix_now};
+use crate::models::{
+    BrowserBrand, BrowserExtension, GeoInfo, GpuSpoofMode, PlatformType, Profile, ProxyConfig,
+    ProxyProtocol, RuntimeInfo, SavedProxy, unix_now,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1426,19 +1429,18 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
         }
     }
 
-    let _ = std::fs::remove_file(&rt_path);
-    let _ = std::fs::remove_file(&active_port_path);
-
-    if !short_id.is_empty() {
+    let removed_files =
+        std::fs::remove_file(&rt_path).is_ok() || std::fs::remove_file(&active_port_path).is_ok();
+    if (stopped_any || removed_files) && !short_id.is_empty() {
         let session = format!("bon_{short_id}");
-        let _ = agent_browser_cmd()
+        let _ = agent_browser_cmd_for_short_id(short_id)
             .args(["--session", &session, "close"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
-    stopped_any
+    stopped_any || removed_files
 }
 
 pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
@@ -2089,8 +2091,17 @@ pub fn agent_sync_targets(short_id: &str, ws_url: &str) -> Result<serde_json::Va
 
 /// Blocks `agent-browser` commands/flags that invoke CDP `Emulation.*` or override BonLogin's C++ stealth fingerprint.
 pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
-    for (idx, arg) in args.iter().enumerate() {
-        let lower = arg.to_ascii_lowercase();
+    let flat_tokens: Vec<String> = args
+        .iter()
+        .flat_map(|a| a.split_whitespace())
+        .map(|s| {
+            s.trim_matches(['"', '\'', ';', ','])
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for (idx, lower) in flat_tokens.iter().enumerate() {
         for forbidden_flag in [
             "--user-agent",
             "--proxy",
@@ -2102,12 +2113,12 @@ pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
         ] {
             if lower == forbidden_flag || lower.starts_with(&format!("{forbidden_flag}=")) {
                 bail!(
-                    "Blocked by BonLogin Stealth Guardrail: flag '{arg}' overrides C++ fingerprint/proxy tunnel. Configure this in BonLogin Profile Settings instead."
+                    "Blocked by BonLogin Stealth Guardrail: flag '{lower}' overrides C++ fingerprint/proxy tunnel. Configure this in BonLogin Profile Settings instead."
                 );
             }
         }
         if lower == "set"
-            && let Some(sub) = args.get(idx + 1).map(|s| s.to_ascii_lowercase())
+            && let Some(sub) = flat_tokens.get(idx + 1)
             && matches!(
                 sub.as_str(),
                 "viewport" | "device" | "geo" | "media" | "headers"
@@ -2124,7 +2135,7 @@ pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
 /// Opens an extension popup/options page inside a running profile via `agent-browser --session bon_<id> tab new <url>`.
 pub fn agent_open_extension_tab(short_id: &str, ws_url: &str, ext_url: &str) -> Result<String> {
     let session = ensure_agent_browser_connected(short_id, ws_url)?;
-    let out = agent_browser_cmd()
+    let out = agent_browser_cmd_for_short_id(short_id)
         .args(["--session", &session, "tab", "new", ext_url])
         .output()?;
     if !out.status.success() {
@@ -2186,7 +2197,7 @@ pub fn agent_export_state(short_id: &str, ws_url: &str) -> Result<(PathBuf, Stri
     std::fs::create_dir_all(&dir)?;
     let state_path = dir.join(format!("bon_{short_id}_state.json"));
 
-    let out = agent_browser_cmd()
+    let out = agent_browser_cmd_for_short_id(short_id)
         .args([
             "--session",
             &session,
@@ -2234,7 +2245,7 @@ pub fn agent_import_state_or_cookies(
     let is_full_state = content.contains("\"cookies\"") && content.contains("\"origins\"");
 
     let out = if is_full_state {
-        agent_browser_cmd()
+        agent_browser_cmd_for_short_id(short_id)
             .args([
                 "--session",
                 &session,
@@ -2244,7 +2255,7 @@ pub fn agent_import_state_or_cookies(
             ])
             .output()?
     } else {
-        agent_browser_cmd()
+        agent_browser_cmd_for_short_id(short_id)
             .args([
                 "--session",
                 &session,
@@ -2269,7 +2280,7 @@ pub fn agent_import_state_or_cookies(
 }
 
 // ---------------------------------------------------------------------------
-// Headless CLI Control Plane for AI Agents (`bon-login list|launch|stop|sync|agent`)
+// Full Headless CLI Control Plane (`bon-login <command> ...`)
 // ---------------------------------------------------------------------------
 
 fn find_profile_by_query<'a>(profiles: &'a [Profile], query: &str) -> Result<&'a Profile> {
@@ -2290,6 +2301,273 @@ fn find_profile_by_query<'a>(profiles: &'a [Profile], query: &str) -> Result<&'a
         .iter()
         .find(|p| p.name.to_ascii_lowercase().contains(&q_lower))
         .ok_or_else(|| anyhow!("No profile found matching '{query}'"))
+}
+
+fn find_saved_proxy_by_query<'a>(proxies: &'a [SavedProxy], query: &str) -> Result<&'a SavedProxy> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Proxy identifier or name is required");
+    }
+    if let Some(p) = proxies.iter().find(|p| {
+        let sid: String = p
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        p.id.eq_ignore_ascii_case(q)
+            || sid.eq_ignore_ascii_case(q)
+            || p.name.eq_ignore_ascii_case(q)
+            || p.config.display_short().eq_ignore_ascii_case(q)
+    }) {
+        return Ok(p);
+    }
+    let q_lower = q.to_ascii_lowercase();
+    proxies
+        .iter()
+        .find(|p| {
+            p.name.to_ascii_lowercase().contains(&q_lower)
+                || p.config.host.to_ascii_lowercase().contains(&q_lower)
+        })
+        .ok_or_else(|| anyhow!("No saved proxy found matching '{query}' in Proxy Manager"))
+}
+
+fn find_extension_by_query<'a>(
+    exts: &'a [BrowserExtension],
+    query: &str,
+) -> Result<&'a BrowserExtension> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Extension ID or name is required");
+    }
+    if let Some(e) = exts.iter().find(|e| {
+        e.id.eq_ignore_ascii_case(q)
+            || e.name.eq_ignore_ascii_case(q)
+            || (!e.source_url.is_empty() && e.source_url.eq_ignore_ascii_case(q))
+    }) {
+        return Ok(e);
+    }
+    let q_lower = q.to_ascii_lowercase();
+    exts.iter()
+        .find(|e| {
+            e.id.to_ascii_lowercase().contains(&q_lower)
+                || e.name.to_ascii_lowercase().contains(&q_lower)
+        })
+        .ok_or_else(|| anyhow!("No extension found matching '{query}'"))
+}
+
+fn parse_bool_flag(val: &str) -> Result<bool> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enable" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "no" | "disable" | "disabled" => Ok(false),
+        other => bail!("Invalid boolean value '{other}' (expected on/off or true/false)"),
+    }
+}
+
+pub fn apply_profile_cli_flags(
+    profile: &mut Profile,
+    saved_proxies: &[SavedProxy],
+    flags: &[String],
+) -> Result<()> {
+    let mut idx = 0;
+    while idx < flags.len() {
+        let key = flags[idx].as_str();
+        let next_val = || -> Result<&str> {
+            flags
+                .get(idx + 1)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow!("Missing value for flag '{key}'"))
+        };
+        match key {
+            "--name" => {
+                profile.name = next_val()?.trim().to_string();
+                idx += 2;
+            }
+            "--group" => {
+                let g = next_val()?.trim();
+                profile.group_tag = if g.eq_ignore_ascii_case("none") {
+                    String::new()
+                } else {
+                    g.to_string()
+                };
+                idx += 2;
+            }
+            "--os" => {
+                let os = PlatformType::from_str_lossy(next_val()?);
+                profile.os_platform = os;
+                profile.os_version = os.os_version_for_seed(profile.seed).to_string();
+                profile.hardware_concurrency = os.optimal_cores_for_seed(profile.seed);
+                profile.window_size = os.default_window_size().to_string();
+                idx += 2;
+            }
+            "--brand" => {
+                let b = BrowserBrand::from_str_lossy(next_val()?);
+                profile.brand = b;
+                profile.brand_version = b.version_for_seed(profile.seed).to_string();
+                idx += 2;
+            }
+            "--seed" => {
+                let raw = next_val()?.trim();
+                let new_seed: u32 = if raw.eq_ignore_ascii_case("random") {
+                    rand::random::<u32>().max(1000)
+                } else {
+                    raw.parse().context("Invalid --seed integer")?
+                };
+                profile.seed = new_seed;
+                profile.os_version = profile
+                    .os_platform
+                    .os_version_for_seed(new_seed)
+                    .to_string();
+                profile.brand_version = profile.brand.version_for_seed(new_seed).to_string();
+                idx += 2;
+            }
+            "--cores" => {
+                profile.hardware_concurrency =
+                    next_val()?.trim().parse().context("Invalid --cores")?;
+                idx += 2;
+            }
+            "--gpu" => {
+                let v = next_val()?.trim().to_ascii_lowercase();
+                profile.gpu_spoofing = if v == "native" || v == "passthrough" {
+                    GpuSpoofMode::NativePassthrough
+                } else {
+                    GpuSpoofMode::SeedGenerated
+                };
+                idx += 2;
+            }
+            "--canvas" => {
+                profile.spoof_canvas = parse_bool_flag(next_val()?)?;
+                idx += 2;
+            }
+            "--audio" => {
+                profile.spoof_audio = parse_bool_flag(next_val()?)?;
+                idx += 2;
+            }
+            "--font" => {
+                profile.spoof_font = parse_bool_flag(next_val()?)?;
+                idx += 2;
+            }
+            "--rects" => {
+                profile.spoof_client_rects = parse_bool_flag(next_val()?)?;
+                idx += 2;
+            }
+            "--window-size" => {
+                profile.window_size = next_val()?.trim().to_string();
+                idx += 2;
+            }
+            "--timezone" => {
+                let tz = next_val()?.trim();
+                profile.custom_timezone =
+                    (!tz.is_empty() && !tz.eq_ignore_ascii_case("auto")).then(|| tz.to_string());
+                idx += 2;
+            }
+            "--locale" => {
+                let loc = next_val()?.trim();
+                profile.custom_locale =
+                    (!loc.is_empty() && !loc.eq_ignore_ascii_case("auto")).then(|| loc.to_string());
+                idx += 2;
+            }
+            "--startup-url" | "--url" => {
+                profile.startup_url = next_val()?.trim().to_string();
+                idx += 2;
+            }
+            "--notes" => {
+                profile.notes = next_val()?.to_string();
+                idx += 2;
+            }
+            "--proxy" => {
+                let p_q = next_val()?.trim();
+                if p_q.is_empty()
+                    || p_q.eq_ignore_ascii_case("none")
+                    || p_q.eq_ignore_ascii_case("direct")
+                {
+                    profile.proxy = None;
+                    profile.resolved_geo = None;
+                } else {
+                    let sp = find_saved_proxy_by_query(saved_proxies, p_q)?;
+                    profile.proxy = Some(sp.config.clone());
+                    profile.resolved_geo = sp.resolved_geo.clone();
+                }
+                idx += 2;
+            }
+            "--proxy-tag" => {
+                let tag = next_val()?.trim().trim_start_matches('#');
+                let pool: Vec<&SavedProxy> = saved_proxies
+                    .iter()
+                    .filter(|sp| sp.group_tag.eq_ignore_ascii_case(tag))
+                    .collect();
+                if pool.is_empty() {
+                    bail!("No saved proxies found in Proxy Manager with tag '{tag}'");
+                }
+                let chosen = pool[(profile.seed as usize) % pool.len()];
+                profile.proxy = Some(chosen.config.clone());
+                profile.resolved_geo = chosen.resolved_geo.clone();
+                idx += 2;
+            }
+            other => bail!("Unknown profile flag '{other}'"),
+        }
+    }
+    Ok(())
+}
+
+fn profile_summary_json(p: &Profile) -> serde_json::Value {
+    let sid = p.short_id();
+    let session = format!("bon_{sid}");
+    let live = probe_live_runtime(&p.id);
+    serde_json::json!({
+        "id": p.id,
+        "short_id": sid,
+        "session": session,
+        "name": p.name,
+        "group": p.group_tag,
+        "seed": p.seed,
+        "os": p.os_platform.as_cli_str(),
+        "os_version": p.os_version,
+        "brand": p.brand.as_cli_str(),
+        "brand_version": p.brand_version,
+        "cores": p.hardware_concurrency,
+        "gpu": p.gpu_spoofing.as_str(),
+        "window_size": p.window_size,
+        "proxy": p.proxy.as_ref().map(|px| px.display_short()).unwrap_or_else(|| "Direct".to_string()),
+        "geo": p.resolved_geo.as_ref().map(|g| serde_json::json!({
+            "ip": g.ip,
+            "country": g.country_code,
+            "timezone": g.timezone,
+            "locale": g.locale,
+            "latency_ms": g.latency_ms,
+        })),
+        "startup_url": p.startup_url,
+        "notes": p.notes,
+        "running": live.is_some(),
+        "pid": live.as_ref().map(|r| r.pid),
+        "cdp_port": live.as_ref().map(|r| r.cdp_port),
+        "ws_url": live.as_ref().map(|r| r.ws_url.clone()),
+        "download_dir": profile_download_dir(&sid),
+        "cli": format!("agent-browser --session {session} snapshot -i -c"),
+    })
+}
+
+fn saved_proxy_summary_json(p: &SavedProxy) -> serde_json::Value {
+    let sid: String = p
+        .id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    serde_json::json!({
+        "id": p.id,
+        "short_id": sid,
+        "name": p.name,
+        "tag": p.group_tag,
+        "protocol": p.config.protocol.as_str(),
+        "host": p.config.host,
+        "port": p.config.port,
+        "has_auth": p.config.username.is_some(),
+        "geo": p.resolved_geo,
+        "last_error": p.last_error,
+        "expired_at": p.expired_at,
+        "expired_label": p.format_expired_at(),
+    })
 }
 
 pub fn ensure_profile_launched_via_supervisor(
@@ -2342,8 +2620,59 @@ pub fn ensure_profile_launched_via_supervisor(
     bail!("Timed out (12s) waiting for profile '{}' to launch", profile.name)
 }
 
-/// Executes CLI subcommands (`list`, `launch`, `stop`, `sync`, `agent`, `--hold-profile`, `--help`)
-/// when invoked with arguments, returning `Some(Result)` so `main()` can exit without opening GPUI.
+async fn check_proxy_config_live(cfg: &ProxyConfig) -> Result<GeoInfo> {
+    let mut tun = crate::proxy_tunnel::LocalProxyTunnel::start(cfg.clone()).await?;
+    let port = tun.local_port();
+    let res = crate::geoip::resolve_geo_via_port(Some(port)).await;
+    tun.stop();
+    res
+}
+
+fn print_cli_help() {
+    println!(
+        "BonLogin — Full CLI & Agent-Browser Control Plane\n\n\
+         BROWSER & AGENT CONTROL:\n  \
+           bon-login                                                     Open GPUI Desktop App\n  \
+           bon-login list [--group <g>] [--search <q>]                   List profiles & live CDP/Agent status (JSON)\n  \
+           bon-login launch <id|name|--group <g>> [--pin-tab <t>] [--url <u>] Launch profile(s) & connect agent-browser\n  \
+           bon-login stop <id|name|--group <g>|--all>                    Stop running profile(s) & flush cookies\n  \
+           bon-login sync <id|name>                                      Sync OAuth popups & extension windows into tabs\n  \
+           bon-login agent <id|name> <agent-browser args...>             Run agent-browser with Stealth Guardrails\n\n\
+         PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
+           bon-login profile list [--group <g>] [--search <q>]\n  \
+           bon-login profile show <id|name>\n  \
+           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge|brave|opera]\n                            [--group <g>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>]\n                            [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>]\n  \
+           bon-login profile update <id|name|--group <g>|--all> [same flags as create]\n  \
+           bon-login profile clone <id|name> [--count <n>] [--name <prefix>]\n  \
+           bon-login profile batch-create --count <n> [--prefix <p>] [--group <g>] [--os <os>] [--brand <b>] [--proxy-tag <tag>]\n  \
+           bon-login profile check-proxy <id|name|--all>\n  \
+           bon-login profile export-cookies <id|name> [--out <file>]\n  \
+           bon-login profile import-cookies <id|name> <file_or_json>\n  \
+           bon-login profile wipe <id|name>\n  \
+           bon-login profile delete <id|name|--group <g>|--all>\n  \
+           bon-login profile backup [--out <file>]\n  \
+           bon-login profile restore <file>\n\n\
+         PROXY MANAGER (`bon-login proxy ...`):\n  \
+           bon-login proxy list [--tag <t>]\n  \
+           bon-login proxy add <raw_proxy_or_file> [--protocol http|socks5] [--tag <t>] [--name <n>] [--expire <days_or_date>]\n  \
+           bon-login proxy check <id|name|--tag <t>|--all>\n  \
+           bon-login proxy extend <id|name|--tag <t>|--all> <days>\n  \
+           bon-login proxy assign <proxy_id_or_name|--tag <t>> --to <profile_id|name|--group <g>|--all>\n  \
+           bon-login proxy delete <id|name|--tag <t>|--all>\n\n\
+         GROUPS & TAGS (`bon-login group ...` / `bon-login tag ...`):\n  \
+           bon-login group list | add <name> | delete <name> | move <profile_id|name> <group>\n  \
+           bon-login tag list   | add <name> | delete <name>\n\n\
+         EXTENSIONS (`bon-login ext ...`):\n  \
+           bon-login ext list\n  \
+           bon-login ext enable <id|name> | disable <id|name>\n  \
+           bon-login ext add <file_or_folder_or_store_url_or_id>\n  \
+           bon-login ext remove <id|name>\n  \
+           bon-login ext open <ext_id|name> --profile <profile_id|name>\n\n\
+         KERNEL (`bon-login kernel ...`):\n  \
+           bon-login kernel status | install"
+    );
+}
+
 pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first()?.as_str();
@@ -2354,7 +2683,7 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 let profile_id = args
                     .get(1)
                     .ok_or_else(|| anyhow!("Missing profile_id for --hold-profile"))?;
-                let db = crate::db::Database::open_fast()?;
+                let db = crate::db::Database::open_default()?;
                 let profiles = db.list_profiles()?;
                 let profile = find_profile_by_query(&profiles, profile_id)?.clone();
                 let err_file = launch_error_file_path(&profile.id);
@@ -2378,142 +2707,33 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                     }
                 }
             }
-            "list" | "ls" => {
-                let db = crate::db::Database::open_fast()?;
-                let profiles = db.list_profiles()?;
-                let items: Vec<serde_json::Value> = profiles
-                    .iter()
-                    .map(|p| {
-                        let sid = p.short_id();
-                        let session = format!("bon_{sid}");
-                        let live = probe_live_runtime(&p.id);
-                        serde_json::json!({
-                            "id": p.id,
-                            "short_id": sid,
-                            "session": session,
-                            "name": p.name,
-                            "group": p.group_tag,
-                            "os": p.os_platform.as_cli_str(),
-                            "brand": p.brand.as_cli_str(),
-                            "proxy": p.proxy.as_ref().map(|px| px.display_short()).unwrap_or_else(|| "Direct".to_string()),
-                            "running": live.is_some(),
-                            "pid": live.as_ref().map(|r| r.pid),
-                            "cdp_port": live.as_ref().map(|r| r.cdp_port),
-                            "ws_url": live.as_ref().map(|r| r.ws_url.clone()),
-                            "download_dir": profile_download_dir(&sid),
-                            "cli": format!("agent-browser --session {session} snapshot -i -c"),
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&items)?);
-                Ok(())
-            }
-            "launch" | "start" => {
-                let target = args
-                    .get(1)
-                    .filter(|s| !s.starts_with('-'))
-                    .ok_or_else(|| anyhow!("Usage: bon-login launch <short_id|name> [--pin-tab <tag>] [--url <url>]"))?;
-                let mut pin_tab: Option<String> = None;
-                let mut open_url: Option<String> = None;
-                let mut idx = 2;
-                while idx < args.len() {
-                    match args[idx].as_str() {
-                        "--pin-tab" => {
-                            pin_tab = args.get(idx + 1).cloned();
-                            idx += 2;
-                        }
-                        "--url" => {
-                            open_url = args.get(idx + 1).cloned();
-                            idx += 2;
-                        }
-                        _ => idx += 1,
-                    }
-                }
-                let db = crate::db::Database::open_fast()?;
-                let profiles = db.list_profiles()?;
-                let profile = find_profile_by_query(&profiles, target)?.clone();
-                let short_id = profile.short_id();
-                let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
-                let session = if let Some(tag) = &pin_tab {
-                    ensure_agent_browser_pinned_tab(&short_id, tag, &info.ws_url, open_url.as_deref())?
-                } else {
-                    let s = ensure_agent_browser_connected(&short_id, &info.ws_url)?;
-                    if let Some(u) = open_url.as_deref().filter(|u| !u.trim().is_empty()) {
-                        let _ = agent_browser_cmd_for_short_id(&short_id)
-                            .args(["--session", &s, "open", u.trim()])
-                            .output();
-                    }
-                    s
-                };
-                let out = serde_json::json!({
-                    "ok": true,
-                    "id": profile.id,
-                    "short_id": short_id,
-                    "session": session,
-                    "name": profile.name,
-                    "pid": info.pid,
-                    "cdp_port": info.cdp_port,
-                    "ws_url": info.ws_url,
-                    "local_proxy_port": info.local_proxy_port,
-                    "download_dir": profile_download_dir(&short_id),
-                    "cli": format!("agent-browser --session {session} snapshot -i -c"),
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
-                Ok(())
-            }
-            "stop" | "close" => {
-                let target = args
-                    .get(1)
-                    .ok_or_else(|| anyhow!("Usage: bon-login stop <short_id|name|--all>"))?;
-                let db = crate::db::Database::open_fast()?;
-                let profiles = db.list_profiles()?;
-                let mut stopped = Vec::new();
-                if target == "--all" || target == "all" {
-                    for p in &profiles {
-                        if probe_live_runtime(&p.id).is_some()
-                            || stop_external_runtime(&p.id, &p.short_id())
-                        {
-                            let _ = stop_external_runtime(&p.id, &p.short_id());
-                            stopped.push(p.short_id());
-                        }
-                    }
-                } else {
-                    let p = find_profile_by_query(&profiles, target)?;
-                    stop_external_runtime(&p.id, &p.short_id());
-                    stopped.push(p.short_id());
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
-                        "stopped": stopped,
-                    }))?
-                );
-                Ok(())
-            }
+            "list" | "ls" => run_profile_list_cli(&args[1..]),
+            "launch" | "start" => run_launch_cli(&args[1..]),
+            "stop" | "close" => run_stop_cli(&args[1..]),
             "sync" => {
                 let target = args
                     .get(1)
                     .ok_or_else(|| anyhow!("Usage: bon-login sync <short_id|name>"))?;
-                let db = crate::db::Database::open_fast()?;
+                let db = crate::db::Database::open_default()?;
                 let profiles = db.list_profiles()?;
                 let p = find_profile_by_query(&profiles, target)?;
-                let info = probe_live_runtime(&p.id)
-                    .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
+                let info = probe_live_runtime(&p.id).ok_or_else(|| {
+                    anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id())
+                })?;
                 let res = agent_sync_targets(&p.short_id(), &info.ws_url)?;
                 println!("{}", serde_json::to_string_pretty(&res)?);
                 Ok(())
             }
             "agent" | "ab" => {
-                let target = args
-                    .get(1)
-                    .ok_or_else(|| anyhow!("Usage: bon-login agent <short_id|name> <agent-browser args...>"))?;
+                let target = args.get(1).ok_or_else(|| {
+                    anyhow!("Usage: bon-login agent <short_id|name> <agent-browser args...>")
+                })?;
                 let rest = &args[2..];
                 if rest.is_empty() {
                     bail!("Usage: bon-login agent <short_id|name> <agent-browser args...>");
                 }
                 validate_stealth_agent_args(rest)?;
-                let db = crate::db::Database::open_fast()?;
+                let db = crate::db::Database::open_default()?;
                 let profiles = db.list_profiles()?;
                 let profile = find_profile_by_query(&profiles, target)?.clone();
                 let short_id = profile.short_id();
@@ -2529,22 +2749,1087 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 }
                 Ok(())
             }
+            "profile" | "profiles" => run_profile_subcommand(tokio_handle, &args[1..]),
+            "proxy" | "proxies" => run_proxy_subcommand(tokio_handle, &args[1..]),
+            "group" | "groups" => run_group_subcommand(&args[1..]),
+            "tag" | "tags" => run_tag_subcommand(&args[1..]),
+            "ext" | "extension" | "extensions" => run_ext_subcommand(tokio_handle, &args[1..]),
+            "kernel" => run_kernel_subcommand(&args[1..]),
             "--help" | "-h" | "help" => {
-                println!(
-                    "BonLogin — Anti-Detect Browser & Agent-Browser Control Plane\n\n\
-                     Usage:\n  \
-                       bon-login                                           Open GPUI Desktop App\n  \
-                       bon-login list                                      List all profiles & live CDP/Agent sessions (JSON)\n  \
-                       bon-login launch <id|name> [--pin-tab <tag>] [--url <u >] Launch profile (Fail-Closed GeoIP + Tunnel) & connect agent-browser\n  \
-                       bon-login stop <id|name|--all>                      Stop running profile(s) & flush SQLite cookies\n  \
-                       bon-login sync <id|name>                            Sync OAuth popups & extension windows into agent-browser tabs\n  \
-                       bon-login agent <id|name> <agent-browser args...>   Run agent-browser with Stealth Guardrails (auto-launches if stopped)"
-                );
+                print_cli_help();
                 Ok(())
             }
             other => bail!("Unknown command '{other}'. Run `bon-login --help` for usage."),
         }
     })())
+}
+
+fn run_profile_list_cli(args: &[String]) -> Result<()> {
+    let mut group_filter: Option<String> = None;
+    let mut search_query = String::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--group" => {
+                group_filter = args.get(idx + 1).cloned();
+                idx += 2;
+            }
+            "--search" | "-q" => {
+                search_query = args.get(idx + 1).cloned().unwrap_or_default();
+                idx += 2;
+            }
+            _ => idx += 1,
+        }
+    }
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let items: Vec<serde_json::Value> = profiles
+        .iter()
+        .filter(|p| p.matches_filter(&search_query, group_filter.as_deref()))
+        .map(profile_summary_json)
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&items)?);
+    Ok(())
+}
+
+fn run_launch_cli(args: &[String]) -> Result<()> {
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let (targets, consumed) = select_profiles_by_target(&profiles, args).map_err(|_| {
+        anyhow!("Usage: bon-login launch <short_id|name|--group <g>|--all> [--pin-tab <tag>] [--url <url>]")
+    })?;
+    let mut pin_tab: Option<String> = None;
+    let mut open_url: Option<String> = None;
+    let mut idx = consumed;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--pin-tab" => {
+                pin_tab = args.get(idx + 1).cloned();
+                idx += 2;
+            }
+            "--url" => {
+                open_url = args.get(idx + 1).cloned();
+                idx += 2;
+            }
+            _ => idx += 1,
+        }
+    }
+    let mut results = Vec::new();
+    for profile in targets {
+        let short_id = profile.short_id();
+        let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
+        let session = if let Some(tag) = &pin_tab {
+            ensure_agent_browser_pinned_tab(&short_id, tag, &info.ws_url, open_url.as_deref())?
+        } else {
+            let s = ensure_agent_browser_connected(&short_id, &info.ws_url)?;
+            if let Some(u) = open_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                let _ = agent_browser_cmd_for_short_id(&short_id)
+                    .args(["--session", &s, "open", u.trim()])
+                    .output();
+            }
+            s
+        };
+        results.push(serde_json::json!({
+            "ok": true,
+            "id": profile.id,
+            "short_id": short_id,
+            "session": session,
+            "name": profile.name,
+            "pid": info.pid,
+            "cdp_port": info.cdp_port,
+            "ws_url": info.ws_url,
+            "local_proxy_port": info.local_proxy_port,
+            "download_dir": profile_download_dir(&short_id),
+            "cli": format!("agent-browser --session {session} snapshot -i -c"),
+        }));
+    }
+    if results.len() == 1 {
+        println!("{}", serde_json::to_string_pretty(&results[0])?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    }
+    Ok(())
+}
+
+fn run_stop_cli(args: &[String]) -> Result<()> {
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let is_all = args
+        .first()
+        .is_some_and(|f| f == "--all" || f == "all");
+    let (targets, _) = select_profiles_by_target(&profiles, args).map_err(|_| {
+        anyhow!("Usage: bon-login stop <short_id|name|--group <g>|--all>")
+    })?;
+    let mut stopped = Vec::new();
+    for p in &targets {
+        let did_stop = stop_external_runtime(&p.id, &p.short_id());
+        if did_stop || !is_all {
+            stopped.push(p.short_id());
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "stopped": stopped,
+        }))?
+    );
+    Ok(())
+}
+
+fn select_profiles_by_target(
+    profiles: &[Profile],
+    args: &[String],
+) -> Result<(Vec<Profile>, usize)> {
+    let first = args
+        .first()
+        .ok_or_else(|| anyhow!("Missing profile target (<id|name|--group <g>|--all>)"))?;
+    if first == "--all" || first == "all" {
+        return Ok((profiles.to_vec(), 1));
+    }
+    if first == "--group" {
+        let g = args
+            .get(1)
+            .ok_or_else(|| anyhow!("Missing group name after --group"))?;
+        let matched: Vec<Profile> = profiles
+            .iter()
+            .filter(|p| p.group_tag.eq_ignore_ascii_case(g))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            bail!("No profiles found in group '{g}'");
+        }
+        return Ok((matched, 2));
+    }
+    let mut out = Vec::new();
+    for token in first.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(find_profile_by_query(profiles, token)?.clone());
+    }
+    Ok((out, 1))
+}
+
+fn run_profile_subcommand(
+    tokio_handle: &tokio::runtime::Handle,
+    args: &[String],
+) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[] } else { &args[1..] };
+    let db = crate::db::Database::open_default()?;
+
+    match sub {
+        "list" | "ls" => run_profile_list_cli(rest),
+        "show" | "info" | "get" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile show <id|name>"))?;
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            let mut val = serde_json::to_value(p)?;
+            if let Some(obj) = val.as_object_mut() {
+                if let Some(proxy_obj) = obj.get_mut("proxy").and_then(|v| v.as_object_mut())
+                    && proxy_obj.get("password").is_some_and(|pw| !pw.is_null())
+                {
+                    proxy_obj.insert("password".into(), serde_json::json!("***"));
+                }
+                let sid = p.short_id();
+                let live = probe_live_runtime(&p.id);
+                obj.insert("short_id".into(), serde_json::json!(sid));
+                obj.insert("session".into(), serde_json::json!(format!("bon_{sid}")));
+                obj.insert("running".into(), serde_json::json!(live.is_some()));
+                obj.insert("live_runtime".into(), serde_json::json!(live));
+                obj.insert(
+                    "has_prelaunch_cookies".into(),
+                    serde_json::json!(!read_prelaunch_cookies(&sid).trim().is_empty()),
+                );
+                obj.insert(
+                    "download_dir".into(),
+                    serde_json::json!(profile_download_dir(&sid)),
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&val)?);
+            Ok(())
+        }
+        "create" | "add" | "new" => {
+            let (name, flag_slice) = if let Some(first) = rest.first()
+                && !first.starts_with('-')
+            {
+                (first.clone(), &rest[1..])
+            } else {
+                let existing = db.list_profiles()?.len();
+                (format!("Profile-{:02}", existing + 1), rest)
+            };
+            let saved_proxies = db.list_proxies()?;
+            let mut prof = Profile::new_default(name, PlatformType::MacOS);
+            apply_profile_cli_flags(&mut prof, &saved_proxies, flag_slice)?;
+            db.upsert_profile(&prof)?;
+            println!("{}", serde_json::to_string_pretty(&profile_summary_json(&prof))?);
+            Ok(())
+        }
+        "update" | "edit" | "set" => {
+            let profiles = db.list_profiles()?;
+            let saved_proxies = db.list_proxies()?;
+            let (mut targets, consumed) = select_profiles_by_target(&profiles, rest)?;
+            let flags = &rest[consumed..];
+            if flags.is_empty() {
+                bail!("Usage: bon-login profile update <id|name|--group <g>|--all> [--os ... --proxy ...]");
+            }
+            let mut updated = Vec::new();
+            for mut p in targets.drain(..) {
+                apply_profile_cli_flags(&mut p, &saved_proxies, flags)?;
+                db.upsert_profile(&p)?;
+                updated.push(profile_summary_json(&p));
+            }
+            if updated.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&updated[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            }
+            Ok(())
+        }
+        "clone" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile clone <id|name> [--count <n>] [--name <prefix>]"))?;
+            let mut count: usize = 1;
+            let mut custom_name: Option<String> = None;
+            let mut idx = 1;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--count" | "-n" => {
+                        count = rest
+                            .get(idx + 1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(1)
+                            .clamp(1, 500);
+                        idx += 2;
+                    }
+                    "--name" => {
+                        custom_name = rest.get(idx + 1).cloned();
+                        idx += 2;
+                    }
+                    _ => idx += 1,
+                }
+            }
+            let profiles = db.list_profiles()?;
+            let src = find_profile_by_query(&profiles, target)?;
+            let mut created = Vec::new();
+            for i in 1..=count {
+                let mut c = src.cloned_with_new_seed();
+                if let Some(prefix) = &custom_name {
+                    c.name = if count == 1 {
+                        prefix.clone()
+                    } else {
+                        format!("{prefix}-{i:02}")
+                    };
+                } else if count > 1 {
+                    c.name = format!("{} (Copy {i})", src.name);
+                }
+                db.upsert_profile(&c)?;
+                created.push(profile_summary_json(&c));
+            }
+            println!("{}", serde_json::to_string_pretty(&created)?);
+            Ok(())
+        }
+        "batch-create" | "batch" => {
+            let mut count: usize = 5;
+            let mut prefix = "Account".to_string();
+            let mut proxy_tag: Option<String> = None;
+            let mut forwarded_flags = Vec::new();
+            let mut idx = 0;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--count" | "-n" => {
+                        count = rest
+                            .get(idx + 1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(5)
+                            .clamp(1, 500);
+                        idx += 2;
+                    }
+                    "--prefix" => {
+                        prefix = rest.get(idx + 1).cloned().unwrap_or(prefix);
+                        idx += 2;
+                    }
+                    "--proxy-tag" => {
+                        proxy_tag = rest
+                            .get(idx + 1)
+                            .map(|s| s.trim().trim_start_matches('#').to_string());
+                        idx += 2;
+                    }
+                    other => {
+                        forwarded_flags.push(other.to_string());
+                        if let Some(val) = rest.get(idx + 1) {
+                            forwarded_flags.push(val.clone());
+                            idx += 2;
+                        } else {
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+            let saved_proxies = db.list_proxies()?;
+            let proxy_pool: Vec<&SavedProxy> = if let Some(tag) = &proxy_tag {
+                let pool: Vec<&SavedProxy> = saved_proxies
+                    .iter()
+                    .filter(|sp| sp.group_tag.eq_ignore_ascii_case(tag))
+                    .collect();
+                if pool.is_empty() {
+                    bail!("No saved proxies found in Proxy Manager with tag '{tag}'");
+                }
+                pool
+            } else {
+                Vec::new()
+            };
+            let mut created = Vec::new();
+            for i in 1..=count {
+                let mut p = Profile::new_default(format!("{prefix}-{i:02}"), PlatformType::MacOS);
+                apply_profile_cli_flags(&mut p, &saved_proxies, &forwarded_flags)?;
+                if !proxy_pool.is_empty() {
+                    let sp = proxy_pool[(i - 1) % proxy_pool.len()];
+                    p.proxy = Some(sp.config.clone());
+                    p.resolved_geo = sp.resolved_geo.clone();
+                }
+                db.upsert_profile(&p)?;
+                created.push(profile_summary_json(&p));
+            }
+            println!("{}", serde_json::to_string_pretty(&created)?);
+            Ok(())
+        }
+        "check-proxy" => {
+            let profiles = db.list_profiles()?;
+            let (targets, _) = select_profiles_by_target(&profiles, rest)?;
+            let mut out = Vec::new();
+            for p in targets {
+                let Some(cfg) = &p.proxy else {
+                    out.push(serde_json::json!({
+                        "id": p.id,
+                        "short_id": p.short_id(),
+                        "name": p.name,
+                        "ok": true,
+                        "mode": "Direct",
+                    }));
+                    continue;
+                };
+                match tokio_handle.block_on(check_proxy_config_live(cfg)) {
+                    Ok(geo) => {
+                        let _ = db.update_resolved_geo(&p.id, Some(&geo));
+                        out.push(serde_json::json!({
+                            "id": p.id,
+                            "short_id": p.short_id(),
+                            "name": p.name,
+                            "ok": true,
+                            "geo": geo,
+                        }));
+                    }
+                    Err(e) => {
+                        out.push(serde_json::json!({
+                            "id": p.id,
+                            "short_id": p.short_id(),
+                            "name": p.name,
+                            "ok": false,
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            Ok(())
+        }
+        "export-cookies" | "export-state" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile export-cookies <id|name> [--out <file>]"))?;
+            let out_file = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            let sid = p.short_id();
+            let (state_path, json) = if let Some(live) = probe_live_runtime(&p.id) {
+                agent_export_state(&sid, &live.ws_url)?
+            } else {
+                let saved = app_support_dir()
+                    .join("states")
+                    .join(format!("bon_{sid}_state.json"));
+                let pre = app_support_dir()
+                    .join("states")
+                    .join(format!("bon_{sid}_prelaunch.json"));
+                let chosen = if saved.is_file() {
+                    saved
+                } else if pre.is_file() {
+                    pre
+                } else {
+                    bail!(
+                        "Profile '{}' is not running and has no saved state file yet",
+                        p.name
+                    );
+                };
+                let content = std::fs::read_to_string(&chosen)?;
+                (chosen, content)
+            };
+            let final_path = if let Some(custom) = out_file {
+                std::fs::write(&custom, &json)?;
+                custom
+            } else {
+                state_path
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "short_id": sid,
+                    "path": final_path,
+                    "bytes": json.len(),
+                }))?
+            );
+            Ok(())
+        }
+        "import-cookies" | "import-state" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile import-cookies <id|name> <file_or_json>"))?;
+            let input = rest
+                .get(1)
+                .ok_or_else(|| anyhow!("Missing cookie/state file path or raw JSON payload"))?;
+            let payload = if Path::new(input).is_file() {
+                std::fs::read_to_string(input)?
+            } else {
+                input.clone()
+            };
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            let sid = p.short_id();
+            save_prelaunch_cookies(&sid, &payload)?;
+            let live_msg = if let Some(live) = probe_live_runtime(&p.id) {
+                Some(agent_import_state_or_cookies(&sid, &live.ws_url, &payload)?)
+            } else {
+                None
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "short_id": sid,
+                    "saved_prelaunch": true,
+                    "live_imported": live_msg,
+                }))?
+            );
+            Ok(())
+        }
+        "wipe" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile wipe <id|name>"))?;
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            stop_external_runtime(&p.id, &p.short_id());
+            wipe_profile_data(&p.id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "wiped": p.short_id(),
+                    "name": p.name,
+                }))?
+            );
+            Ok(())
+        }
+        "delete" | "rm" => {
+            let profiles = db.list_profiles()?;
+            let (targets, _) = select_profiles_by_target(&profiles, rest)?;
+            let mut deleted = Vec::new();
+            for p in targets {
+                stop_external_runtime(&p.id, &p.short_id());
+                let _ = wipe_profile_data(&p.id);
+                if let Ok(dir) = profile_user_data_dir(&p.id) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                db.delete_profile(&p.id)?;
+                deleted.push(p.short_id());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "deleted": deleted,
+                }))?
+            );
+            Ok(())
+        }
+        "backup" => {
+            let out_file = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
+            let (default_path, json) = db.export_profiles_json()?;
+            let final_path = if let Some(custom) = out_file {
+                std::fs::write(&custom, &json)?;
+                custom
+            } else {
+                default_path
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "path": final_path,
+                    "count": db.list_profiles()?.len(),
+                }))?
+            );
+            Ok(())
+        }
+        "restore" => {
+            let file = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile restore <backup_json_file>"))?;
+            let raw = std::fs::read_to_string(file)
+                .with_context(|| format!("Failed to read backup file '{file}'"))?;
+            let imported = db.import_profiles_json(&raw)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "imported": imported,
+                }))?
+            );
+            Ok(())
+        }
+        other => bail!("Unknown profile subcommand '{other}'"),
+    }
+}
+
+fn select_proxies_by_target(
+    proxies: &[SavedProxy],
+    args: &[String],
+) -> Result<(Vec<SavedProxy>, usize)> {
+    let first = args
+        .first()
+        .ok_or_else(|| anyhow!("Missing proxy target (<id|name|--tag <t>|--all>)"))?;
+    if first == "--all" || first == "all" {
+        return Ok((proxies.to_vec(), 1));
+    }
+    if first == "--tag" {
+        let tag = args
+            .get(1)
+            .ok_or_else(|| anyhow!("Missing tag name after --tag"))?
+            .trim_start_matches('#');
+        let matched: Vec<SavedProxy> = proxies
+            .iter()
+            .filter(|p| p.group_tag.eq_ignore_ascii_case(tag))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            bail!("No saved proxies found with tag '{tag}'");
+        }
+        return Ok((matched, 2));
+    }
+    let mut out = Vec::new();
+    for token in first.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(find_saved_proxy_by_query(proxies, token)?.clone());
+    }
+    Ok((out, 1))
+}
+
+fn run_proxy_subcommand(
+    tokio_handle: &tokio::runtime::Handle,
+    args: &[String],
+) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[] } else { &args[1..] };
+    let db = crate::db::Database::open_default()?;
+
+    match sub {
+        "list" | "ls" => {
+            let tag_filter = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--tag").then(|| w[1].trim_start_matches('#').to_string()));
+            let proxies = db.list_proxies()?;
+            let items: Vec<serde_json::Value> = proxies
+                .iter()
+                .filter(|p| {
+                    tag_filter
+                        .as_deref()
+                        .is_none_or(|t| p.group_tag.eq_ignore_ascii_case(t))
+                })
+                .map(saved_proxy_summary_json)
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+            Ok(())
+        }
+        "add" | "import" => {
+            let raw_arg = rest
+                .first()
+                .filter(|s| !s.starts_with('-'))
+                .ok_or_else(|| {
+                    anyhow!("Usage: bon-login proxy add <raw_proxy_or_file> [--protocol http|socks5] [--tag <t>] [--name <n>] [--expire <days_or_date>]")
+                })?;
+            let mut default_proto = ProxyProtocol::Http;
+            let mut tag = String::new();
+            let mut explicit_name: Option<String> = None;
+            let mut expire_ts: Option<i64> = None;
+            let mut idx = 1;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--protocol" | "--type" => {
+                        if let Some(v) = rest.get(idx + 1) {
+                            default_proto = ProxyProtocol::from_str_lossy(v);
+                        }
+                        idx += 2;
+                    }
+                    "--tag" | "--group" => {
+                        tag = rest
+                            .get(idx + 1)
+                            .map(|s| s.trim().trim_start_matches('#').to_string())
+                            .unwrap_or_default();
+                        idx += 2;
+                    }
+                    "--name" => {
+                        explicit_name = rest.get(idx + 1).cloned();
+                        idx += 2;
+                    }
+                    "--expire" => {
+                        if let Some(v) = rest.get(idx + 1) {
+                            expire_ts = SavedProxy::parse_expiration_input(v);
+                        }
+                        idx += 2;
+                    }
+                    _ => idx += 1,
+                }
+            }
+            let content = if Path::new(raw_arg).is_file() {
+                std::fs::read_to_string(raw_arg)?
+            } else {
+                raw_arg.clone()
+            };
+            let mut existing_count = db.list_proxies()?.len();
+            let mut added = Vec::new();
+            for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if let Some((cfg, inline_name)) =
+                    ProxyConfig::parse_with_optional_name(line, default_proto)?
+                {
+                    existing_count += 1;
+                    let name = explicit_name
+                        .clone()
+                        .or(inline_name)
+                        .unwrap_or_else(|| format!("Proxy #{existing_count:02}"));
+                    let mut sp = SavedProxy::new(name, tag.clone(), cfg);
+                    sp.expired_at = expire_ts;
+                    db.upsert_proxy(&sp)?;
+                    added.push(saved_proxy_summary_json(&sp));
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&added)?);
+            Ok(())
+        }
+        "check" => {
+            let proxies = db.list_proxies()?;
+            let (targets, _) = select_proxies_by_target(&proxies, rest)?;
+            let mut results = Vec::new();
+            for sp in targets {
+                match tokio_handle.block_on(check_proxy_config_live(&sp.config)) {
+                    Ok(geo) => {
+                        let _ = db.update_saved_proxy_check(&sp.id, Some(&geo), None);
+                        results.push(serde_json::json!({
+                            "id": sp.id,
+                            "name": sp.name,
+                            "host": sp.config.display_short(),
+                            "ok": true,
+                            "geo": geo,
+                        }));
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let _ = db.update_saved_proxy_check(&sp.id, None, Some(&msg));
+                        results.push(serde_json::json!({
+                            "id": sp.id,
+                            "name": sp.name,
+                            "host": sp.config.display_short(),
+                            "ok": false,
+                            "error": msg,
+                        }));
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&results)?);
+            Ok(())
+        }
+        "extend" => {
+            let proxies = db.list_proxies()?;
+            let (targets, consumed) = select_proxies_by_target(&proxies, rest)?;
+            let days_raw = rest
+                .get(consumed)
+                .ok_or_else(|| anyhow!("Usage: bon-login proxy extend <id|name|--tag <t>|--all> <days>"))?;
+            let days: i64 = days_raw
+                .trim_start_matches('+')
+                .trim_end_matches(['d', 'D'])
+                .parse()
+                .context("Invalid days integer")?;
+            let now = unix_now();
+            let mut updated = Vec::new();
+            for mut sp in targets {
+                let base = sp.expired_at.unwrap_or(now).max(now);
+                sp.expired_at = Some(base + days * 86_400);
+                db.upsert_proxy(&sp)?;
+                updated.push(serde_json::json!({
+                    "id": sp.id,
+                    "name": sp.name,
+                    "expired_at": sp.expired_at,
+                    "expired_label": sp.format_expired_at(),
+                }));
+            }
+            println!("{}", serde_json::to_string_pretty(&updated)?);
+            Ok(())
+        }
+        "assign" => {
+            let proxies = db.list_proxies()?;
+            let (proxy_pool, consumed) = select_proxies_by_target(&proxies, rest)?;
+            let after = &rest[consumed..];
+            let to_idx = after
+                .iter()
+                .position(|a| a == "--to")
+                .ok_or_else(|| anyhow!("Usage: bon-login proxy assign <proxy|--tag <t>> --to <profile|--group <g>|--all>"))?;
+            let prof_args = &after[to_idx + 1..];
+            let profiles = db.list_profiles()?;
+            let (mut target_profiles, _) = select_profiles_by_target(&profiles, prof_args)?;
+            let mut assigned = Vec::new();
+            for (idx, mut p) in target_profiles.drain(..).enumerate() {
+                let chosen = &proxy_pool[idx % proxy_pool.len()];
+                p.proxy = Some(chosen.config.clone());
+                p.resolved_geo = chosen.resolved_geo.clone();
+                db.upsert_profile(&p)?;
+                assigned.push(serde_json::json!({
+                    "profile_short_id": p.short_id(),
+                    "profile_name": p.name,
+                    "proxy": chosen.config.display_short(),
+                    "proxy_name": chosen.name,
+                }));
+            }
+            println!("{}", serde_json::to_string_pretty(&assigned)?);
+            Ok(())
+        }
+        "delete" | "rm" => {
+            let proxies = db.list_proxies()?;
+            let (targets, _) = select_proxies_by_target(&proxies, rest)?;
+            let mut deleted = Vec::new();
+            for sp in targets {
+                db.delete_proxy(&sp.id)?;
+                deleted.push(sp.id);
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "deleted": deleted,
+                }))?
+            );
+            Ok(())
+        }
+        other => bail!("Unknown proxy subcommand '{other}'"),
+    }
+}
+
+fn run_group_subcommand(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[] } else { &args[1..] };
+    let db = crate::db::Database::open_default()?;
+    match sub {
+        "list" | "ls" => {
+            let profiles = db.list_profiles()?;
+            let groups = db.list_groups()?;
+            let items: Vec<serde_json::Value> = groups
+                .into_iter()
+                .map(|g| {
+                    let count = profiles
+                        .iter()
+                        .filter(|p| p.group_tag.eq_ignore_ascii_case(&g))
+                        .count();
+                    serde_json::json!({ "name": g, "profiles_count": count })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+            Ok(())
+        }
+        "add" | "create" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login group add <name>"))?;
+            db.insert_group(name)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "group": name.trim() }))?
+            );
+            Ok(())
+        }
+        "delete" | "rm" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login group delete <name>"))?;
+            db.delete_group(name)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "deleted": name.trim() }))?
+            );
+            Ok(())
+        }
+        "move" | "assign" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login group move <profile_id|name> <group_name>"))?;
+            let group_name = rest
+                .get(1)
+                .ok_or_else(|| anyhow!("Usage: bon-login group move <profile_id|name> <group_name>"))?
+                .trim();
+            let profiles = db.list_profiles()?;
+            let mut p = find_profile_by_query(&profiles, target)?.clone();
+            p.group_tag = if group_name.eq_ignore_ascii_case("none") {
+                String::new()
+            } else {
+                group_name.to_string()
+            };
+            db.upsert_profile(&p)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "short_id": p.short_id(),
+                    "name": p.name,
+                    "group": p.group_tag,
+                }))?
+            );
+            Ok(())
+        }
+        other => bail!("Unknown group subcommand '{other}'"),
+    }
+}
+
+fn run_tag_subcommand(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[] } else { &args[1..] };
+    let db = crate::db::Database::open_default()?;
+    match sub {
+        "list" | "ls" => {
+            let proxies = db.list_proxies()?;
+            let tags = db.list_tags()?;
+            let items: Vec<serde_json::Value> = tags
+                .into_iter()
+                .map(|t| {
+                    let count = proxies
+                        .iter()
+                        .filter(|p| p.group_tag.eq_ignore_ascii_case(&t))
+                        .count();
+                    serde_json::json!({ "name": t, "proxies_count": count })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+            Ok(())
+        }
+        "add" | "create" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login tag add <name>"))?
+                .trim()
+                .trim_start_matches('#');
+            db.insert_tag(name)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "tag": name }))?
+            );
+            Ok(())
+        }
+        "delete" | "rm" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login tag delete <name>"))?
+                .trim()
+                .trim_start_matches('#');
+            db.delete_tag(name)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "ok": true, "deleted": name }))?
+            );
+            Ok(())
+        }
+        other => bail!("Unknown tag subcommand '{other}'"),
+    }
+}
+
+fn run_ext_subcommand(
+    tokio_handle: &tokio::runtime::Handle,
+    args: &[String],
+) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    let rest = if args.is_empty() { &[] } else { &args[1..] };
+    let db = crate::db::Database::open_default()?;
+    match sub {
+        "list" | "ls" => {
+            let exts = db.list_extensions()?;
+            let items: Vec<serde_json::Value> = exts
+                .iter()
+                .map(|e| {
+                    let rt = resolve_extension_runtime_info(e);
+                    serde_json::json!({
+                        "id": e.id,
+                        "name": e.name,
+                        "enabled": e.enabled,
+                        "is_default": e.is_default,
+                        "runtime_id": rt.as_ref().map(|(id, _)| id),
+                        "entry_url": rt.as_ref().map(|(_, url)| url),
+                        "source_url": e.source_url,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+            Ok(())
+        }
+        "enable" | "disable" => {
+            let enable = sub == "enable";
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login ext {sub} <id|name>"))?;
+            let exts = db.list_extensions()?;
+            let mut ext = find_extension_by_query(&exts, target)?.clone();
+            ext.enabled = enable;
+            if enable {
+                let dir = ensure_extension_unpacked(&ext)?;
+                if is_placeholder_extension_dir(&dir) && !ext.source_url.trim().is_empty() {
+                    let downloaded =
+                        tokio_handle.block_on(download_extension_from_url(&ext.source_url))?;
+                    ext.folder_path = downloaded.folder_path;
+                }
+            }
+            db.upsert_extension(&ext)?;
+            db.set_extension_enabled(&ext.id, enable)?;
+            let rt = resolve_extension_runtime_info(&ext);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "id": ext.id,
+                    "name": ext.name,
+                    "enabled": enable,
+                    "runtime_id": rt.as_ref().map(|(id, _)| id),
+                    "entry_url": rt.as_ref().map(|(_, url)| url),
+                }))?
+            );
+            Ok(())
+        }
+        "add" | "install" => {
+            let src = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login ext add <file_or_folder_or_store_url_or_id>"))?;
+            let ext = if Path::new(src).exists() {
+                install_extension_from_file(Path::new(src))?
+            } else {
+                tokio_handle.block_on(download_extension_from_url(src))?
+            };
+            db.upsert_extension(&ext)?;
+            let rt = resolve_extension_runtime_info(&ext);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "id": ext.id,
+                    "name": ext.name,
+                    "enabled": ext.enabled,
+                    "runtime_id": rt.as_ref().map(|(id, _)| id),
+                    "entry_url": rt.as_ref().map(|(_, url)| url),
+                }))?
+            );
+            Ok(())
+        }
+        "remove" | "delete" | "rm" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login ext remove <id|name>"))?;
+            let exts = db.list_extensions()?;
+            let ext = find_extension_by_query(&exts, target)?;
+            if ext.is_default {
+                db.set_extension_enabled(&ext.id, false)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "id": ext.id,
+                        "disabled_default": true,
+                    }))?
+                );
+            } else {
+                db.delete_extension(&ext.id)?;
+                remove_extension_files(&ext.id);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "deleted": ext.id,
+                    }))?
+                );
+            }
+            Ok(())
+        }
+        "open" => {
+            let ext_target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login ext open <ext_id|name> --profile <profile_id|name>"))?;
+            let prof_target = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--profile" || w[0] == "-p").then(|| w[1].as_str()))
+                .or_else(|| rest.get(1).map(String::as_str))
+                .ok_or_else(|| anyhow!("Usage: bon-login ext open <ext_id|name> --profile <profile_id|name>"))?;
+            let exts = db.list_extensions()?;
+            let ext = find_extension_by_query(&exts, ext_target)?;
+            let (runtime_id, entry_url) = resolve_extension_runtime_info(ext)
+                .ok_or_else(|| anyhow!("Could not resolve extension entry URL for '{}'", ext.name))?;
+            let profiles = db.list_profiles()?;
+            let profile = find_profile_by_query(&profiles, prof_target)?;
+            let info = ensure_profile_launched_via_supervisor(&db, profile)?;
+            let cli = agent_open_extension_tab(&profile.short_id(), &info.ws_url, &entry_url)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "profile_short_id": profile.short_id(),
+                    "session": format!("bon_{}", profile.short_id()),
+                    "extension_id": ext.id,
+                    "runtime_id": runtime_id,
+                    "entry_url": entry_url,
+                    "cli": cli,
+                }))?
+            );
+            Ok(())
+        }
+        other => bail!("Unknown extension subcommand '{other}'"),
+    }
+}
+
+fn run_kernel_subcommand(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("status");
+    match sub {
+        "status" | "info" => {
+            let k = locate_chromium_kernel();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "installed": k.is_some(),
+                    "version": k.as_ref().map(|i| &i.version_label),
+                    "path": k.as_ref().map(|i| &i.path),
+                    "is_adryfish_bundle": k.as_ref().map(|i| i.is_adryfish_bundle),
+                }))?
+            );
+            Ok(())
+        }
+        "install" | "download" => {
+            let k = install_adryfish_kernel_blocking()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "version": k.version_label,
+                    "path": k.path,
+                }))?
+            );
+            Ok(())
+        }
+        other => bail!("Unknown kernel subcommand '{other}' (expected status or install)"),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -2856,6 +4141,14 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            validate_stealth_agent_args(&[
+                "batch".to_string(),
+                "set viewport 1920 1080".to_string(),
+                "click @e1".to_string()
+            ])
+            .is_err()
+        );
 
         let info = RuntimeInfo {
             pid: 1234,
@@ -2866,6 +4159,69 @@ mod tests {
         assert_eq!(
             info.pinned_tab_cli("76a2aa96", "worker 1"),
             "agent-browser --session bon_76a2aa96_worker1 --input-mode human --pin-tab connect \"ws://127.0.0.1:55111/devtools/browser/abc\""
+        );
+    }
+
+    #[test]
+    fn test_apply_profile_cli_flags() {
+        let mut p = Profile::new_default("Init", PlatformType::MacOS);
+        let sp = SavedProxy::new(
+            "US Resi 01",
+            "US-Tag",
+            ProxyConfig {
+                protocol: ProxyProtocol::Socks5,
+                host: "198.51.100.7".to_string(),
+                port: 1080,
+                username: Some("u".to_string()),
+                password: Some("pw".to_string()),
+            },
+        );
+        let flags: Vec<String> = [
+            "--name",
+            "TikTok Shop US",
+            "--group",
+            "TikTok",
+            "--os",
+            "windows",
+            "--brand",
+            "edge",
+            "--seed",
+            "555666",
+            "--cores",
+            "12",
+            "--gpu",
+            "native",
+            "--canvas",
+            "off",
+            "--window-size",
+            "1920,1080",
+            "--timezone",
+            "America/New_York",
+            "--locale",
+            "en-US",
+            "--proxy-tag",
+            "#US-Tag",
+            "--notes",
+            "Seller account",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        apply_profile_cli_flags(&mut p, &[sp], &flags).unwrap();
+        assert_eq!(p.name, "TikTok Shop US");
+        assert_eq!(p.group_tag, "TikTok");
+        assert_eq!(p.os_platform, PlatformType::Windows);
+        assert_eq!(p.brand, BrowserBrand::Edge);
+        assert_eq!(p.seed, 555666);
+        assert_eq!(p.hardware_concurrency, 12);
+        assert_eq!(p.gpu_spoofing, GpuSpoofMode::NativePassthrough);
+        assert!(!p.spoof_canvas);
+        assert_eq!(p.window_size, "1920,1080");
+        assert_eq!(p.custom_timezone.as_deref(), Some("America/New_York"));
+        assert_eq!(
+            p.proxy.as_ref().map(|x| x.display_short()).as_deref(),
+            Some("198.51.100.7:1080")
         );
     }
 }
