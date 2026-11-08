@@ -1475,20 +1475,22 @@ fn flush_prelaunch_state_if_needed(short_id: &str, cdp_port: u16, ws_url: &str) 
     }
 }
 
-fn cleanup_stale_singleton_locks(user_data_dir: &Path) {
-    let lock_path = user_data_dir.join("SingletonLock");
-    if let Ok(target) = std::fs::read_link(&lock_path)
-        && let Some(pid_str) = target.to_string_lossy().rsplit('-').next()
-        && let Ok(pid) = pid_str.parse::<u32>()
-        && pid > 0
+fn singleton_lock_pid(user_data_dir: &Path) -> Option<u32> {
+    let target = std::fs::read_link(user_data_dir.join("SingletonLock")).ok()?;
+    let pid: u32 = target.to_string_lossy().rsplit('-').next()?.parse().ok()?;
+    (pid > 0
         && Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
-    {
+            .is_ok_and(|s| s.success()))
+    .then_some(pid)
+}
+
+fn cleanup_stale_singleton_locks(user_data_dir: &Path) {
+    if singleton_lock_pid(user_data_dir).is_some() {
         return;
     }
     for name in ["SingletonLock", "SingletonSocket", "SingletonCookie", "RunningChromeVersion"] {
@@ -2513,6 +2515,7 @@ pub fn build_chromium_args(
     if !win_size.is_empty() {
         args.push(format!("--window-size={win_size}"));
     }
+    args.push(format!("--window-name={}", profile.window_badge_label()));
 
     if let Some(port) = local_proxy_port {
         args.push(format!("--proxy-server=http://127.0.0.1:{port}"));
@@ -3173,13 +3176,10 @@ fn cdp_first_page_target(cdp_port: u16) -> Result<(String, String)> {
         .context("No open browser page target found")
 }
 
-pub fn cdp_set_window_bounds(
+fn cdp_update_and_activate_window(
     cdp_port: u16,
     ws_url: &str,
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
+    rect: Option<(i32, i32, i32, i32)>,
 ) -> Result<()> {
     let (target_id, _) = cdp_first_page_target(cdp_port)?;
     let (mut stream, mut buf) = cdp_ws_connect(cdp_port, ws_url)?;
@@ -3203,7 +3203,11 @@ pub fn cdp_set_window_bounds(
         .and_then(|s| s.as_str())
         .unwrap_or("normal");
 
-    if win_state != "normal" {
+    if if rect.is_some() {
+        win_state != "normal"
+    } else {
+        win_state == "minimized"
+    } {
         let restore = serde_json::json!({
             "id": 2,
             "method": "Browser.setWindowBounds",
@@ -3216,21 +3220,18 @@ pub fn cdp_set_window_bounds(
         let _ = cdp_ws_recv_id(&mut stream, &mut buf, 2)?;
     }
 
-    let set_bounds = serde_json::json!({
-        "id": 3,
-        "method": "Browser.setWindowBounds",
-        "params": {
-            "windowId": window_id,
-            "bounds": {
-                "left": left,
-                "top": top,
-                "width": width,
-                "height": height
+    if let Some((left, top, width, height)) = rect {
+        let set_bounds = serde_json::json!({
+            "id": 3,
+            "method": "Browser.setWindowBounds",
+            "params": {
+                "windowId": window_id,
+                "bounds": { "left": left, "top": top, "width": width, "height": height }
             }
-        }
-    });
-    cdp_ws_send(&mut stream, &set_bounds.to_string())?;
-    let _ = cdp_ws_recv_id(&mut stream, &mut buf, 3)?;
+        });
+        cdp_ws_send(&mut stream, &set_bounds.to_string())?;
+        let _ = cdp_ws_recv_id(&mut stream, &mut buf, 3)?;
+    }
 
     let activate = serde_json::json!({
         "id": 4,
@@ -3240,6 +3241,42 @@ pub fn cdp_set_window_bounds(
     let _ = cdp_ws_send(&mut stream, &activate.to_string());
     let _ = cdp_ws_recv_id(&mut stream, &mut buf, 4);
     Ok(())
+}
+
+pub fn cdp_set_window_bounds(
+    cdp_port: u16,
+    ws_url: &str,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    cdp_update_and_activate_window(cdp_port, ws_url, Some((left, top, width, height)))
+}
+
+/// Brings a running Chromium window to the front on macOS (restores if minimized, activates CDP target, and raises PID).
+pub fn cdp_focus_window(profile_id: &str, pid: u32, cdp_port: u16, ws_url: &str) -> Result<()> {
+    let cdp_res = cdp_update_and_activate_window(cdp_port, ws_url, None);
+    #[cfg(target_os = "macos")]
+    {
+        let effective_pid = if pid > 0 {
+            Some(pid)
+        } else {
+            singleton_lock_pid(&app_support_dir().join("profiles").join(profile_id))
+        };
+        if let Some(p) = effective_pid {
+            let script = format!(
+                "tell application \"System Events\" to set frontmost of first process whose unix id is {p} to true"
+            );
+            let _ = Command::new("osascript")
+                .args(["-e", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    cdp_res
 }
 
 /// Types `text` character-by-character into the focused element of a running Chromium window via
@@ -3484,11 +3521,56 @@ fn ensure_bookmark_bar_visible(def_dir: &Path) {
     }
 }
 
-/// Ensures `<user_data_dir>/Default/Preferences` has the Bookmarks bar visible on all tabs.
-pub fn ensure_profile_bookmarks(_profile: &Profile, user_data_dir: &Path) {
+/// Ensures `<user_data_dir>/Default/Preferences` and `<user_data_dir>/Local State` have the
+/// Bookmarks bar visible plus the profile's display name (`[#id4] Name`) and seed-matched toolbar color.
+pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
     let def_dir = user_data_dir.join("Default");
     let _ = std::fs::create_dir_all(&def_dir);
-    ensure_bookmark_bar_visible(&def_dir);
+
+    let badge_name = profile.window_badge_label();
+    let (_, _, skcolor) = Profile::accent_color_for_seed(profile.seed);
+    let avatar_idx = 26 + ((profile.seed as usize) % 29);
+
+    let pref_path = def_dir.join("Preferences");
+    let mut prefs: serde_json::Value = std::fs::read_to_string(&pref_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !prefs.is_object() {
+        prefs = serde_json::json!({});
+    }
+    prefs["bookmark_bar"]["show_on_all_tabs"] = serde_json::Value::Bool(true);
+    prefs["profile"]["name"] = serde_json::Value::String(badge_name.clone());
+    prefs["profile"]["is_using_default_name"] = serde_json::Value::Bool(false);
+    prefs["profile"]["avatar_index"] = serde_json::json!(avatar_idx);
+    prefs["browser"]["theme"] = serde_json::json!({
+        "color_variant": 1,
+        "user_color2": skcolor
+    });
+    if let Ok(s) = serde_json::to_string(&prefs) {
+        let _ = std::fs::write(&pref_path, s);
+    }
+
+    let local_state_path = user_data_dir.join("Local State");
+    let mut local_state: serde_json::Value = std::fs::read_to_string(&local_state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !local_state.is_object() {
+        local_state = serde_json::json!({});
+    }
+    let def_info = &mut local_state["profile"]["info_cache"]["Default"];
+    def_info["name"] = serde_json::Value::String(badge_name);
+    def_info["is_using_default_name"] = serde_json::Value::Bool(false);
+    def_info["avatar_icon"] = serde_json::Value::String(format!(
+        "chrome://theme/IDR_PROFILE_AVATAR_{avatar_idx}"
+    ));
+    def_info["profile_color_seed"] = serde_json::json!(skcolor);
+    def_info["profile_highlight_color"] = serde_json::json!(skcolor);
+    def_info["default_avatar_fill_color"] = serde_json::json!(skcolor);
+    if let Ok(s) = serde_json::to_string(&local_state) {
+        let _ = std::fs::write(&local_state_path, s);
+    }
 }
 
 /// Generates the current 6-digit TOTP code for `profile` and types `{code}\n` into the active browser input.
@@ -9266,6 +9348,9 @@ mod tests {
         let pref_file = bm_dir.join("Default/Preferences");
         let pref_txt = std::fs::read_to_string(&pref_file).unwrap();
         assert!(pref_txt.contains("\"show_on_all_tabs\":true"));
+        assert!(pref_txt.contains(&bm_prof.window_badge_label()));
+        let local_state_txt = std::fs::read_to_string(bm_dir.join("Local State")).unwrap();
+        assert!(local_state_txt.contains(&bm_prof.window_badge_label()));
         assert!(read_profile_bookmarks(&bm_prof).is_empty());
         let custom_items = parse_bookmarks_editable("My Dashboard|https://dash.example.com, shop.example.com");
         assert_eq!(custom_items.len(), 2);

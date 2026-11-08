@@ -548,6 +548,7 @@ pub fn render_profile_table(
                                 let pid_rot = prof.id.clone();
                                 let pid_type = prof.id.clone();
                                 let pid_shot = prof.id.clone();
+                                let pid_focus = prof.id.clone();
                                 let is_prof_running =
                                     matches!(statuses.get(&prof.id), Some(ProfileStatus::Running(_)));
                                 let has_proxy_rot = prof
@@ -589,6 +590,15 @@ pub fn render_profile_table(
                                             .label("🔄 Rotate IP")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.rotate_profile_proxy_ip(&pid_rot, cx);
+                                            }))
+                                    }))
+                                    .children(is_prof_running.then(|| {
+                                        Button::new("drawer-focus-win")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .small()
+                                            .label("🔍 Focus Window")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.focus_profile_browser(&pid_focus, cx);
                                             }))
                                     }))
                                     .children(is_prof_running.then(|| {
@@ -701,6 +711,8 @@ fn build_profile_popup_menu(
     let pid_meta = profile_id.clone();
     let app_totp = app_entity.clone();
     let pid_totp = profile_id.clone();
+    let app_focus = app_entity.clone();
+    let pid_focus = profile_id.clone();
     let app_type = app_entity.clone();
     let pid_type = profile_id.clone();
     let app_shot = app_entity.clone();
@@ -721,6 +733,8 @@ fn build_profile_popup_menu(
     let pid_clone = profile_id.clone();
     let app_proxy = app_entity.clone();
     let pid_proxy = profile_id.clone();
+    let app_copy_id = app_entity.clone();
+    let pid_copy_id = profile_id.clone();
     let app_agent = app_entity.clone();
     let pid_agent = profile_id.clone();
     let app_del = app_entity;
@@ -754,6 +768,15 @@ fn build_profile_popup_menu(
         );
     }
     menu = menu
+        .item(
+            PopupMenuItem::new("🔍   Focus Browser Window")
+                .disabled(!is_running)
+                .on_click(move |_, _, cx| {
+                    app_focus.update(cx, |app, cx| {
+                        app.focus_profile_browser(&pid_focus, cx);
+                    });
+                }),
+        )
         .item(
             PopupMenuItem::new("⌨️   Human-Type Clipboard")
                 .disabled(!is_running)
@@ -839,6 +862,15 @@ fn build_profile_popup_menu(
             move |_, window, cx| {
                 app_clone.update(cx, |app, cx| {
                     app.clone_profile(&pid_clone, window, cx);
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Copy ID", SfSymbol::DOC_ON_DOC)).on_click(
+            move |_, _, cx| {
+                app_copy_id.update(cx, |app, cx| {
+                    app.copy_profile_id(&pid_copy_id, cx);
                 });
             },
         ),
@@ -1011,16 +1043,27 @@ fn render_profile_row(
                 )
                 // Col 1: ID (`3866478`)
                 .children(cols.show_id.then(|| {
+                    let pid_id_col = profile_id.clone();
                     div()
                         .w(px(68.))
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
+                        .cursor_pointer()
                         .text_color(BonTheme::text_primary())
+                        .hover(|s| s.text_color(BonTheme::accent()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, cx| {
+                                cx.stop_propagation();
+                                app.copy_profile_id(&pid_id_col, cx);
+                            }),
+                        )
                         .child(numeric_id)
                 }))
                 // Col 2: Name (`🔵 wheel-die`)
                 .children(cols.show_name.then(|| {
+                    let (dot_border, dot_bg, _) = Profile::accent_color_for_seed(profile.seed);
                     h_flex()
                         .w(px(128.))
                         .flex_shrink_0()
@@ -1034,8 +1077,8 @@ fn render_profile_row(
                                 .flex_shrink_0()
                                 .rounded_full()
                                 .border_2()
-                                .border_color(rgb(0x38bdf8))
-                                .bg(rgba(0x0284c733)),
+                                .border_color(rgb(dot_border))
+                                .bg(rgba(dot_bg)),
                         )
                         .child(
                             div()
@@ -1214,7 +1257,8 @@ fn render_profile_row(
                 }))
                 // Col 7: Status (`Ready` green pill)
                 .children(cols.show_status.then(|| {
-                    let badge = h_flex()
+                    let pid_status_focus = profile_id.clone();
+                    let mut badge = h_flex()
                         .px_2()
                         .py_0p5()
                         .gap_1()
@@ -1232,6 +1276,18 @@ fn render_profile_row(
                                 .bg(badge_fg),
                         )
                         .child(state_title);
+                    if is_running {
+                        badge = badge
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |app, _, _, cx| {
+                                    cx.stop_propagation();
+                                    app.focus_profile_browser(&pid_status_focus, cx);
+                                }),
+                            );
+                    }
                     div().w(px(64.)).flex_shrink_0().child(
                         h_flex().child(if is_starting {
                             badge

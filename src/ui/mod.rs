@@ -2307,6 +2307,39 @@ impl BonLoginApp {
         .detach();
     }
 
+    pub fn focus_profile_browser(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() else {
+            self.banner_message = Some("Profile is not running".to_string());
+            cx.notify();
+            return;
+        };
+        let pid_s = prof.id;
+        let name = prof.name;
+        let pid = info.pid;
+        let cdp_port = info.cdp_port;
+        let ws_url = info.ws_url;
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || {
+                    crate::launcher::cdp_focus_window(&pid_s, pid, cdp_port, &ws_url)
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                app.banner_message = Some(match res {
+                    Ok(()) => format!("Focused browser window for '{name}'"),
+                    Err(e) => format!("Focus failed for '{name}': {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn open_quick_meta_modal(
         &mut self,
         profile_id: Option<String>,
@@ -3258,6 +3291,16 @@ impl BonLoginApp {
             .unwrap_or_else(|| "Local IP".to_string());
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         self.banner_message = Some(format!("Copied proxy: {text}"));
+        cx.notify();
+    }
+
+    pub fn copy_profile_id(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id) else {
+            return;
+        };
+        let short_id = prof.short_id();
+        cx.write_to_clipboard(ClipboardItem::new_string(short_id.clone()));
+        self.banner_message = Some(format!("Copied ID for '{}': {short_id}", prof.name));
         cx.notify();
     }
 

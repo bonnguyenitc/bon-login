@@ -791,6 +791,31 @@ impl Profile {
             .collect()
     }
 
+    /// Deterministic 8-color accent palette (`(border_rgb, bg_rgba, skcolor_argb_i64)`) from `seed`
+    /// so each profile row dot in BonLogin matches its Chromium toolbar/avatar color.
+    pub fn accent_color_for_seed(seed: u32) -> (u32, u32, i64) {
+        const PALETTE: [(u32, u32); 8] = [
+            (0x38bdf8, 0x0284c740), // Sky Blue
+            (0x34d399, 0x10b98140), // Emerald
+            (0xfbbf24, 0xf59e0b40), // Amber
+            (0xf87171, 0xef444440), // Rose Red
+            (0xc084fc, 0xa855f740), // Purple
+            (0xf472b6, 0xec489940), // Pink
+            (0x2dd4bf, 0x14b8a640), // Teal
+            (0xfb923c, 0xf9731640), // Orange
+        ];
+        let (rgb_hex, rgba_hex) = PALETTE[(seed as usize) % PALETTE.len()];
+        let skcolor = (0xFF00_0000u32 | rgb_hex) as i32 as i64;
+        (rgb_hex, rgba_hex, skcolor)
+    }
+
+    /// Window/Profile badge label (`"[#id4] Profile Name"`).
+    pub fn window_badge_label(&self) -> String {
+        let sid = self.short_id();
+        let id4 = &sid[..sid.len().min(4)];
+        format!("[#{id4}] {}", self.name.trim())
+    }
+
     pub fn format_last_launched(&self) -> String {
         let Some(ts) = self.last_launched_at else {
             return "Never run".to_string();
