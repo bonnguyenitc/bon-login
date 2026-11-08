@@ -2192,11 +2192,39 @@ impl BonLoginApp {
     }
 
     pub fn copy_profile_totp(&mut self, profile_id: &str, cx: &mut Context<Self>) {
-        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id) else {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
             return;
         };
         if let Some((code, rem)) = prof.current_totp() {
             cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+            if let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() {
+                let cdp_port = info.cdp_port;
+                let code_to_type = format!("{code}\n");
+                let prof_name = prof.name.clone();
+                let tokio_handle = self.tokio_handle.clone();
+                self.banner_message = Some(format!(
+                    "Copied & auto-typing 2FA {code} ({rem}s) into '{prof_name}'..."
+                ));
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let ok = tokio_handle
+                        .spawn_blocking(move || {
+                            crate::launcher::cdp_type_as_human(cdp_port, &code_to_type).is_ok()
+                        })
+                        .await
+                        .unwrap_or(false);
+                    if ok {
+                        let _ = this.update(cx, |app, cx| {
+                            app.banner_message = Some(format!(
+                                "Typed & copied 2FA code for '{prof_name}': {code} ({rem}s)"
+                            ));
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+                return;
+            }
             self.banner_message = Some(format!(
                 "Copied 2FA code for '{}': {code} (valid {rem}s)",
                 prof.name
@@ -2205,6 +2233,43 @@ impl BonLoginApp {
             self.banner_message = Some("Invalid or empty 2FA secret on this profile".to_string());
         }
         cx.notify();
+    }
+
+    pub fn capture_profile_screenshot(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() else {
+            self.banner_message = Some("Start the profile first to capture a screenshot".to_string());
+            cx.notify();
+            return;
+        };
+        let sid = prof.short_id();
+        let name = prof.name.clone();
+        let cdp_port = info.cdp_port;
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || crate::launcher::cdp_capture_screenshot(&sid, cdp_port, None))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                match res {
+                    Ok(path) => {
+                        let path_s = path.display().to_string();
+                        cx.write_to_clipboard(ClipboardItem::new_string(path_s.clone()));
+                        app.banner_message = Some(format!(
+                            "Saved screenshot for '{name}': {path_s} (copied path)"
+                        ));
+                    }
+                    Err(e) => {
+                        app.banner_message = Some(format!("Screenshot failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn open_quick_meta_modal(
@@ -2337,6 +2402,179 @@ impl BonLoginApp {
                         crate::launcher::format_bytes(rem)
                     ),
                     Err(e) => format!("Clean cache failed: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn clean_all_or_checked_cache(&mut self, cx: &mut Context<Self>) {
+        let use_checked = !self.checked_profile_ids.is_empty();
+        let ids: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|p| !use_checked || self.checked_profile_ids.contains(&p.id))
+            .filter(|p| {
+                !matches!(
+                    self.statuses.get(&p.id),
+                    Some(ProfileStatus::Running(_) | ProfileStatus::Starting(_))
+                )
+            })
+            .map(|p| p.id.clone())
+            .collect();
+        if ids.is_empty() {
+            self.banner_message = Some("No stopped profiles to clean cache".to_string());
+            cx.notify();
+            return;
+        }
+        let count = ids.len();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let total_freed = tokio_handle
+                .spawn_blocking(move || {
+                    let mut freed = 0u64;
+                    for id in &ids {
+                        if let Ok((f, _)) = crate::launcher::clean_profile_cache(id) {
+                            freed = freed.saturating_add(f);
+                        }
+                    }
+                    freed
+                })
+                .await
+                .unwrap_or(0);
+            let _ = this.update(cx, |app, cx| {
+                app.banner_message = Some(format!(
+                    "Cleaned cache on {count} profile(s): freed {}",
+                    crate::launcher::format_bytes(total_freed)
+                ));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn export_profiles_csv_ui(&mut self, cx: &mut Context<Self>) {
+        let res = self.db.lock().ok().and_then(|db| db.export_profiles_csv().ok());
+        if let Some((path, _)) = res {
+            let path_s = path.display().to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(path_s.clone()));
+            self.banner_message = Some(format!("Exported CSV: {path_s} (copied path)"));
+        } else {
+            self.banner_message = Some("Failed to export profiles CSV".to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn pick_and_import_csv_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tokio_handle = self.tokio_handle.clone();
+        let db = self.db.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || -> anyhow::Result<Option<(String, usize)>> {
+                    let out = std::process::Command::new("osascript")
+                        .args([
+                            "-e",
+                            "POSIX path of (choose file with prompt \"Choose Profiles CSV/TSV File\")",
+                        ])
+                        .output()?;
+                    if !out.status.success() {
+                        return Ok(None);
+                    }
+                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if path_str.is_empty() {
+                        return Ok(None);
+                    }
+                    let raw = std::fs::read_to_string(&path_str)?;
+                    let count = db
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("DB lock error"))?
+                        .import_profiles_csv(&raw)?;
+                    Ok(Some((path_str, count)))
+                })
+                .await
+                .unwrap_or(Ok(None));
+            let _ = this.update(cx, |app, cx| {
+                match res {
+                    Ok(Some((path_str, count))) => {
+                        app.reload_profiles();
+                        app.banner_message =
+                            Some(format!("Imported {count} profile(s) from {path_str}"));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        app.banner_message = Some(format!("CSV import failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn sync_clipboard_to_checked_running(&mut self, cx: &mut Context<Self>) {
+        let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.banner_message = Some("Clipboard is empty".to_string());
+            cx.notify();
+            return;
+        };
+        let val = clip.trim().to_string();
+        if val.is_empty() {
+            self.banner_message = Some("Clipboard text is empty".to_string());
+            cx.notify();
+            return;
+        }
+        let use_checked = self.profiles.iter().any(|p| {
+            self.checked_profile_ids.contains(&p.id)
+                && matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_)))
+        });
+        let ports: Vec<u16> = self
+            .profiles
+            .iter()
+            .filter(|p| !use_checked || self.checked_profile_ids.contains(&p.id))
+            .filter_map(|p| match self.statuses.get(&p.id) {
+                Some(ProfileStatus::Running(info)) => Some(info.cdp_port),
+                _ => None,
+            })
+            .collect();
+        if ports.is_empty() {
+            self.banner_message = Some("No running profiles to sync".to_string());
+            cx.notify();
+            return;
+        }
+        let is_url = val.starts_with("http://") || val.starts_with("https://");
+        let total = ports.len();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let ok_count = tokio_handle
+                .spawn_blocking(move || {
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = ports
+                            .into_iter()
+                            .map(|port| {
+                                let v = val.clone();
+                                s.spawn(move || {
+                                    if is_url {
+                                        crate::launcher::cdp_navigate_page(port, &v).is_ok()
+                                    } else {
+                                        crate::launcher::cdp_type_as_human(port, &v).is_ok()
+                                    }
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .filter_map(|h| h.join().ok().filter(|&ok| ok))
+                            .count()
+                    })
+                })
+                .await
+                .unwrap_or(0);
+            let _ = this.update(cx, |app, cx| {
+                app.banner_message = Some(if is_url {
+                    format!("Synced URL navigation across {ok_count}/{total} running browser(s)")
+                } else {
+                    format!("Synced human-typing across {ok_count}/{total} running browser(s)")
                 });
                 cx.notify();
             });
@@ -3913,6 +4151,43 @@ impl Render for BonLoginApp {
                                                     .gap_2()
                                                     .items_center()
                                                     .child(
+                                                        Button::new("top-clean-cache-btn")
+                                                            .with_variant(BonTheme::row_action(cx))
+                                                            .small()
+                                                            .label("🧹  Clean Cache")
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.clean_all_or_checked_cache(
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("top-import-csv-btn")
+                                                            .with_variant(BonTheme::row_action(cx))
+                                                            .small()
+                                                            .label("📊  Import CSV")
+                                                            .on_click(cx.listener(
+                                                                |app, _, window, cx| {
+                                                                    app.pick_and_import_csv_ui(
+                                                                        window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("top-export-csv-btn")
+                                                            .with_variant(BonTheme::row_action(cx))
+                                                            .small()
+                                                            .label("📤  Export CSV")
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.export_profiles_csv_ui(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
                                                         Button::new("top-import-zip-btn")
                                                             .with_variant(BonTheme::outline_blue(
                                                                 cx,
@@ -4028,6 +4303,21 @@ impl Render for BonLoginApp {
                                                                             ActivePopupModal::ArrangeWindows,
                                                                         );
                                                                         cx.notify();
+                                                                    },
+                                                                ))
+                                                        },
+                                                    ))
+                                                    .children((checked_running_count > 0).then(
+                                                        || {
+                                                            Button::new("batch-sync-clip")
+                                                                .with_variant(
+                                                                    BonTheme::outline_blue(cx),
+                                                                )
+                                                                .small()
+                                                                .label("⚡  Sync Clipboard")
+                                                                .on_click(cx.listener(
+                                                                    |app, _, _, cx| {
+                                                                        app.sync_clipboard_to_checked_running(cx);
                                                                     },
                                                                 ))
                                                         },

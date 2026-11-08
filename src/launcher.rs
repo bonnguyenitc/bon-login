@@ -2718,6 +2718,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     let _ = std::fs::remove_file(runtime_file_path(&profile.id));
     let _ = std::fs::remove_file(launch_error_file_path(&profile.id));
     let _ = profile_download_dir(&profile.short_id());
+    ensure_profile_bookmarks(profile, &user_data_dir);
     unquarantine_macos_app(&kernel.path);
     sync_enabled_remote_extensions().await;
     let args = build_chromium_args(
@@ -3305,6 +3306,124 @@ pub fn cdp_type_as_human(cdp_port: u16, text: &str) -> Result<usize> {
     Ok(typed)
 }
 
+/// Populates `<user_data_dir>/Default/Bookmarks` on first launch with campaign-relevant quick links.
+pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
+    let def_dir = user_data_dir.join("Default");
+    let bm_path = def_dir.join("Bookmarks");
+    if bm_path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&def_dir);
+    let mut items: Vec<(&str, String)> = vec![
+        ("BrowserScan", "https://browserscan.net".to_string()),
+        ("CreepJS", "https://abrahamjuliot.github.io/creepjs/".to_string()),
+    ];
+    let grp = profile.group_tag.to_ascii_lowercase();
+    if grp.contains("fb") || grp.contains("facebook") {
+        items.push(("Ads Manager", "https://adsmanager.facebook.com".to_string()));
+        items.push(("Business Suite", "https://business.facebook.com".to_string()));
+    } else if grp.contains("tiktok") {
+        items.push(("TikTok Seller", "https://seller.tiktok.com".to_string()));
+        items.push(("TikTok Ads", "https://ads.tiktok.com".to_string()));
+    } else if grp.contains("airdrop") || grp.contains("crypto") || grp.contains("web3") {
+        items.push(("DeBank", "https://debank.com".to_string()));
+        items.push(("Revoke.cash", "https://revoke.cash".to_string()));
+    }
+    for url in profile.startup_urls() {
+        if !items.iter().any(|(_, u)| u == &url) {
+            items.push(("Launch", url));
+        }
+    }
+    let children: Vec<serde_json::Value> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, url))| {
+            serde_json::json!({
+                "id": (i + 2).to_string(),
+                "name": name,
+                "type": "url",
+                "url": url,
+            })
+        })
+        .collect();
+    let bm_json = serde_json::json!({
+        "roots": {
+            "bookmark_bar": {
+                "children": children,
+                "id": "1",
+                "name": "Bookmarks bar",
+                "type": "folder"
+            },
+            "other": { "children": [], "id": "100", "name": "Other bookmarks", "type": "folder" },
+            "synced": { "children": [], "id": "101", "name": "Mobile bookmarks", "type": "folder" }
+        },
+        "version": 1
+    });
+    if let Ok(s) = serde_json::to_string_pretty(&bm_json) {
+        let _ = std::fs::write(bm_path, s);
+    }
+}
+
+/// Generates the current 6-digit TOTP code for `profile` and types `{code}\n` into the active browser input.
+pub fn cdp_type_totp(profile: &Profile, cdp_port: u16) -> Result<String> {
+    let (code, _) = profile
+        .current_totp()
+        .ok_or_else(|| anyhow!("Profile '{}' has no valid 2FA TOTP secret", profile.name))?;
+    cdp_type_as_human(cdp_port, &format!("{code}\n"))?;
+    Ok(code)
+}
+
+/// Navigates the active page tab of a running Chromium instance via CDP `Page.navigate`.
+pub fn cdp_navigate_page(cdp_port: u16, url: &str) -> Result<()> {
+    let (_, page_ws_url) = cdp_first_page_target(cdp_port)?;
+    let (mut stream, mut buf) = cdp_ws_connect(cdp_port, &page_ws_url)?;
+    let msg = serde_json::json!({
+        "id": 1,
+        "method": "Page.navigate",
+        "params": { "url": url.trim() }
+    });
+    cdp_ws_send(&mut stream, &msg.to_string())?;
+    let _ = cdp_ws_recv_id(&mut stream, &mut buf, 1)?;
+    Ok(())
+}
+
+/// Captures a PNG screenshot of the active tab via CDP `Page.captureScreenshot` (no `Runtime.enable`).
+pub fn cdp_capture_screenshot(
+    short_id: &str,
+    cdp_port: u16,
+    custom_out: Option<&Path>,
+) -> Result<PathBuf> {
+    use base64::Engine;
+    let (_, page_ws_url) = cdp_first_page_target(cdp_port)?;
+    let (mut stream, mut buf) = cdp_ws_connect(cdp_port, &page_ws_url)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+    let msg = serde_json::json!({
+        "id": 1,
+        "method": "Page.captureScreenshot",
+        "params": { "format": "png" }
+    });
+    cdp_ws_send(&mut stream, &msg.to_string())?;
+    let resp = cdp_ws_recv_id(&mut stream, &mut buf, 1)?;
+    let b64 = resp
+        .get("result")
+        .and_then(|r| r.get("data"))
+        .and_then(|d| d.as_str())
+        .context("Missing base64 data in Page.captureScreenshot response")?;
+    let png_bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .context("Failed to decode screenshot PNG base64")?;
+    let out_path = match custom_out {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let dir = app_support_dir().join("screenshots");
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join(format!("bon_{short_id}_{}.png", unix_now()))
+        }
+    };
+    std::fs::write(&out_path, png_bytes)?;
+    Ok(out_path)
+}
+
 /// Attaches any `chrome-extension://` page tabs that opened at browser startup (before `agent-browser connect`)
 /// so they appear in `agent-browser --session bon_<id> tab`.
 fn sync_extension_targets_to_agent_browser(session: &str, cdp_port: u16) -> usize {
@@ -3389,17 +3508,24 @@ pub fn should_reconnect_agent_session(stderr: &[u8], stdout: &[u8]) -> bool {
 
 pub fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<String> {
     let session = format!("bon_{short_id}");
-    let out = agent_browser_cmd_for_short_id(short_id)
-        .args([
-            "--session",
-            &session,
-            "--input-mode",
-            "instant",
-            "connect",
-            ws_url,
-        ])
-        .output()
-        .context("Failed to execute `agent-browser`. Is `agent-browser` installed in PATH?")?;
+    let run_connect = || {
+        agent_browser_cmd_for_short_id(short_id)
+            .args([
+                "--session",
+                &session,
+                "--input-mode",
+                "instant",
+                "connect",
+                ws_url,
+            ])
+            .output()
+            .context("Failed to execute `agent-browser`. Is `agent-browser` installed in PATH?")
+    };
+    let mut out = run_connect()?;
+    if !out.status.success() {
+        std::thread::sleep(Duration::from_millis(150));
+        out = run_connect()?;
+    }
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("agent-browser connect failed: {}", stderr.trim());
@@ -4390,6 +4516,9 @@ fn print_cli_help() {
            bon-login sync <id|name>                                      Sync OAuth popups & extension windows into tabs\n  \
            bon-login arrange [--size <W,H>]                              Tile all running browser windows into a screen grid\n  \
            bon-login type <id|name> <text...>                            Human-type text into focused input via CDP (bypass paste block)\n  \
+           bon-login totp <id|name> [--type]                             Generate 6-digit 2FA code (and optionally type into browser)\n  \
+           bon-login screenshot <id|name> [--out <file>]                 Capture PNG screenshot of running profile via CDP\n  \
+           bon-login broadcast <open|type|totp> [val] [--group <g>]      Sync navigation/typing/2FA across running profiles\n  \
            bon-login serve [--port <19820>]                              Start local HTTP JSON control plane for n8n/Python/agents\n  \
            bon-login agent <id|name> [--record <flow>] <ab args...>      Run agent-browser (auto-records DOM steps)\n\n\
          AGENT FLOW PLAYBOOKS (`bon-login flow ...`):\n  \
@@ -4403,7 +4532,7 @@ fn print_cli_help() {
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
            bon-login profile list [--group <g>] [--search <q>]\n  \
            bon-login profile show <id|name>\n  \
-           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>]\n                            [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--cookies <file_or_json>]\n  \
+           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--tags <t1,t2>] [--totp <secret>] [--proxy <saved_proxy|none>]\n                            [--proxy-tag <tag>] [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--cookies <file_or_json>]\n  \
            bon-login profile update <id|name|--group <g>|--all> [same flags as create]\n  \
            bon-login profile reseed <id|name|--group <g>|--all>\n  \
            bon-login profile clone <id|name> [--count <n>] [--name <prefix>]\n  \
@@ -4411,8 +4540,14 @@ fn print_cli_help() {
            bon-login profile check-proxy <id|name|--group <g>|--all>\n  \
            bon-login profile rotate-proxy <id|name|--group <g>|--all>\n  \
            bon-login profile clean-cache <id|name|--group <g>|--all>\n  \
+           bon-login profile warmup <id|name> [url1,url2...]\n  \
            bon-login profile export-cookies <id|name> [--out <file>]\n  \
            bon-login profile import-cookies <id|name> <file_or_json>\n  \
+           bon-login profile export-zip <id|name>                        Export full profile archive (.zip with cookies & user-data)\n  \
+           bon-login profile import-zip <zip_file>                       Restore profile from .zip archive\n  \
+           bon-login profile export-csv [--out <file>]                   Export profiles to CSV\n  \
+           bon-login profile import-csv <csv_or_tsv_file>                Bulk import profiles from CSV/TSV\n  \
+           bon-login profile trash [list|restore <id|--all>|empty]       Manage soft-deleted profiles in Trash\n  \
            bon-login profile wipe <id|name|--group <g>|--all>\n  \
            bon-login profile delete <id|name|--group <g>|--all>\n  \
            bon-login profile backup [--out <file>]\n  \
@@ -4494,6 +4629,9 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
             }
             "arrange" | "tile" => run_arrange_cli(&args[1..]),
             "type" | "human-type" => run_type_cli(&args[1..]),
+            "totp" | "2fa" => run_totp_cli(&args[1..]),
+            "screenshot" | "shot" => run_screenshot_cli(&args[1..]),
+            "broadcast" | "multi" => run_broadcast_cli(&args[1..]),
             "serve" | "server" => tokio_handle.block_on(run_serve_cli(&args[1..])),
             "agent" | "ab" => run_agent_cli(&args[1..]),
             "flow" | "flows" => run_flow_subcommand(&args[1..]),
@@ -5151,6 +5289,170 @@ fn run_profile_subcommand(
                 }))?
             );
             Ok(())
+        }
+        "export-csv" => {
+            let out_file = rest
+                .windows(2)
+                .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
+            let (default_path, csv) = db.export_profiles_csv()?;
+            let final_path = if let Some(custom) = out_file {
+                std::fs::write(&custom, &csv)?;
+                custom
+            } else {
+                default_path
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "path": final_path,
+                    "count": db.list_profiles()?.len(),
+                }))?
+            );
+            Ok(())
+        }
+        "import-csv" => {
+            let file = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile import-csv <csv_or_tsv_file>"))?;
+            let raw = std::fs::read_to_string(file)
+                .with_context(|| format!("Failed to read CSV file '{file}'"))?;
+            let imported = db.import_profiles_csv(&raw)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "imported": imported,
+                }))?
+            );
+            Ok(())
+        }
+        "export-zip" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile export-zip <id|name>"))?;
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            if probe_live_runtime(&p.id).is_some() {
+                bail!("Stop profile '{}' before exporting .zip archive", p.name);
+            }
+            let path = export_profile_archive_zip(p)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "short_id": p.short_id(),
+                    "path": path,
+                }))?
+            );
+            Ok(())
+        }
+        "import-zip" => {
+            let file = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile import-zip <zip_file>"))?;
+            let existing_ids: std::collections::HashSet<String> = db
+                .list_profiles()?
+                .into_iter()
+                .chain(db.list_trashed_profiles()?)
+                .map(|p| p.id)
+                .collect();
+            let restored = import_profile_archive_zip(Path::new(file), &existing_ids)?;
+            db.upsert_profile(&restored)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "id": restored.id,
+                    "short_id": restored.short_id(),
+                    "name": restored.name,
+                }))?
+            );
+            Ok(())
+        }
+        "warmup" | "cookie-robot" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile warmup <id|name> [url1,url2...]"))?;
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            let info = ensure_profile_launched_via_supervisor(&db, p)?;
+            let urls: Vec<String> = if let Some(raw_urls) = rest.get(1) {
+                raw_urls
+                    .split([',', ' ', '\n'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            } else {
+                vec![
+                    "https://www.wikipedia.org".to_string(),
+                    "https://www.reddit.com".to_string(),
+                    "https://www.youtube.com".to_string(),
+                    "https://www.amazon.com".to_string(),
+                ]
+            };
+            let visited = run_cookie_robot_warmup(&p.short_id(), &info.ws_url, &urls, 4)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "short_id": p.short_id(),
+                    "visited": visited,
+                    "urls": urls,
+                }))?
+            );
+            Ok(())
+        }
+        "trash" => {
+            let action = rest.first().map(String::as_str).unwrap_or("list");
+            match action {
+                "list" | "ls" => {
+                    let trashed = db.list_trashed_profiles()?;
+                    let items: Vec<serde_json::Value> =
+                        trashed.iter().map(profile_summary_json).collect();
+                    println!("{}", serde_json::to_string_pretty(&items)?);
+                    Ok(())
+                }
+                "restore" => {
+                    let q = rest
+                        .get(1)
+                        .ok_or_else(|| anyhow!("Usage: bon-login profile trash restore <id|name|--all>"))?;
+                    let trashed = db.list_trashed_profiles()?;
+                    let targets: Vec<Profile> = if q == "--all" || q == "all" {
+                        trashed
+                    } else {
+                        vec![find_profile_by_query(&trashed, q)?.clone()]
+                    };
+                    for t in &targets {
+                        db.restore_profile(&t.id)?;
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "restored": targets.len(),
+                        }))?
+                    );
+                    Ok(())
+                }
+                "empty" => {
+                    let trashed = db.list_trashed_profiles()?;
+                    for t in &trashed {
+                        let _ = wipe_profile_data(&t.id);
+                        let _ = db.delete_profile(&t.id);
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "emptied": trashed.len(),
+                        }))?
+                    );
+                    Ok(())
+                }
+                other => bail!("Unknown trash action '{other}' (expected list, restore, or empty)"),
+            }
         }
         other => bail!("Unknown profile subcommand '{other}'"),
     }
@@ -5948,6 +6250,119 @@ fn run_type_cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_totp_cli(args: &[String]) -> Result<()> {
+    let target = args
+        .first()
+        .ok_or_else(|| anyhow!("Usage: bon-login totp <short_id|name> [--type]"))?;
+    let do_type = args.iter().any(|a| a == "--type" || a == "-t");
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let p = find_profile_by_query(&profiles, target)?;
+    let (code, remaining_secs) = p
+        .current_totp()
+        .ok_or_else(|| anyhow!("Profile '{}' has no valid 2FA TOTP secret", p.name))?;
+    let mut typed = false;
+    if do_type {
+        let rt = probe_live_runtime(&p.id)
+            .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
+        cdp_type_as_human(rt.cdp_port, &format!("{code}\n"))?;
+        typed = true;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "short_id": p.short_id(),
+            "code": code,
+            "remaining_secs": remaining_secs,
+            "typed": typed,
+        }))?
+    );
+    Ok(())
+}
+
+fn run_screenshot_cli(args: &[String]) -> Result<()> {
+    let target = args
+        .first()
+        .ok_or_else(|| anyhow!("Usage: bon-login screenshot <short_id|name> [--out <file>]"))?;
+    let out_file = args
+        .windows(2)
+        .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let p = find_profile_by_query(&profiles, target)?;
+    let rt = probe_live_runtime(&p.id)
+        .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
+    let path = cdp_capture_screenshot(&p.short_id(), rt.cdp_port, out_file.as_deref())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "short_id": p.short_id(),
+            "path": path,
+        }))?
+    );
+    Ok(())
+}
+
+fn run_broadcast_cli(args: &[String]) -> Result<()> {
+    let op = args
+        .first()
+        .ok_or_else(|| anyhow!("Usage: bon-login broadcast <open|type|totp> [value] [--group <g>]"))?
+        .as_str();
+    if !matches!(op, "open" | "goto" | "navigate" | "type" | "totp" | "2fa") {
+        bail!("Unknown broadcast op '{op}' (expected open, type, or totp)");
+    }
+    let group_filter = args
+        .windows(2)
+        .find_map(|w| (w[0] == "--group" || w[0] == "-g").then_some(w[1].as_str()));
+    let val = if matches!(op, "totp" | "2fa") {
+        String::new()
+    } else {
+        args.get(1)
+            .filter(|s| !s.starts_with('-'))
+            .cloned()
+            .ok_or_else(|| anyhow!("Missing value/URL for `bon-login broadcast {op} <value>`"))?
+    };
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let running: Vec<(Profile, RuntimeInfo)> = profiles
+        .into_iter()
+        .filter(|p| {
+            group_filter.is_none_or(|g| p.group_tag.eq_ignore_ascii_case(g))
+        })
+        .filter_map(|p| probe_live_runtime(&p.id).map(|rt| (p, rt)))
+        .collect();
+    let ok_count = std::thread::scope(|s| {
+        let handles: Vec<_> = running
+            .iter()
+            .map(|(p, rt)| {
+                let v = val.clone();
+                s.spawn(move || match op {
+                    "open" | "goto" | "navigate" => cdp_navigate_page(rt.cdp_port, &v).is_ok(),
+                    "type" => cdp_type_as_human(rt.cdp_port, &v).is_ok(),
+                    "totp" | "2fa" => cdp_type_totp(p, rt.cdp_port).is_ok(),
+                    _ => false,
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().filter(|&ok| ok))
+            .count()
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "op": op,
+            "succeeded": ok_count,
+            "total_running": running.len(),
+        }))?
+    );
+    Ok(())
+}
+
 pub fn handle_control_http_request(
     method: &str,
     path: &str,
@@ -6107,6 +6522,44 @@ pub fn handle_control_http_request(
                         Ok(n) => (
                             200,
                             serde_json::json!({"ok": true, "typed_chars": n}).to_string(),
+                        ),
+                        Err(e) => (
+                            500,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        ),
+                    }
+                }
+                "totp" | "2fa" => {
+                    let Some(rt) = probe_live_runtime(&profile.id) else {
+                        return (
+                            409,
+                            serde_json::json!({"ok": false, "error": "Profile is not running"})
+                                .to_string(),
+                        );
+                    };
+                    match cdp_type_totp(&profile, rt.cdp_port) {
+                        Ok(code) => (
+                            200,
+                            serde_json::json!({"ok": true, "code": code, "typed": true}).to_string(),
+                        ),
+                        Err(e) => (
+                            400,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        ),
+                    }
+                }
+                "screenshot" => {
+                    let Some(rt) = probe_live_runtime(&profile.id) else {
+                        return (
+                            409,
+                            serde_json::json!({"ok": false, "error": "Profile is not running"})
+                                .to_string(),
+                        );
+                    };
+                    match cdp_capture_screenshot(&profile.short_id(), rt.cdp_port, None) {
+                        Ok(path) => (
+                            200,
+                            serde_json::json!({"ok": true, "path": path}).to_string(),
                         ),
                         Err(e) => (
                             500,
@@ -8747,5 +9200,18 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(code404, 404);
+
+        // Verify ensure_profile_bookmarks writes campaign bookmarks and preserves existing file
+        let mut bm_prof = Profile::new_default("TikTok Shop 01", PlatformType::MacOS);
+        bm_prof.group_tag = "TikTok".to_string();
+        let bm_dir = app_support_dir().join("profiles").join(&bm_prof.id);
+        ensure_profile_bookmarks(&bm_prof, &bm_dir);
+        let bm_file = bm_dir.join("Default/Bookmarks");
+        let bm_txt = std::fs::read_to_string(&bm_file).unwrap();
+        assert!(bm_txt.contains("https://seller.tiktok.com"));
+        std::fs::write(&bm_file, "{\"custom\":true}").unwrap();
+        ensure_profile_bookmarks(&bm_prof, &bm_dir);
+        assert_eq!(std::fs::read_to_string(&bm_file).unwrap(), "{\"custom\":true}");
+        let _ = wipe_profile_data(&bm_prof.id);
     }
 }

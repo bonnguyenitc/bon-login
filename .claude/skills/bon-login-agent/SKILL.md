@@ -33,6 +33,24 @@ bon-login flow delete <flow_name>
 # Re-sync newly opened OAuth popups / Web3 extension windows into agent-browser tabs
 bon-login sync <short_id|name>
 
+# Tile all running browser windows into a clean screen grid
+bon-login arrange [--size 960,600]
+
+# Human-type text character-by-character via CDP Input.dispatchKeyEvent (bypasses paste blockers)
+bon-login type <short_id|name> <text...>
+
+# Generate 6-digit 2FA TOTP code (add --type to auto-type code + Enter into running browser)
+bon-login totp <short_id|name> [--type]
+
+# Capture PNG screenshot of active tab via CDP Page.captureScreenshot
+bon-login screenshot <short_id|name> [--out ./shot.png]
+
+# Broadcast navigation, human typing, or 2FA autofill across all running profiles (or a group)
+bon-login broadcast <open|type|totp> [value] [--group <g>]
+
+# Start local HTTP JSON control plane on 127.0.0.1:19820 for n8n / Python / external scripts
+bon-login serve [--port 19820]
+
 # Stop running profile(s) gracefully (SIGTERM -> flush SQLite cookies -> close tunnel & daemon)
 bon-login stop <short_id|name|--group <g>|--all>
 ```
@@ -48,8 +66,9 @@ bon-login profile create "FB Ads US 01" --os windows --brand chrome --group Face
 
 # Update single profile, a whole group, or --all
 bon-login profile update <id|name|--group <g>|--all> \
-  [--name <n>] [--os macos|windows|linux] [--brand chrome|edge|brave|opera] \
-  [--group <g|none>] [--proxy <saved_proxy|none>] [--proxy-tag <tag>] \
+  [--name <n>] [--os macos|windows|linux] [--brand chrome|edge] \
+  [--group <g|none>] [--tags <t1,t2>] [--totp <base32_or_otpauth>] \
+  [--proxy <saved_proxy|none>] [--proxy-tag <tag>] \
   [--seed <u32|random>] [--cores <n>] [--gpu native|seed] \
   [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off] \
   [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>] \
@@ -60,10 +79,18 @@ bon-login profile reseed <id|name|--group <g>|--all>
 bon-login profile clone <id|name> [--count 5] [--name "ClonePrefix"]
 bon-login profile batch-create --count 10 --prefix "TikTok" --group TikTok --os windows --proxy-tag VN-ISP
 
-# Check Proxy, Cookies/State Import & Export, Wipe, Delete, Backup & Restore
+# Check/Rotate Proxy, Clean Cache, Cookie Robot Warm-up, Cookies/ZIP/CSV Import & Export, Trash
 bon-login profile check-proxy <id|name|--group <g>|--all>
+bon-login profile rotate-proxy <id|name|--group <g>|--all>
+bon-login profile clean-cache <id|name|--group <g>|--all>
+bon-login profile warmup <id|name> [url1,url2...]
 bon-login profile export-cookies <id|name> [--out ./state.json]
 bon-login profile import-cookies <id|name> <./cookies.json_or_raw_json>
+bon-login profile export-zip <id|name>
+bon-login profile import-zip ./archive.zip
+bon-login profile export-csv [--out ./profiles.csv]
+bon-login profile import-csv ./profiles.csv
+bon-login profile trash [list|restore <id|--all>|empty]
 bon-login profile wipe <id|name|--group <g>|--all>
 bon-login profile delete <id|name|--group <g>|--all>
 bon-login profile backup [--out ./backup.json]
@@ -75,14 +102,13 @@ bon-login profile restore ./backup.json
 ```bash
 bon-login proxy list [--tag <t>]
 
-# Add single proxy or import multi-line proxy file (supports host:port:user:pass:name, socks5://user:pass@host:port)
-bon-login proxy add "socks5:160.250.60.55:45042:user1:pass1:VN Proxy 01" --tag VN-ISP --expire +30d
+# Add single proxy or import multi-line proxy file (supports trailing |http://... IP rotation webhook)
+bon-login proxy add "socks5:160.250.60.55:45042:user1:pass1:VN Proxy 01|http://rotate.local/api" --tag VN-ISP --expire +30d
 bon-login proxy add ./proxies.txt --protocol socks5 --tag US-Resi --expire 24/12/2026
 
-# Check live GeoIP & latency through LocalProxyTunnel
+# Check or Rotate live GeoIP & latency through LocalProxyTunnel
 bon-login proxy check <id|name|--tag <t>|--all>
-
-# Update metadata, Extend/Clear expiration, Assign/Clear proxy, Export, or Delete
+bon-login proxy rotate <id|name|--tag <t>|--all>
 bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t|none>] [--expire <days_or_date|none>]
 bon-login proxy extend <id|name|--tag <t>|--all> <+30d|0|clear>
 bon-login proxy assign <proxy_id|name|--tag <t>|--all|none> --to <profile_id|name|--group <g>|--all>
@@ -114,7 +140,8 @@ bon-login ext remove <id|name>
 bon-login ext open <ext_id|name> [--profile <profile_id|name>]
 
 bon-login kernel status
-bon-login kernel install
+bon-login kernel check
+bon-login kernel install [--force]
 ```
 
 ## 6. `jev-ultrafast` Loop, Flow Self-Healing & Stealth Guardrails

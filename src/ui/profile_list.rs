@@ -482,7 +482,18 @@ pub fn render_profile_table(
                                     .1
                                     .to_string(),
                             ))
-                            .child(
+                            .child({
+                                let pid_clean = prof.id.clone();
+                                let pid_rot = prof.id.clone();
+                                let pid_type = prof.id.clone();
+                                let pid_shot = prof.id.clone();
+                                let is_prof_running =
+                                    matches!(statuses.get(&prof.id), Some(ProfileStatus::Running(_)));
+                                let has_proxy_rot = prof
+                                    .proxy
+                                    .as_ref()
+                                    .and_then(|p| p.change_ip_url.as_ref())
+                                    .is_some();
                                 h_flex()
                                     .pt_2()
                                     .gap_1p5()
@@ -501,6 +512,43 @@ pub fn render_profile_table(
                                             })),
                                     )
                                     .child(
+                                        Button::new("drawer-clean-cache")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .disabled(is_prof_running)
+                                            .label("🧹 Clean Cache")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.clean_single_profile_cache(&pid_clean, cx);
+                                            })),
+                                    )
+                                    .children(has_proxy_rot.then(|| {
+                                        Button::new("drawer-rotate-proxy")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .label("🔄 Rotate IP")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.rotate_profile_proxy_ip(&pid_rot, cx);
+                                            }))
+                                    }))
+                                    .children(is_prof_running.then(|| {
+                                        Button::new("drawer-human-type")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .small()
+                                            .label("⌨️ Human Type")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.type_clipboard_as_human(&pid_type, cx);
+                                            }))
+                                    }))
+                                    .children(is_prof_running.then(|| {
+                                        Button::new("drawer-screenshot")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .small()
+                                            .label("📸 Screenshot")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.capture_profile_screenshot(&pid_shot, cx);
+                                            }))
+                                    }))
+                                    .child(
                                         Button::new("drawer-open-edit")
                                             .with_variant(BonTheme::outline_blue(cx))
                                             .small()
@@ -511,8 +559,8 @@ pub fn render_profile_table(
                                             .on_click(cx.listener(move |app, _, window, cx| {
                                                 app.open_edit_view(&pid_edit, window, cx);
                                             })),
-                                    ),
-                            )
+                                    )
+                            })
                             .with_animation(
                                 content_anim_id,
                                 BonTheme::ui_enter_anim(),
@@ -594,6 +642,8 @@ fn build_profile_popup_menu(
     let pid_totp = profile_id.clone();
     let app_type = app_entity.clone();
     let pid_type = profile_id.clone();
+    let app_shot = app_entity.clone();
+    let pid_shot = profile_id.clone();
     let app_rot = app_entity.clone();
     let pid_rot = profile_id.clone();
     let app_robot = app_entity.clone();
@@ -642,24 +692,34 @@ fn build_profile_popup_menu(
             }),
         );
     }
-    if is_running {
-        menu = menu.item(
-            PopupMenuItem::new("⌨️   Human-Type Clipboard").on_click(move |_, _, cx| {
-                app_type.update(cx, |app, cx| {
-                    app.type_clipboard_as_human(&pid_type, cx);
-                });
-            }),
+    menu = menu
+        .item(
+            PopupMenuItem::new("⌨️   Human-Type Clipboard")
+                .disabled(!is_running)
+                .on_click(move |_, _, cx| {
+                    app_type.update(cx, |app, cx| {
+                        app.type_clipboard_as_human(&pid_type, cx);
+                    });
+                }),
+        )
+        .item(
+            PopupMenuItem::new("📸   Capture Screenshot")
+                .disabled(!is_running)
+                .on_click(move |_, _, cx| {
+                    app_shot.update(cx, |app, cx| {
+                        app.capture_profile_screenshot(&pid_shot, cx);
+                    });
+                }),
+        )
+        .item(
+            PopupMenuItem::new("🔄   Rotate Proxy IP")
+                .disabled(!has_rotate_url)
+                .on_click(move |_, _, cx| {
+                    app_rot.update(cx, |app, cx| {
+                        app.rotate_profile_proxy_ip(&pid_rot, cx);
+                    });
+                }),
         );
-    }
-    if has_rotate_url {
-        menu = menu.item(
-            PopupMenuItem::new("🔄   Rotate Proxy IP").on_click(move |_, _, cx| {
-                app_rot.update(cx, |app, cx| {
-                    app.rotate_profile_proxy_ip(&pid_rot, cx);
-                });
-            }),
-        );
-    }
     menu.item(
         PopupMenuItem::new("🤖   Cookie Robot (Warm-up)").on_click(move |_, _, cx| {
             let pid = pid_robot.clone();

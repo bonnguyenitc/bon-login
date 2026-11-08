@@ -686,6 +686,135 @@ impl Database {
         })
     }
 
+    /// Exports all active profiles to `backups/bonlogin_profiles.csv` (`name,group,os,brand,proxy,totp_secret,tags,startup_url,notes`).
+    pub fn export_profiles_csv(&self) -> anyhow::Result<(PathBuf, String)> {
+        fn csv_cell(val: &str) -> String {
+            let clean = val.replace(['\r', '\n'], " ");
+            if clean.contains([',', '"']) {
+                format!("\"{}\"", clean.replace('"', "\"\""))
+            } else {
+                clean
+            }
+        }
+        let profiles = self.list_profiles()?;
+        let mut lines = Vec::with_capacity(profiles.len() + 1);
+        lines.push("name,group,os,brand,proxy,totp_secret,tags,startup_url,notes".to_string());
+        for p in &profiles {
+            let proxy_s = p
+                .proxy
+                .as_ref()
+                .map(ProxyConfig::to_editable_string)
+                .unwrap_or_default();
+            lines.push(
+                [
+                    csv_cell(&p.name),
+                    csv_cell(&p.group_tag),
+                    csv_cell(p.os_platform.as_cli_str()),
+                    csv_cell(p.brand.as_cli_str()),
+                    csv_cell(&proxy_s),
+                    csv_cell(&p.totp_secret),
+                    csv_cell(&p.tags_csv()),
+                    csv_cell(&p.startup_url),
+                    csv_cell(&p.notes),
+                ]
+                .join(","),
+            );
+        }
+        let csv = lines.join("\n");
+        let path = app_data_dir()?
+            .join("backups")
+            .join("bonlogin_profiles.csv");
+        std::fs::write(&path, &csv)?;
+        Ok((path, csv))
+    }
+
+    /// Imports profiles from CSV or TSV text (`name,group,os,brand,proxy,totp_secret,tags,startup_url,notes`).
+    pub fn import_profiles_csv(&self, raw_csv: &str) -> anyhow::Result<usize> {
+        fn split_row(line: &str, delim: char) -> Vec<String> {
+            let mut cols = Vec::new();
+            let mut cur = String::new();
+            let mut in_q = false;
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if in_q {
+                    if c == '"' {
+                        if chars.peek() == Some(&'"') {
+                            cur.push('"');
+                            let _ = chars.next();
+                        } else {
+                            in_q = false;
+                        }
+                    } else {
+                        cur.push(c);
+                    }
+                } else if c == '"' {
+                    in_q = true;
+                } else if c == delim {
+                    cols.push(std::mem::take(&mut cur).trim().to_string());
+                } else {
+                    cur.push(c);
+                }
+            }
+            cols.push(cur.trim().to_string());
+            cols
+        }
+
+        let mut rows_to_insert = Vec::new();
+        let non_empty: Vec<&str> = raw_csv.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let delim = if non_empty.first().is_some_and(|l| l.contains('\t')) {
+            '\t'
+        } else {
+            ','
+        };
+        for (idx, raw_line) in non_empty.into_iter().enumerate() {
+            let cols = split_row(raw_line, delim);
+            let first = cols.first().map(String::as_str).unwrap_or("");
+            if idx == 0 && first.eq_ignore_ascii_case("name") {
+                continue;
+            }
+            if first.is_empty() {
+                continue;
+            }
+            let os = cols
+                .get(2)
+                .filter(|s| !s.is_empty())
+                .map(|s| PlatformType::from_str_lossy(s))
+                .unwrap_or(PlatformType::MacOS);
+            let mut p = Profile::new_default(first, os);
+            if let Some(g) = cols.get(1).filter(|s| !s.is_empty()) {
+                p.group_tag = g.clone();
+            }
+            if let Some(b) = cols.get(3).filter(|s| !s.is_empty()) {
+                p.brand = BrowserBrand::from_str_lossy(b);
+                p.brand_version = p.brand.version_for_seed(p.seed).to_string();
+            }
+            if let Some(px) = cols.get(4).filter(|s| !s.is_empty())
+                && let Ok(Some(cfg)) = ProxyConfig::parse_flexible(px)
+            {
+                p.proxy = Some(cfg);
+            }
+            if let Some(totp) = cols.get(5).filter(|s| !s.is_empty()) {
+                p.totp_secret = totp.clone();
+            }
+            if let Some(tags_raw) = cols.get(6).filter(|s| !s.is_empty()) {
+                p.tags = Profile::parse_tags_csv(tags_raw);
+            }
+            if let Some(url) = cols.get(7).filter(|s| !s.is_empty()) {
+                p.startup_url = url.clone();
+            }
+            if let Some(note) = cols.get(8).filter(|s| !s.is_empty()) {
+                p.notes = note.clone();
+            }
+            rows_to_insert.push(p);
+        }
+        self.with_transaction(|db| {
+            for p in &rows_to_insert {
+                db.upsert_profile(p)?;
+            }
+            Ok(rows_to_insert.len())
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Saved Proxies & Proxy Groups CRUD
     // -----------------------------------------------------------------------
@@ -1211,5 +1340,30 @@ mod tests {
         });
         assert!(err_res.is_err());
         assert_eq!(db.list_profiles().unwrap().len(), before_len);
+
+        // Test CSV export and import round-trip
+        let (_, csv_txt) = db.export_profiles_csv().unwrap();
+        assert!(csv_txt.starts_with("name,group,os,brand,proxy,totp_secret,tags,startup_url,notes"));
+        let imported_csv = db
+            .import_profiles_csv(
+                "name,group,os,brand,proxy,totp_secret,tags,startup_url,notes\n\
+                 \"Seller, 01\",TikTok,windows,edge,socks5:1.2.3.4:1080:u:p|http://rot.local,JBSWY3DPEHPK3PXP,\"Live,VIP\",https://tiktok.com,Main shop",
+            )
+            .unwrap();
+        assert_eq!(imported_csv, 1);
+        let list_after = db.list_profiles().unwrap();
+        let seller = list_after.iter().find(|p| p.name == "Seller, 01").unwrap();
+        assert_eq!(seller.group_tag, "TikTok");
+        assert_eq!(seller.os_platform, PlatformType::Windows);
+        assert_eq!(seller.brand, BrowserBrand::Edge);
+        assert_eq!(seller.totp_secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(seller.tags, vec!["Live", "VIP"]);
+        assert_eq!(
+            seller
+                .proxy
+                .as_ref()
+                .and_then(|x| x.change_ip_url.as_deref()),
+            Some("http://rot.local")
+        );
     }
 }
