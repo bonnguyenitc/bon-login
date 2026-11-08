@@ -131,6 +131,9 @@ pub struct BonLoginApp {
     pub quick_meta_tag_input: Entity<InputState>,
     pub quick_meta_note_input: Entity<TextareaState>,
     pub quick_meta_totp_input: Entity<InputState>,
+    pub quick_meta_bookmarks: Vec<(String, String)>,
+    pub quick_meta_bm_name_input: Entity<InputState>,
+    pub quick_meta_bm_url_input: Entity<InputState>,
     pub cookie_robot_target_id: Option<String>,
     pub cookie_robot_urls_input: Entity<TextareaState>,
     pub cookie_robot_dwell_secs: u64,
@@ -224,6 +227,12 @@ impl BonLoginApp {
         let quick_meta_totp_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Base32 2FA Secret or otpauth:// URI...")
         });
+        let quick_meta_bm_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Title (optional)")
+        });
+        let quick_meta_bm_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("URL (e.g. seller.tiktok.com)")
+        });
         let cookie_robot_urls_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(6)
@@ -249,7 +258,14 @@ impl BonLoginApp {
                     .timer(Duration::from_millis(800))
                     .await;
                 let Ok(profile_ids) = this.read_with(cx, |app, _| {
-                    app.profiles.iter().map(|p| p.id.clone()).collect::<Vec<_>>()
+                    app.profiles
+                        .iter()
+                        .filter(|p| {
+                            !matches!(app.statuses.get(&p.id), Some(ProfileStatus::Starting(_)))
+                                && !app.profile_tasks.contains_key(&p.id)
+                        })
+                        .map(|p| p.id.clone())
+                        .collect::<Vec<_>>()
                 }) else {
                     break;
                 };
@@ -295,7 +311,13 @@ impl BonLoginApp {
                             .map(|m| m.keys().cloned().collect())
                             .unwrap_or_default();
                         for (pid, info) in &external_live {
-                            if !matches!(app.statuses.get(pid), Some(ProfileStatus::Running(cur)) if cur == info) {
+                            if !matches!(
+                                app.statuses.get(pid),
+                                Some(ProfileStatus::Starting(_))
+                            ) && !matches!(
+                                app.statuses.get(pid),
+                                Some(ProfileStatus::Running(cur)) if cur == info
+                            ) {
                                 app.statuses.insert(pid.clone(), ProfileStatus::Running(info.clone()));
                                 changed = true;
                             }
@@ -385,6 +407,9 @@ impl BonLoginApp {
             quick_meta_tag_input,
             quick_meta_note_input,
             quick_meta_totp_input,
+            quick_meta_bookmarks: Vec::new(),
+            quick_meta_bm_name_input,
+            quick_meta_bm_url_input,
             cookie_robot_target_id: None,
             cookie_robot_urls_input,
             cookie_robot_dwell_secs: 5,
@@ -1723,10 +1748,16 @@ impl BonLoginApp {
     }
 
     pub fn save_modal_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(m) = self.modal.as_mut() {
+            let n = m.bookmark_name_input.clone();
+            let u = m.bookmark_url_input.clone();
+            profile_modal::push_bookmark_from_inputs(&mut m.bookmarks, &n, &u, window, cx);
+        }
         let Some(modal) = self.modal.as_ref() else {
             return;
         };
         let cookies_raw = modal.cookies_input.read(cx).value().to_string();
+        let bm_items = modal.bookmarks.clone();
         match modal.build_profile(cx) {
             Ok(profile) => {
                 let normalized_cookies = if cookies_raw.trim().is_empty() {
@@ -1764,10 +1795,14 @@ impl BonLoginApp {
                     .map(|b| b.to_state_json_pretty())
                     .unwrap_or_default();
                 let _ = crate::launcher::save_prelaunch_cookies(&short_id, &payload_to_save);
-
                 let saved_id = profile.id.clone();
                 let saved_name = profile.name.clone();
                 let live_pair = self.running_session_pair(&saved_id);
+                if live_pair.is_none()
+                    && let Ok(user_data_dir) = crate::launcher::profile_user_data_dir(&profile.id)
+                {
+                    crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bm_items);
+                }
                 self.reload_profiles();
                 self.select_profile(&saved_id, window, cx);
                 self.active_view = WorkspaceView::Profiles;
@@ -2279,20 +2314,22 @@ impl BonLoginApp {
         cx: &mut Context<Self>,
     ) {
         self.quick_meta_profile_id = profile_id.clone();
-        let (tags, note, totp) = if let Some(pid) = &profile_id
+        let (tags, note, totp, bms) = if let Some(pid) = &profile_id
             && let Some(p) = self.profiles.iter().find(|x| &x.id == pid)
         {
-            (p.tags.clone(), p.notes.clone(), p.totp_secret.clone())
+            let bm_list = crate::launcher::read_profile_bookmarks(p);
+            (p.tags.clone(), p.notes.clone(), p.totp_secret.clone(), bm_list)
         } else {
-            (Vec::new(), String::new(), String::new())
+            (Vec::new(), String::new(), String::new(), Vec::new())
         };
         self.quick_meta_tags = tags;
+        self.quick_meta_bookmarks = bms;
         self.quick_meta_tag_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Custom tag (e.g. Shop-01, Tier1)...")
         });
         self.quick_meta_note_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .rows(4)
+                .rows(3)
                 .placeholder("Account note, recovery email, status...")
                 .default_value(note)
         });
@@ -2301,19 +2338,72 @@ impl BonLoginApp {
                 .placeholder("Base32 2FA Secret or otpauth:// URI...")
                 .default_value(totp)
         });
+        self.quick_meta_bm_name_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Title (optional)")
+        });
+        self.quick_meta_bm_url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("URL (e.g. seller.tiktok.com)")
+        });
         self.popup_modal = Some(ActivePopupModal::QuickMeta);
         cx.notify();
     }
 
+    pub fn add_quick_meta_bookmark_from_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.quick_meta_bm_name_input.clone();
+        let u = self.quick_meta_bm_url_input.clone();
+        profile_modal::push_bookmark_from_inputs(&mut self.quick_meta_bookmarks, &n, &u, window, cx);
+        cx.notify();
+    }
+
+    pub fn open_or_copy_bookmark(&mut self, profile_id: &str, name: &str, url: &str, cx: &mut Context<Self>) {
+        let url_s = url.to_string();
+        let name_s = name.to_string();
+        if let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() {
+            let cdp_port = info.cdp_port;
+            let tokio_handle = self.tokio_handle.clone();
+            cx.write_to_clipboard(ClipboardItem::new_string(url_s.clone()));
+            self.banner_message = Some(format!("Opening bookmark '{name_s}' ({url_s})..."));
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let u_nav = url_s.clone();
+                let res = tokio_handle
+                    .spawn_blocking(move || crate::launcher::cdp_navigate_page(cdp_port, &u_nav))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+                let _ = this.update(cx, |app, cx| {
+                    app.banner_message = Some(match res {
+                        Ok(()) => format!("Opened bookmark '{name_s}' in active tab"),
+                        Err(_) => format!("Copied bookmark URL: {url_s}"),
+                    });
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string(url_s.clone()));
+            self.banner_message = Some(format!("Copied bookmark '{name_s}': {url_s}"));
+            cx.notify();
+        }
+    }
+
     pub fn save_quick_meta_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.quick_meta_bm_name_input.clone();
+        let u = self.quick_meta_bm_url_input.clone();
+        profile_modal::push_bookmark_from_inputs(&mut self.quick_meta_bookmarks, &n, &u, window, cx);
         let tags = self.quick_meta_tags.clone();
         let note = self.quick_meta_note_input.read(cx).value().trim().to_string();
         let totp = self.quick_meta_totp_input.read(cx).value().trim().to_string();
+        let bms = self.quick_meta_bookmarks.clone();
         if let Some(pid) = self.quick_meta_profile_id.clone() {
             if let Ok(db) = self.db.lock() {
                 let _ = db.update_profile_quick_meta(&pid, &note, &tags, &totp);
             }
-            self.banner_message = Some("Updated tags, note & 2FA".to_string());
+            if self.running_session_pair(&pid).is_none()
+                && let Ok(user_data_dir) = crate::launcher::profile_user_data_dir(&pid)
+            {
+                crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bms);
+            }
+            self.banner_message = Some("Updated tags, bookmarks, note & 2FA".to_string());
         } else {
             let targets: Vec<Profile> = self
                 .profiles
@@ -2328,11 +2418,17 @@ impl BonLoginApp {
                         let new_note = if note.is_empty() { &p.notes } else { &note };
                         let new_tags = if tags.is_empty() { &p.tags } else { &tags };
                         let _ = db.update_profile_quick_meta(&p.id, new_note, new_tags, &p.totp_secret);
+                        if !bms.is_empty()
+                            && self.running_session_pair(&p.id).is_none()
+                            && let Ok(user_data_dir) = crate::launcher::profile_user_data_dir(&p.id)
+                        {
+                            crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bms);
+                        }
                     }
                     Ok(())
                 });
             }
-            self.banner_message = Some(format!("Updated tags & note on {count} profile(s)"));
+            self.banner_message = Some(format!("Updated tags, bookmarks & note on {count} profile(s)"));
         }
         self.popup_modal = None;
         self.reload_profiles();
@@ -3096,13 +3192,20 @@ impl BonLoginApp {
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
                 let _ = this.update(cx, |app, cx| {
                     match res {
-                        Ok((path, json)) => {
+                        Ok((_, json)) => {
                             let _ = crate::launcher::save_prelaunch_cookies(&short_id, &json);
-                            cx.write_to_clipboard(ClipboardItem::new_string(json));
-                            app.banner_message = Some(format!(
-                                "Exported live cookies for '{prof_name}' to clipboard & {}",
-                                path.display()
-                            ));
+                            let dl_path = crate::db::user_downloads_dir()
+                                .join(format!("bon_{short_id}_cookies.json"));
+                            cx.write_to_clipboard(ClipboardItem::new_string(json.clone()));
+                            app.banner_message = Some(match std::fs::write(&dl_path, &json) {
+                                Ok(()) => format!(
+                                    "Exported live cookies for '{prof_name}' to clipboard & {}",
+                                    dl_path.display()
+                                ),
+                                Err(e) => format!(
+                                    "Copied cookies to clipboard (file save failed: {e})"
+                                ),
+                            });
                         }
                         Err(e) => {
                             app.banner_message = Some(format!("Export cookies failed: {e}"));
@@ -3126,11 +3229,20 @@ impl BonLoginApp {
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "[]".to_string())
             };
-            cx.write_to_clipboard(ClipboardItem::new_string(payload));
-            self.banner_message = Some(format!(
-                "Exported cookies JSON for '{}' to clipboard",
-                prof.name
-            ));
+            let dl_path = crate::db::user_downloads_dir()
+                .join(format!("bon_{sid}_cookies.json"));
+            cx.write_to_clipboard(ClipboardItem::new_string(payload.clone()));
+            self.banner_message = Some(match std::fs::write(&dl_path, &payload) {
+                Ok(()) => format!(
+                    "Exported cookies JSON for '{}' to clipboard & {}",
+                    prof.name,
+                    dl_path.display()
+                ),
+                Err(e) => format!(
+                    "Copied cookies for '{}' to clipboard (file save failed: {e})",
+                    prof.name
+                ),
+            });
             cx.notify();
         }
     }
@@ -4404,7 +4516,7 @@ impl Render for BonLoginApp {
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("🏷  Tags & Note")
+                                                            .label("🔖  Tags, Bookmarks & Note")
                                                             .on_click(cx.listener(
                                                                 |app, _, window, cx| {
                                                                     app.open_quick_meta_modal(

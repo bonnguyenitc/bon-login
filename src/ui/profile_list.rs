@@ -399,6 +399,67 @@ pub fn render_profile_table(
                             .overflow_y_scroll()
                             .child(drawer_row("Profile name", prof.name.clone()))
                             .child(drawer_row("Tags", tags_str))
+                            .child({
+                                let pid_bm_edit = prof.id.clone();
+                                let pid_bm_click = prof.id.clone();
+                                let bms = crate::launcher::read_profile_bookmarks(&prof);
+                                v_flex()
+                                    .w_full()
+                                    .py_1()
+                                    .gap_1p5()
+                                    .border_b_1()
+                                    .border_color(BonTheme::border())
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(BonTheme::text_secondary())
+                                                    .child(format!("Bookmarks ({})", bms.len())),
+                                            )
+                                            .child(
+                                                Button::new("drawer-quick-add-bm")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .xsmall()
+                                                    .label("+ Add / Edit")
+                                                    .on_click(cx.listener(move |app, _, window, cx| {
+                                                        app.open_quick_meta_modal(
+                                                            Some(pid_bm_edit.clone()),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    })),
+                                            ),
+                                    )
+                                    .child(if bms.is_empty() {
+                                        div()
+                                            .text_xs()
+                                            .text_color(BonTheme::text_muted())
+                                            .child("No bookmarks — click '+ Add / Edit'")
+                                            .into_any_element()
+                                    } else {
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1()
+                                            .flex_wrap()
+                                            .children(bms.into_iter().enumerate().map(|(i, (bm_name, bm_url))| {
+                                                let pid_c = pid_bm_click.clone();
+                                                let n_c = bm_name.clone();
+                                                let u_c = bm_url.clone();
+                                                Button::new(SharedString::from(format!("drawer-bm-chip-{i}")))
+                                                    .with_variant(BonTheme::row_action(cx))
+                                                    .xsmall()
+                                                    .label(format!("🔖 {bm_name}"))
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.open_or_copy_bookmark(&pid_c, &n_c, &u_c, cx);
+                                                    }))
+                                            }))
+                                            .into_any_element()
+                                    })
+                            })
                             .children(totp_opt.map(|(code, rem)| {
                                 h_flex()
                                     .w_full()
@@ -502,7 +563,7 @@ pub fn render_profile_table(
                                         Button::new("drawer-open-meta")
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
-                                            .label("🏷 Tags / Note / 2FA")
+                                            .label("🔖 Bookmarks / Tags / 2FA")
                                             .on_click(cx.listener(move |app, _, window, cx| {
                                                 app.open_quick_meta_modal(
                                                     Some(pid_meta.clone()),
@@ -676,7 +737,7 @@ fn build_profile_popup_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("🏷   Tags, Note & 2FA").on_click(move |_, window, cx| {
+            PopupMenuItem::new("🔖   Bookmarks, Tags & 2FA").on_click(move |_, window, cx| {
                 let pid = pid_meta.clone();
                 app_meta.update(cx, |app, cx| {
                     app.open_quick_meta_modal(Some(pid), window, cx);

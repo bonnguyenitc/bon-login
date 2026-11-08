@@ -48,6 +48,7 @@ pub enum ProfileEditorTab {
     Location,
     Hardware,
     Cookies,
+    Bookmarks,
 }
 
 pub struct ProfileModalState {
@@ -79,6 +80,9 @@ pub struct ProfileModalState {
     pub startup_url_input: Entity<InputState>,
     pub notes_input: Entity<InputState>,
     pub totp_input: Entity<InputState>,
+    pub bookmarks: Vec<(String, String)>,
+    pub bookmark_name_input: Entity<InputState>,
+    pub bookmark_url_input: Entity<InputState>,
     pub cookies_input: Entity<TextareaState>,
     pub cookies_cache_key: std::cell::RefCell<String>,
     pub cookies_cache_status: std::cell::RefCell<Option<Result<String, String>>>,
@@ -102,6 +106,7 @@ impl ProfileModalState {
         let notes_val = profile.notes.clone();
         let totp_val = profile.totp_secret.clone();
         let tags_val = profile.tags.clone();
+        let bookmarks_val = crate::launcher::read_profile_bookmarks(profile);
         let cookies_val = if is_edit {
             let sid = profile.short_id();
             let pre = crate::launcher::read_prelaunch_cookies(&sid);
@@ -186,6 +191,13 @@ impl ProfileModalState {
                 InputState::new(window, cx)
                     .placeholder("Base32 2FA Secret or otpauth:// URI...")
                     .default_value(totp_val)
+            }),
+            bookmarks: bookmarks_val,
+            bookmark_name_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Title (optional, e.g. My Shop)")
+            }),
+            bookmark_url_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("URL (e.g. seller.tiktok.com)")
             }),
             cookies_input: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -326,6 +338,16 @@ pub fn render_edit_profile_view(
     let url_preview = {
         let v = modal.startup_url_input.read(cx).value().trim().to_string();
         if v.is_empty() { "-".to_string() } else { v }
+    };
+    let bookmarks_parsed = modal.bookmarks.clone();
+    let bookmarks_detail_str = if bookmarks_parsed.is_empty() {
+        "None".to_string()
+    } else {
+        bookmarks_parsed
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let cookies_raw_ref = modal.cookies_input.read(cx).value();
     if modal.cookies_cache_key.borrow().as_str() != cookies_raw_ref.as_ref() {
@@ -641,6 +663,7 @@ pub fn render_edit_profile_view(
                                                 (ProfileEditorTab::Network, "Network"),
                                                 (ProfileEditorTab::Location, "Location"),
                                                 (ProfileEditorTab::Hardware, "Hardware"),
+                                                (ProfileEditorTab::Bookmarks, "Bookmarks"),
                                                 (ProfileEditorTab::Cookies, "Cookies"),
                                             ]
                                             .into_iter()
@@ -960,6 +983,8 @@ pub fn render_edit_profile_view(
                                                 .child(Input::new(&modal.notes_input)),
                                         ),
                                 )
+                                // Bookmarks Bar (Clean Title + URL Adder & Pill Chips)
+                                .child(render_modal_bookmarks_section(modal, &bookmarks_parsed, false, cx))
                                 // 2FA Authenticator (TOTP) & Profile Status Tags
                                 .child({
                                     let cur_totp_raw = modal.totp_input.read(cx).value().to_string();
@@ -1886,6 +1911,21 @@ pub fn render_edit_profile_view(
                                     |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
+                            ProfileEditorTab::Bookmarks => v_flex()
+                                .w_full()
+                                .p_4()
+                                .gap_3p5()
+                                .rounded_lg()
+                                .bg(BonTheme::bg_elevated())
+                                .border_1()
+                                .border_color(BonTheme::border())
+                                .child(render_modal_bookmarks_section(modal, &bookmarks_parsed, true, cx))
+                                .with_animation(
+                                    "prof-tab-bookmarks-enter",
+                                    BonTheme::ui_enter_anim(),
+                                    |this, delta| this.opacity(delta),
+                                )
+                                .into_any_element(),
                         }),
                 )
                 // Right Column: GenLogin 3.0 `Detail` Live Summary Table (`menu-bar_profile_create-profile_01.png`)
@@ -1933,6 +1973,7 @@ pub fn render_edit_profile_view(
                             format!("{cores} Cores / {ram_preview} GB"),
                         ))
                         .child(detail_summary_row("Start URL", url_preview))
+                        .child(detail_summary_row("Bookmarks", bookmarks_detail_str))
                         .child(detail_summary_row("Cookies", cookies_detail_str))
                         .child(detail_summary_row("Proxy", proxy_detail_str))
                         .child(detail_summary_row(
@@ -4954,10 +4995,10 @@ pub fn render_popup_modal(
                     .find(|p| &p.id == pid)
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "Profile".to_string());
-                format!("🏷  Tags, Note & 2FA — {name}")
+                format!("🔖  Bookmarks, Tags, Note & 2FA — {name}")
             } else {
                 format!(
-                    "🏷  Batch Tags & Note ({} selected)",
+                    "🔖  Batch Bookmarks, Tags & Note ({} selected)",
                     app.checked_profile_ids.len()
                 )
             };
@@ -5133,6 +5174,71 @@ pub fn render_popup_modal(
                         )
                         .child(Input::new(&app.quick_meta_totp_input))
                 }))
+                .child({
+                    let qm_bms = app.quick_meta_bookmarks.clone();
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .child(field_label(if is_single {
+                            "Bookmarks Bar"
+                        } else {
+                            "Bookmarks Bar (leave empty to keep existing)"
+                        }))
+                        .children((!qm_bms.is_empty()).then(|| {
+                            h_flex()
+                                .w_full()
+                                .gap_1()
+                                .flex_wrap()
+                                .children(qm_bms.into_iter().map(|(n, u)| {
+                                    let rm_u = u.clone();
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(BonTheme::bg_well())
+                                        .border_1()
+                                        .border_color(BonTheme::border_active())
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(BonTheme::danger_bg()).border_color(BonTheme::danger()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |app, _, _, cx| {
+                                                app.quick_meta_bookmarks.retain(|(_, eu)| eu != &rm_u);
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(format!("🔖 {n} ×"))
+                                }))
+                        }))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .w(px(135.))
+                                        .flex_shrink_0()
+                                        .child(Input::new(&app.quick_meta_bm_name_input)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(Input::new(&app.quick_meta_bm_url_input)),
+                                )
+                                .child(
+                                    Button::new("qm-bm-add-btn")
+                                        .with_variant(BonTheme::outline_blue(cx))
+                                        .small()
+                                        .label("+ Add")
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            app.add_quick_meta_bookmark_from_inputs(window, cx);
+                                        })),
+                                ),
+                        )
+                })
                 .child(
                     v_flex()
                         .w_full()
@@ -5447,4 +5553,213 @@ pub fn render_popup_modal(
             |this, delta| this.opacity(delta),
         )
         .into_any_element()
+}
+
+pub fn push_bookmark_from_inputs(
+    list: &mut Vec<(String, String)>,
+    name_input: &Entity<InputState>,
+    url_input: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let name_raw = name_input.read(cx).value().trim().to_string();
+    let url_raw = url_input.read(cx).value().trim().to_string();
+    if url_raw.is_empty() {
+        return;
+    }
+    let combined = if name_raw.is_empty() {
+        url_raw
+    } else {
+        format!("{name_raw}|{url_raw}")
+    };
+    for (n, u) in crate::launcher::parse_bookmarks_editable(&combined) {
+        if !list.iter().any(|(_, eu)| eu.eq_ignore_ascii_case(&u)) {
+            list.push((n, u));
+        }
+    }
+    name_input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+    url_input.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+}
+
+fn render_modal_bookmarks_section(
+    modal: &ProfileModalState,
+    bookmarks: &[(String, String)],
+    show_full_rows: bool,
+    cx: &mut Context<BonLoginApp>,
+) -> Div {
+    let pfx = if show_full_rows { "tab-bm" } else { "ov-bm" };
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .child(field_label(
+                    "Bookmarks Bar (shown on all tabs)",
+                ))
+                .children((!bookmarks.is_empty()).then(|| {
+                    Button::new(SharedString::from(format!("{pfx}-clear-all")))
+                        .with_variant(BonTheme::row_action(cx))
+                        .xsmall()
+                        .label("Clear")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            if let Some(m) = app.modal.as_mut() {
+                                m.bookmarks.clear();
+                                cx.notify();
+                            }
+                        }))
+                })),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(170.))
+                        .flex_shrink_0()
+                        .child(Input::new(&modal.bookmark_name_input)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&modal.bookmark_url_input)),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("{pfx}-add-btn")))
+                        .with_variant(BonTheme::outline_blue(cx))
+                        .small()
+                        .label("+ Add Bookmark")
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            if let Some(m) = app.modal.as_mut() {
+                                let n = m.bookmark_name_input.clone();
+                                let u = m.bookmark_url_input.clone();
+                                push_bookmark_from_inputs(&mut m.bookmarks, &n, &u, window, cx);
+                                cx.notify();
+                            }
+                        })),
+                ),
+        )
+        .child(if bookmarks.is_empty() {
+            div()
+                .w_full()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(BonTheme::bg_well())
+                .text_xs()
+                .text_color(BonTheme::text_muted())
+                .child("No bookmarks on bar — enter a URL above and click '+ Add Bookmark'.")
+                .into_any_element()
+        } else if show_full_rows {
+            v_flex()
+                .w_full()
+                .gap_1p5()
+                .children(bookmarks.iter().enumerate().map(|(i, (name, url))| {
+                    let rm_url = url.clone();
+                    let cp_url = url.clone();
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .py_1p5()
+                        .rounded_md()
+                        .bg(BonTheme::bg_well())
+                        .border_1()
+                        .border_color(BonTheme::border())
+                        .justify_between()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_2p5()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(BonTheme::bg_elevated())
+                                        .border_1()
+                                        .border_color(BonTheme::border_active())
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::text_primary())
+                                        .child(format!("🔖  {name}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child(url.clone()),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new(SharedString::from(format!("cp-bm-{i}")))
+                                        .ghost()
+                                        .xsmall()
+                                        .label(SfSymbol::DOC_ON_DOC)
+                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(cp_url.clone()));
+                                            app.banner_message = Some(format!("Copied URL: {cp_url}"));
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("rm-bm-{i}")))
+                                        .ghost()
+                                        .xsmall()
+                                        .label(SfSymbol::XMARK)
+                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                            if let Some(m) = app.modal.as_mut() {
+                                                m.bookmarks.retain(|(_, eu)| eu != &rm_url);
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        )
+                }))
+                .into_any_element()
+        } else {
+            h_flex()
+                .w_full()
+                .gap_1p5()
+                .flex_wrap()
+                .children(bookmarks.iter().map(|(name, url)| {
+                    let rm_url = url.clone();
+                    div()
+                        .px_2p5()
+                        .py_1()
+                        .rounded_md()
+                        .bg(BonTheme::bg_well())
+                        .border_1()
+                        .border_color(BonTheme::border_active())
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(BonTheme::text_primary())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(BonTheme::danger_bg()).border_color(BonTheme::danger()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, cx| {
+                                if let Some(m) = app.modal.as_mut() {
+                                    m.bookmarks.retain(|(_, eu)| eu != &rm_url);
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(format!("🔖 {name}  ×"))
+                }))
+                .into_any_element()
+        })
 }

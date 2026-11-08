@@ -1429,20 +1429,10 @@ pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
     let rt_path = prof_dir.join("bon_runtime.json");
     let active_port_path = prof_dir.join("DevToolsActivePort");
 
-    let info = if let Ok(raw) = std::fs::read_to_string(&rt_path)
-        && let Ok(parsed) = serde_json::from_str::<RuntimeInfo>(&raw)
-    {
-        parsed
-    } else if let Ok(contents) = std::fs::read_to_string(&active_port_path)
-        && let Ok((cdp_port, ws_url)) = parse_devtools_active_port(&contents)
-    {
-        RuntimeInfo {
-            pid: 0,
-            cdp_port,
-            ws_url,
-            local_proxy_port: None,
-        }
-    } else {
+    let Ok(raw) = std::fs::read_to_string(&rt_path) else {
+        return None;
+    };
+    let Ok(info) = serde_json::from_str::<RuntimeInfo>(&raw) else {
         return None;
     };
 
@@ -1472,6 +1462,40 @@ pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
     }
 }
 
+fn flush_prelaunch_state_if_needed(short_id: &str, cdp_port: u16, ws_url: &str) {
+    let pre_path = app_support_dir()
+        .join("states")
+        .join(format!("bon_{short_id}_prelaunch.json"));
+    if !short_id.is_empty()
+        && pre_path.is_file()
+        && cdp_has_open_window(cdp_port) == Some(true)
+        && let Ok((_, live_json)) = agent_export_state(short_id, ws_url)
+    {
+        let _ = std::fs::write(pre_path, live_json);
+    }
+}
+
+fn cleanup_stale_singleton_locks(user_data_dir: &Path) {
+    let lock_path = user_data_dir.join("SingletonLock");
+    if let Ok(target) = std::fs::read_link(&lock_path)
+        && let Some(pid_str) = target.to_string_lossy().rsplit('-').next()
+        && let Ok(pid) = pid_str.parse::<u32>()
+        && pid > 0
+        && Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    {
+        return;
+    }
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie", "RunningChromeVersion"] {
+        let _ = std::fs::remove_file(user_data_dir.join(name));
+    }
+}
+
 /// Gracefully stops a profile launched by another process (CLI daemon or previous session).
 pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
     let prof_dir = app_support_dir().join("profiles").join(profile_id);
@@ -1494,17 +1518,7 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
 
     let mut stopped_any = false;
     if let Some(info) = maybe_info {
-        if !short_id.is_empty()
-            && cdp_has_open_window(info.cdp_port) == Some(true)
-            && let Ok((_, live_json)) = agent_export_state(short_id, &info.ws_url)
-        {
-            let pre_path = app_support_dir()
-                .join("states")
-                .join(format!("bon_{short_id}_prelaunch.json"));
-            if pre_path.is_file() {
-                let _ = std::fs::write(pre_path, live_json);
-            }
-        }
+        flush_prelaunch_state_if_needed(short_id, info.cdp_port, &info.ws_url);
         if info.pid > 0 {
             #[cfg(unix)]
             {
@@ -2595,6 +2609,7 @@ pub struct RunningProcess {
     pub short_id: String,
     pub tunnel: Option<crate::proxy_tunnel::LocalProxyTunnel>,
     pub saw_window: bool,
+    pub empty_window_polls: u8,
     pub launched_at: std::time::Instant,
 }
 
@@ -2610,26 +2625,25 @@ impl RunningProcess {
         match cdp_has_open_window(self.info.cdp_port) {
             Some(true) => {
                 self.saw_window = true;
+                self.empty_window_polls = 0;
                 true
             }
-            Some(false) => !(self.saw_window || self.launched_at.elapsed() > Duration::from_secs(8)),
+            Some(false) => {
+                if self.saw_window {
+                    self.empty_window_polls = self.empty_window_polls.saturating_add(1);
+                    // Require 2 consecutive empty polls (~1.6s) so transient tab reloads never kill the browser
+                    self.empty_window_polls < 2
+                } else {
+                    self.launched_at.elapsed() <= Duration::from_secs(15)
+                }
+            }
             None => true,
         }
     }
 
     pub fn stop_gracefully(&mut self) {
         if self.is_process_running() {
-            if !self.short_id.is_empty()
-                && cdp_has_open_window(self.info.cdp_port) == Some(true)
-                && let Ok((_, live_json)) = agent_export_state(&self.short_id, &self.info.ws_url)
-            {
-                let pre_path = app_support_dir()
-                    .join("states")
-                    .join(format!("bon_{}_prelaunch.json", self.short_id));
-                if pre_path.is_file() {
-                    let _ = std::fs::write(pre_path, live_json);
-                }
-            }
+            flush_prelaunch_state_if_needed(&self.short_id, self.info.cdp_port, &self.info.ws_url);
             #[cfg(unix)]
             {
                 let pid = self.child.id().to_string();
@@ -2717,6 +2731,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     let _ = std::fs::remove_file(&active_port_file);
     let _ = std::fs::remove_file(runtime_file_path(&profile.id));
     let _ = std::fs::remove_file(launch_error_file_path(&profile.id));
+    cleanup_stale_singleton_locks(&user_data_dir);
     let _ = profile_download_dir(&profile.short_id());
     ensure_profile_bookmarks(profile, &user_data_dir);
     unquarantine_macos_app(&kernel.path);
@@ -2811,10 +2826,6 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         ws_url: ws_url.clone(),
         local_proxy_port,
     };
-    if let Ok(json) = serde_json::to_string(&info) {
-        let _ = std::fs::write(runtime_file_path(&profile.id), json);
-    }
-
     let mut saw_window = false;
     for _ in 0..120 {
         if cdp_has_open_window(cdp_port) == Some(true) {
@@ -2823,13 +2834,12 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-
     let short_id = profile.short_id();
     let prelaunch_cookies = read_prelaunch_cookies(&short_id);
-    let sid = short_id.clone();
-    let ws_clone = ws_url.clone();
-    let startup_url_hint = profile.startup_url.clone();
     if !prelaunch_cookies.trim().is_empty() {
+        let sid = short_id.clone();
+        let ws_clone = ws_url.clone();
+        let startup_url_hint = profile.startup_url.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let payload = parse_and_normalize_cookies(&prelaunch_cookies, Some(&startup_url_hint))
                 .map(|b| b.to_state_json_pretty())
@@ -2837,11 +2847,9 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
             let _ = agent_import_state_or_cookies(&sid, &ws_clone, &payload);
         })
         .await;
-    } else {
-        // Connect agent-browser daemon in background so UI transitions to Running immediately
-        tokio::task::spawn_blocking(move || {
-            let _ = ensure_agent_browser_connected(&sid, &ws_clone);
-        });
+    }
+    if let Ok(json) = serde_json::to_string(&info) {
+        let _ = std::fs::write(runtime_file_path(&profile.id), json);
     }
     let child = child_guard
         .child
@@ -2855,6 +2863,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
             short_id,
             tunnel,
             saw_window,
+            empty_window_polls: 0,
             launched_at: std::time::Instant::now(),
         },
         newly_resolved_geo,
@@ -3306,36 +3315,110 @@ pub fn cdp_type_as_human(cdp_port: u16, text: &str) -> Result<usize> {
     Ok(typed)
 }
 
-/// Populates `<user_data_dir>/Default/Bookmarks` on first launch with campaign-relevant quick links.
-pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
+/// Reads `<user_data_dir>/Default/Bookmarks` into `(Name, URL)` pairs (empty if no bookmarks yet).
+pub fn read_profile_bookmarks(profile: &Profile) -> Vec<(String, String)> {
+    type CacheMap = std::collections::HashMap<
+        String,
+        (
+            Option<(std::time::SystemTime, u64)>,
+            Vec<(String, String)>,
+        ),
+    >;
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<CacheMap>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let bm_path = app_support_dir()
+        .join("profiles")
+        .join(&profile.id)
+        .join("Default")
+        .join("Bookmarks");
+    let stamp = std::fs::metadata(&bm_path)
+        .and_then(|m| Ok((m.modified()?, m.len())))
+        .ok();
+    if let Ok(guard) = CACHE.lock()
+        && let Some((cached_stamp, cached_items)) = guard.get(&profile.id)
+        && *cached_stamp == stamp
+    {
+        return cached_items.clone();
+    }
+    let result = if let Ok(raw) = std::fs::read_to_string(&bm_path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+        && let Some(children) = val
+            .get("roots")
+            .and_then(|r| r.get("bookmark_bar"))
+            .and_then(|b| b.get("children"))
+            .and_then(|c| c.as_array())
+    {
+        children
+            .iter()
+            .filter_map(|item| {
+                let name = item.get("name")?.as_str()?.trim();
+                let url = item.get("url")?.as_str()?.trim();
+                (!url.is_empty()).then(|| (name.to_string(), url.to_string()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.insert(profile.id.clone(), (stamp, result.clone()));
+    }
+    result
+}
+
+/// Parses `"Name|URL, URL2, ..."` into `(Name, URL)` bookmark pairs.
+pub fn parse_bookmarks_editable(raw: &str) -> Vec<(String, String)> {
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|token| {
+            let (name, url_raw) = if let Some((l, r)) = token.split_once('|') {
+                (l.trim(), r.trim())
+            } else {
+                ("", token)
+            };
+            let url = if url_raw.starts_with("http://")
+                || url_raw.starts_with("https://")
+                || url_raw.starts_with("chrome://")
+                || url_raw.starts_with("chrome-extension://")
+            {
+                url_raw.to_string()
+            } else {
+                format!("https://{url_raw}")
+            };
+            let label = if !name.is_empty() {
+                name.to_string()
+            } else {
+                url.split("://")
+                    .nth(1)
+                    .unwrap_or(&url)
+                    .split('/')
+                    .next()
+                    .unwrap_or("Bookmark")
+                    .trim_start_matches("www.")
+                    .to_string()
+            };
+            (label, url)
+        })
+        .collect()
+}
+
+pub fn write_profile_bookmarks_items(user_data_dir: &Path, items: &[(String, String)]) {
     let def_dir = user_data_dir.join("Default");
-    let bm_path = def_dir.join("Bookmarks");
-    if bm_path.exists() {
-        return;
-    }
     let _ = std::fs::create_dir_all(&def_dir);
-    let mut items: Vec<(&str, String)> = vec![
-        ("BrowserScan", "https://browserscan.net".to_string()),
-        ("CreepJS", "https://abrahamjuliot.github.io/creepjs/".to_string()),
-    ];
-    let grp = profile.group_tag.to_ascii_lowercase();
-    if grp.contains("fb") || grp.contains("facebook") {
-        items.push(("Ads Manager", "https://adsmanager.facebook.com".to_string()));
-        items.push(("Business Suite", "https://business.facebook.com".to_string()));
-    } else if grp.contains("tiktok") {
-        items.push(("TikTok Seller", "https://seller.tiktok.com".to_string()));
-        items.push(("TikTok Ads", "https://ads.tiktok.com".to_string()));
-    } else if grp.contains("airdrop") || grp.contains("crypto") || grp.contains("web3") {
-        items.push(("DeBank", "https://debank.com".to_string()));
-        items.push(("Revoke.cash", "https://revoke.cash".to_string()));
-    }
-    for url in profile.startup_urls() {
-        if !items.iter().any(|(_, u)| u == &url) {
-            items.push(("Launch", url));
-        }
-    }
-    let children: Vec<serde_json::Value> = items
-        .into_iter()
+    let bm_path = def_dir.join("Bookmarks");
+    let existing = std::fs::read_to_string(&bm_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let roots = existing.as_ref().and_then(|v| v.get("roots"));
+    let other_children = roots
+        .and_then(|r| r.get("other")?.get("children").cloned())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let synced_children = roots
+        .and_then(|r| r.get("synced")?.get("children").cloned())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let mut children: Vec<serde_json::Value> = items
+        .iter()
         .enumerate()
         .map(|(i, (name, url))| {
             serde_json::json!({
@@ -3346,6 +3429,15 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
             })
         })
         .collect();
+    if let Some(prev_bar) = roots
+        .and_then(|r| r.get("bookmark_bar")?.get("children")?.as_array())
+    {
+        for entry in prev_bar {
+            if entry.get("url").is_none() {
+                children.push(entry.clone());
+            }
+        }
+    }
     let bm_json = serde_json::json!({
         "roots": {
             "bookmark_bar": {
@@ -3354,14 +3446,49 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
                 "name": "Bookmarks bar",
                 "type": "folder"
             },
-            "other": { "children": [], "id": "100", "name": "Other bookmarks", "type": "folder" },
-            "synced": { "children": [], "id": "101", "name": "Mobile bookmarks", "type": "folder" }
+            "other": { "children": other_children, "id": "100", "name": "Other bookmarks", "type": "folder" },
+            "synced": { "children": synced_children, "id": "101", "name": "Mobile bookmarks", "type": "folder" }
         },
         "version": 1
     });
     if let Ok(s) = serde_json::to_string_pretty(&bm_json) {
         let _ = std::fs::write(bm_path, s);
     }
+    ensure_bookmark_bar_visible(&def_dir);
+}
+
+fn ensure_bookmark_bar_visible(def_dir: &Path) {
+    let pref_path = def_dir.join("Preferences");
+    let mut prefs: serde_json::Value = std::fs::read_to_string(&pref_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if prefs
+        .get("bookmark_bar")
+        .and_then(|b| b.get("show_on_all_tabs"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return;
+    }
+    if let Some(obj) = prefs.as_object_mut() {
+        let bar = obj
+            .entry("bookmark_bar")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(bar_obj) = bar.as_object_mut() {
+            bar_obj.insert("show_on_all_tabs".to_string(), serde_json::Value::Bool(true));
+        }
+        if let Ok(s) = serde_json::to_string(&prefs) {
+            let _ = std::fs::write(pref_path, s);
+        }
+    }
+}
+
+/// Ensures `<user_data_dir>/Default/Preferences` has the Bookmarks bar visible on all tabs.
+pub fn ensure_profile_bookmarks(_profile: &Profile, user_data_dir: &Path) {
+    let def_dir = user_data_dir.join("Default");
+    let _ = std::fs::create_dir_all(&def_dir);
+    ensure_bookmark_bar_visible(&def_dir);
 }
 
 /// Generates the current 6-digit TOTP code for `profile` and types `{code}\n` into the active browser input.
@@ -3415,72 +3542,12 @@ pub fn cdp_capture_screenshot(
     let out_path = match custom_out {
         Some(p) => p.to_path_buf(),
         None => {
-            let dir = app_support_dir().join("screenshots");
-            let _ = std::fs::create_dir_all(&dir);
+            let dir = crate::db::user_downloads_dir();
             dir.join(format!("bon_{short_id}_{}.png", unix_now()))
         }
     };
     std::fs::write(&out_path, png_bytes)?;
     Ok(out_path)
-}
-
-/// Attaches any `chrome-extension://` page tabs that opened at browser startup (before `agent-browser connect`)
-/// so they appear in `agent-browser --session bon_<id> tab`.
-fn sync_extension_targets_to_agent_browser(session: &str, cdp_port: u16) -> usize {
-    let Some(list_body) = cdp_http_get_body(cdp_port, "/json/list") else {
-        return 0;
-    };
-    let Ok(targets) = serde_json::from_str::<serde_json::Value>(&list_body) else {
-        return 0;
-    };
-    let Some(target_arr) = targets.as_array() else {
-        return 0;
-    };
-    let ext_pages: Vec<(String, String)> = target_arr
-        .iter()
-        .filter_map(|t| {
-            let ty = t.get("type")?.as_str()?;
-            let id = t.get("id")?.as_str()?;
-            let url = t.get("url")?.as_str()?;
-            (matches!(ty, "page" | "app") && url.starts_with("chrome-extension://"))
-                .then(|| (id.to_string(), url.to_string()))
-        })
-        .collect();
-    if ext_pages.is_empty() {
-        return 0;
-    }
-
-    let known_urls: std::collections::HashSet<String> = agent_browser_cmd()
-        .args(["--session", session, "tab", "--json"])
-        .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-        .and_then(|v| {
-            v.get("data")?
-                .get("tabs")?
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| t.get("url")?.as_str().map(ToString::to_string))
-                        .collect()
-                })
-        })
-        .unwrap_or_default();
-
-    let mut attached = 0;
-    for (old_id, ext_url) in ext_pages {
-        if !known_urls.contains(&ext_url) {
-            let opened = agent_browser_cmd()
-                .args(["--session", session, "tab", "new", &ext_url])
-                .output()
-                .is_ok_and(|o| o.status.success());
-            if opened {
-                let _ = cdp_http_get_body(cdp_port, &format!("/json/close/{old_id}"));
-                attached += 1;
-            }
-        }
-    }
-    attached
 }
 
 /// Returns true when an `agent-browser` command failed due to an unattached/stale CDP session
@@ -3530,9 +3597,6 @@ pub fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<St
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("agent-browser connect failed: {}", stderr.trim());
     }
-    if let Some(port) = extract_port_from_ws_url(ws_url) {
-        sync_extension_targets_to_agent_browser(&session, port);
-    }
     Ok(session)
 }
 
@@ -3579,12 +3643,6 @@ pub fn ensure_agent_browser_pinned_tab(
 /// Re-scans CDP targets (OAuth popups, Web3 wallet windows, extensions) and returns the active tab list.
 pub fn agent_sync_targets(short_id: &str, ws_url: &str) -> Result<serde_json::Value> {
     let session = ensure_agent_browser_connected(short_id, ws_url)?;
-    let cdp_port = extract_port_from_ws_url(ws_url).unwrap_or(0);
-    let newly_attached = if cdp_port > 0 {
-        sync_extension_targets_to_agent_browser(&session, cdp_port)
-    } else {
-        0
-    };
     let tabs_out = agent_browser_cmd_for_short_id(short_id)
         .args(["--session", &session, "tab", "--json"])
         .output()?;
@@ -3593,7 +3651,6 @@ pub fn agent_sync_targets(short_id: &str, ws_url: &str) -> Result<serde_json::Va
     Ok(serde_json::json!({
         "ok": true,
         "session": session,
-        "newly_attached_extension_tabs": newly_attached,
         "tabs": tabs_json.get("data").and_then(|d| d.get("tabs")).cloned().unwrap_or(tabs_json),
     }))
 }
@@ -4007,9 +4064,9 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Exports a full profile archive (`.zip`) containing `profile_metadata.json`, `prelaunch_cookies.json`,
-/// and its essential `user_data` directory (Cookies, LocalStorage, IndexedDB, Extension storage) into `backups/`.
+/// and its essential `user_data` directory (Cookies, LocalStorage, IndexedDB, Extension storage) into `~/Downloads/`.
 pub fn export_profile_archive_zip(profile: &Profile) -> Result<PathBuf> {
-    let backups_dir = app_support_dir().join("backups");
+    let backups_dir = crate::db::user_downloads_dir();
     std::fs::create_dir_all(&backups_dir)?;
     let clean_name: String = profile
         .name
@@ -5133,7 +5190,7 @@ fn run_profile_subcommand(
             let profiles = db.list_profiles()?;
             let p = find_profile_by_query(&profiles, target)?;
             let sid = p.short_id();
-            let (state_path, json) = if let Some(live) = probe_live_runtime(&p.id) {
+            let (_, json) = if let Some(live) = probe_live_runtime(&p.id) {
                 agent_export_state(&sid, &live.ws_url)?
             } else {
                 let saved = app_support_dir()
@@ -5155,12 +5212,10 @@ fn run_profile_subcommand(
                 let content = std::fs::read_to_string(&chosen)?;
                 (chosen, content)
             };
-            let final_path = if let Some(custom) = out_file {
-                std::fs::write(&custom, &json)?;
-                custom
-            } else {
-                state_path
-            };
+            let final_path = out_file.unwrap_or_else(|| {
+                crate::db::user_downloads_dir().join(format!("bon_{sid}_cookies.json"))
+            });
+            std::fs::write(&final_path, &json)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -5257,13 +5312,7 @@ fn run_profile_subcommand(
             let out_file = rest
                 .windows(2)
                 .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
-            let (default_path, json) = db.export_profiles_json()?;
-            let final_path = if let Some(custom) = out_file {
-                std::fs::write(&custom, &json)?;
-                custom
-            } else {
-                default_path
-            };
+            let (final_path, _) = db.export_profiles_json_to(out_file.as_deref())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -5294,13 +5343,7 @@ fn run_profile_subcommand(
             let out_file = rest
                 .windows(2)
                 .find_map(|w| (w[0] == "--out" || w[0] == "-o").then(|| PathBuf::from(&w[1])));
-            let (default_path, csv) = db.export_profiles_csv()?;
-            let final_path = if let Some(custom) = out_file {
-                std::fs::write(&custom, &csv)?;
-                custom
-            } else {
-                default_path
-            };
+            let (final_path, _) = db.export_profiles_csv_to(out_file.as_deref())?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -9126,6 +9169,21 @@ mod tests {
         assert!(def_dir.join("Cookies").is_file());
         assert!(!def_dir.join("Cache").exists());
         let _ = wipe_profile_data(&cache_test_id);
+        // Verify cleanup_stale_singleton_locks keeps live PID lock and removes dead PID lock
+        #[cfg(unix)]
+        {
+            let lock_test_dir = std::env::temp_dir().join(format!("bon_lock_test_{}", rand::random::<u32>()));
+            std::fs::create_dir_all(&lock_test_dir).unwrap();
+            let my_pid = std::process::id();
+            std::os::unix::fs::symlink(format!("host-{my_pid}"), lock_test_dir.join("SingletonLock")).unwrap();
+            cleanup_stale_singleton_locks(&lock_test_dir);
+            assert!(lock_test_dir.join("SingletonLock").symlink_metadata().is_ok());
+            let _ = std::fs::remove_file(lock_test_dir.join("SingletonLock"));
+            std::os::unix::fs::symlink("host-99999999", lock_test_dir.join("SingletonLock")).unwrap();
+            cleanup_stale_singleton_locks(&lock_test_dir);
+            assert!(lock_test_dir.join("SingletonLock").symlink_metadata().is_err());
+            let _ = std::fs::remove_dir_all(&lock_test_dir);
+        }
 
         // Verify cdp_type_as_human sends Input.dispatchKeyEvent frames without Runtime.enable
         use std::io::{Read, Write};
@@ -9201,17 +9259,22 @@ mod tests {
             .unwrap();
         assert_eq!(code404, 404);
 
-        // Verify ensure_profile_bookmarks writes campaign bookmarks and preserves existing file
-        let mut bm_prof = Profile::new_default("TikTok Shop 01", PlatformType::MacOS);
-        bm_prof.group_tag = "TikTok".to_string();
+        // Verify ensure_profile_bookmarks enables bookmark_bar without auto-populating default bookmarks
+        let bm_prof = Profile::new_default("TikTok Shop 01", PlatformType::MacOS);
         let bm_dir = app_support_dir().join("profiles").join(&bm_prof.id);
         ensure_profile_bookmarks(&bm_prof, &bm_dir);
-        let bm_file = bm_dir.join("Default/Bookmarks");
-        let bm_txt = std::fs::read_to_string(&bm_file).unwrap();
-        assert!(bm_txt.contains("https://seller.tiktok.com"));
-        std::fs::write(&bm_file, "{\"custom\":true}").unwrap();
-        ensure_profile_bookmarks(&bm_prof, &bm_dir);
-        assert_eq!(std::fs::read_to_string(&bm_file).unwrap(), "{\"custom\":true}");
+        let pref_file = bm_dir.join("Default/Preferences");
+        let pref_txt = std::fs::read_to_string(&pref_file).unwrap();
+        assert!(pref_txt.contains("\"show_on_all_tabs\":true"));
+        assert!(read_profile_bookmarks(&bm_prof).is_empty());
+        let custom_items = parse_bookmarks_editable("My Dashboard|https://dash.example.com, shop.example.com");
+        assert_eq!(custom_items.len(), 2);
+        assert_eq!(custom_items[0], ("My Dashboard".to_string(), "https://dash.example.com".to_string()));
+        assert_eq!(custom_items[1], ("shop.example.com".to_string(), "https://shop.example.com".to_string()));
+        write_profile_bookmarks_items(&bm_dir, &custom_items);
+        assert_eq!(read_profile_bookmarks(&bm_prof), custom_items);
+        write_profile_bookmarks_items(&bm_dir, &[]);
+        assert!(read_profile_bookmarks(&bm_prof).is_empty());
         let _ = wipe_profile_data(&bm_prof.id);
     }
 }

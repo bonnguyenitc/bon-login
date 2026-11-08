@@ -47,7 +47,13 @@ fn main() {
     app.run(move |cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
-        Theme::global_mut(cx).font_family = "SF Pro".into();
+        Theme::update(cx, |theme| {
+            theme.font_family = "SF Pro".into();
+            theme.input = rgb(0x52525b).into();
+            theme.ring = rgb(0x0a84ff).into();
+            theme.caret = rgb(0x0a84ff).into();
+            theme.selection = rgba(0x0a84ff55).into();
+        });
         cx.activate(true);
 
         let quit_procs = running_processes.clone();

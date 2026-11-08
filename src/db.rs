@@ -21,6 +21,17 @@ pub fn app_data_dir() -> anyhow::Result<PathBuf> {
     Ok(APP_DATA_DIR.clone())
 }
 
+pub fn user_downloads_dir() -> PathBuf {
+    #[cfg(test)]
+    let dir = APP_DATA_DIR.join("backups");
+    #[cfg(not(test))]
+    let dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .unwrap_or_else(|| APP_DATA_DIR.join("backups"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 fn apply_fast_pragmas(conn: &Connection) {
     let _ = conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -653,13 +664,20 @@ impl Database {
         stmt.execute(params![profile_id])?;
         Ok(())
     }
-    /// Exports all profiles to `~/Library/Application Support/com.bonlogin.app/backups/bonlogin_profiles_backup.json`.
+    /// Exports all profiles to `~/Downloads/bonlogin_profiles_backup.json`.
     pub fn export_profiles_json(&self) -> anyhow::Result<(PathBuf, String)> {
+        self.export_profiles_json_to(None)
+    }
+
+    pub fn export_profiles_json_to(
+        &self,
+        custom_out: Option<&std::path::Path>,
+    ) -> anyhow::Result<(PathBuf, String)> {
         let profiles = self.list_profiles()?;
         let json = serde_json::to_string_pretty(&profiles)?;
-        let path = app_data_dir()?
-            .join("backups")
-            .join("bonlogin_profiles_backup.json");
+        let path = custom_out
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_downloads_dir().join("bonlogin_profiles_backup.json"));
         std::fs::write(&path, &json)?;
         Ok((path, json))
     }
@@ -686,8 +704,15 @@ impl Database {
         })
     }
 
-    /// Exports all active profiles to `backups/bonlogin_profiles.csv` (`name,group,os,brand,proxy,totp_secret,tags,startup_url,notes`).
+    /// Exports all active profiles to `~/Downloads/bonlogin_profiles.csv` (`name,group,os,brand,proxy,totp_secret,tags,startup_url,notes`).
     pub fn export_profiles_csv(&self) -> anyhow::Result<(PathBuf, String)> {
+        self.export_profiles_csv_to(None)
+    }
+
+    pub fn export_profiles_csv_to(
+        &self,
+        custom_out: Option<&std::path::Path>,
+    ) -> anyhow::Result<(PathBuf, String)> {
         fn csv_cell(val: &str) -> String {
             let clean = val.replace(['\r', '\n'], " ");
             if clean.contains([',', '"']) {
@@ -721,9 +746,9 @@ impl Database {
             );
         }
         let csv = lines.join("\n");
-        let path = app_data_dir()?
-            .join("backups")
-            .join("bonlogin_profiles.csv");
+        let path = custom_out
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_downloads_dir().join("bonlogin_profiles.csv"));
         std::fs::write(&path, &csv)?;
         Ok((path, csv))
     }
@@ -1342,7 +1367,8 @@ mod tests {
         assert_eq!(db.list_profiles().unwrap().len(), before_len);
 
         // Test CSV export and import round-trip
-        let (_, csv_txt) = db.export_profiles_csv().unwrap();
+        let (csv_path, csv_txt) = db.export_profiles_csv().unwrap();
+        let _ = std::fs::remove_file(&csv_path);
         assert!(csv_txt.starts_with("name,group,os,brand,proxy,totp_secret,tags,startup_url,notes"));
         let imported_csv = db
             .import_profiles_csv(
