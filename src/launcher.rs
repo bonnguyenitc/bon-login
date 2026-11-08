@@ -1578,7 +1578,6 @@ pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
                 .with_context(|| format!("Failed to wipe profile dir {}", dir.display()))?;
         }
     }
-    std::fs::create_dir_all(&dir)?;
     let short_id: String = profile_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -1653,7 +1652,7 @@ fn extract_host_from_url_or_domain(raw: &str) -> Option<String> {
         .unwrap_or(trimmed);
     let had_scheme = without_scheme.len() != trimmed.len();
     let host_port = without_scheme
-        .split(['/', '?', '#'])
+        .split(['/', '?', '#', ',', ' ', '\t', '\r', '\n'])
         .next()
         .unwrap_or("")
         .trim();
@@ -1679,7 +1678,7 @@ fn extract_origin_from_url(raw: &str) -> Option<String> {
     } else {
         return None;
     };
-    let authority = rest.split(['/', '?', '#']).next()?.trim();
+    let authority = rest.split(['/', '?', '#', ',', ' ', '\t', '\r', '\n']).next()?.trim();
     if authority.is_empty() {
         return None;
     }
@@ -2430,9 +2429,8 @@ pub fn build_chromium_args(
         "--remote-debugging-address=127.0.0.1".to_string(),
     ]);
 
-    let startup = profile.startup_url.trim();
-    if !startup.is_empty() {
-        args.push(startup.to_string());
+    for url in profile.startup_urls() {
+        args.push(url);
     }
 
     args
@@ -3569,6 +3567,227 @@ pub fn agent_import_state_or_cookies(
     Ok(format!("Imported {}", bundle.summary_badge()))
 }
 
+/// Runs a Cookie Robot warm-up sequence on a running profile (`ws_url`), visiting each URL,
+/// scrolling naturally, waiting `dwell_secs`, and exporting the accumulated cookies to prelaunch storage.
+pub fn run_cookie_robot_warmup(
+    short_id: &str,
+    ws_url: &str,
+    urls: &[String],
+    dwell_secs: u64,
+) -> Result<usize> {
+    let clean_urls: Vec<String> = urls
+        .iter()
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            if u.starts_with("http://") || u.starts_with("https://") {
+                u.to_string()
+            } else {
+                format!("https://{u}")
+            }
+        })
+        .collect();
+    if clean_urls.is_empty() {
+        bail!("At least 1 warm-up URL is required");
+    }
+    let session = ensure_agent_browser_connected(short_id, ws_url)?;
+    let cdp_port = extract_port_from_ws_url(ws_url);
+    let wait_s = dwell_secs.clamp(1, 30);
+    let mut visited = 0usize;
+    for url in &clean_urls {
+        if let Some(port) = cdp_port
+            && cdp_has_open_window(port) == Some(false)
+        {
+            break;
+        }
+        let opened = agent_browser_cmd_for_short_id(short_id)
+            .args(["--session", &session, "open", url])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !opened {
+            break;
+        }
+        visited += 1;
+        std::thread::sleep(Duration::from_millis(800));
+        let _ = agent_browser_cmd_for_short_id(short_id)
+            .args(["--session", &session, "scroll", "down", "420"])
+            .output();
+        std::thread::sleep(Duration::from_secs(wait_s));
+        if let Some(port) = cdp_port
+            && cdp_has_open_window(port) == Some(false)
+        {
+            break;
+        }
+        let _ = agent_browser_cmd_for_short_id(short_id)
+            .args(["--session", &session, "scroll", "up", "160"])
+            .output();
+    }
+    if visited > 0
+        && let Ok((_, live_json)) = agent_export_state(short_id, ws_url)
+    {
+        let _ = save_prelaunch_cookies(short_id, &live_json);
+    }
+    Ok(visited)
+}
+
+fn is_chromium_ephemeral_entry(name: &str) -> bool {
+    matches!(
+        name,
+        "Cache"
+            | "Code Cache"
+            | "GPUCache"
+            | "ShaderCache"
+            | "DawnCache"
+            | "DawnWebGPUCache"
+            | "DawnGraphiteCache"
+            | "GrShaderCache"
+            | "GraphiteDawnCache"
+            | "Crashpad"
+            | "BrowserMetrics"
+            | "Safe Browsing"
+            | "ComponentMetrics"
+            | "SingletonLock"
+            | "SingletonSocket"
+            | "SingletonCookie"
+            | "DevToolsActivePort"
+            | "RunningChromeVersion"
+    ) || name.ends_with(".tmp")
+}
+
+fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if is_chromium_ephemeral_entry(&name_str) {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&file_name);
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_filtered(&src_path, &dst_path)?;
+        } else if ft.is_file() {
+            let _ = std::fs::copy(&src_path, &dst_path);
+        }
+    }
+    Ok(())
+}
+
+/// Exports a full profile archive (`.zip`) containing `profile_metadata.json`, `prelaunch_cookies.json`,
+/// and its essential `user_data` directory (Cookies, LocalStorage, IndexedDB, Extension storage) into `backups/`.
+pub fn export_profile_archive_zip(profile: &Profile) -> Result<PathBuf> {
+    let backups_dir = app_support_dir().join("backups");
+    std::fs::create_dir_all(&backups_dir)?;
+    let clean_name: String = profile
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(28)
+        .collect();
+    let short_id = profile.short_id();
+    let zip_path = backups_dir.join(format!("bonlogin_{clean_name}_{short_id}.zip"));
+    let _ = std::fs::remove_file(&zip_path);
+
+    let nonce = rand::random::<u32>();
+    let stage_dir = std::env::temp_dir().join(format!("bonlogin_pack_{short_id}_{nonce}"));
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    std::fs::create_dir_all(&stage_dir)?;
+
+    let meta_json = serde_json::to_string_pretty(profile)?;
+    std::fs::write(stage_dir.join("profile_metadata.json"), meta_json)?;
+
+    let pre_cookies = read_prelaunch_cookies(&short_id);
+    if !pre_cookies.trim().is_empty() {
+        std::fs::write(stage_dir.join("prelaunch_cookies.json"), pre_cookies)?;
+    }
+
+    let user_data_src = app_support_dir().join("profiles").join(&profile.id);
+    if user_data_src.is_dir() {
+        let _ = copy_dir_filtered(&user_data_src, &stage_dir.join("user_data"));
+    }
+
+    let status = Command::new("/usr/bin/zip")
+        .current_dir(&stage_dir)
+        .args(["-r", "-q", &zip_path.to_string_lossy(), "."])
+        .status()
+        .context("Failed to execute /usr/bin/zip")?;
+    let _ = std::fs::remove_dir_all(&stage_dir);
+
+    if !status.success() {
+        bail!("Failed to create profile backup archive (.zip)");
+    }
+    Ok(zip_path)
+}
+
+/// Restores a profile from a `.zip` archive exported by `export_profile_archive_zip`.
+/// If `existing_ids` already contains the profile's UUID, assigns a fresh UUID so nothing is overwritten.
+pub fn import_profile_archive_zip(
+    zip_path: &Path,
+    existing_ids: &std::collections::HashSet<String>,
+) -> Result<Profile> {
+    if !zip_path.is_file() {
+        bail!("Backup archive not found: {}", zip_path.display());
+    }
+    let nonce = rand::random::<u32>();
+    let stage_dir = std::env::temp_dir().join(format!("bonlogin_unpack_{nonce}"));
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    std::fs::create_dir_all(&stage_dir)?;
+
+    let status = Command::new("/usr/bin/unzip")
+        .args([
+            "-q",
+            "-o",
+            &zip_path.to_string_lossy(),
+            "-d",
+            &stage_dir.to_string_lossy(),
+        ])
+        .status()
+        .context("Failed to execute /usr/bin/unzip")?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        bail!("Invalid or corrupted .zip archive");
+    }
+
+    let meta_path = stage_dir.join("profile_metadata.json");
+    if !meta_path.is_file() {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        bail!("Archive does not contain profile_metadata.json");
+    }
+    let meta_raw = std::fs::read_to_string(&meta_path)?;
+    let mut profile: Profile = serde_json::from_str(&meta_raw)
+        .context("Failed to parse profile_metadata.json")?;
+    profile.deleted_at = None;
+    let invalid_uuid = uuid::Uuid::parse_str(&profile.id).is_err();
+    if invalid_uuid || existing_ids.contains(&profile.id) {
+        profile.id = uuid::Uuid::new_v4().to_string();
+        if !invalid_uuid {
+            profile.name = format!("{} (Restored)", profile.name);
+        }
+    }
+
+    let short_id = profile.short_id();
+    let pre_path = stage_dir.join("prelaunch_cookies.json");
+    if let Ok(pre_raw) = std::fs::read_to_string(&pre_path)
+        && !pre_raw.trim().is_empty()
+    {
+        let _ = save_prelaunch_cookies(&short_id, &pre_raw);
+    }
+
+    let user_data_stage = stage_dir.join("user_data");
+    if user_data_stage.is_dir() {
+        let dst_dir = app_support_dir().join("profiles").join(&profile.id);
+        let _ = copy_dir_filtered(&user_data_stage, &dst_dir);
+    }
+
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    Ok(profile)
+}
+
 // ---------------------------------------------------------------------------
 // Full Headless CLI Control Plane (`bon-login <command> ...`)
 // ---------------------------------------------------------------------------
@@ -3764,6 +3983,14 @@ pub fn apply_profile_cli_flags(
             }
             "--notes" => {
                 profile.notes = next_val()?.to_string();
+                idx += 2;
+            }
+            "--tags" => {
+                profile.tags = Profile::parse_tags_csv(next_val()?);
+                idx += 2;
+            }
+            "--totp" | "--2fa" => {
+                profile.totp_secret = next_val()?.trim().to_string();
                 idx += 2;
             }
             "--cookies" => {
@@ -4419,7 +4646,6 @@ fn run_profile_subcommand(
         }
         "check-proxy" => {
             let profiles = db.list_profiles()?;
-            let saved_proxies = db.list_proxies()?;
             let (targets, _) = select_profiles_by_target(&profiles, rest)?;
             let mut out = Vec::new();
             for p in targets {
@@ -4577,9 +4803,6 @@ fn run_profile_subcommand(
             for p in targets {
                 stop_external_runtime(&p.id, &p.short_id());
                 let _ = wipe_profile_data(&p.id);
-                if let Ok(dir) = profile_user_data_dir(&p.id) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
                 db.delete_profile(&p.id)?;
                 deleted.push(p.short_id());
             }
@@ -7224,9 +7447,6 @@ mod tests {
         }
         let _ = wipe_profile_data(&profile.id);
         clear_flow_session_cache(&short_id);
-        if let Ok(dir) = profile_user_data_dir(&profile.id) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 
 
@@ -7681,5 +7901,58 @@ mod tests {
         let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/mock");
         cdp_set_window_bounds(port, &ws_url, 10, 25, 960, 600).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn test_export_and_import_profile_archive_zip_and_trash() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let mut p = Profile::new_default("ZipTestProfile", PlatformType::MacOS);
+        p.tags = vec!["Live".to_string(), "VIP".to_string()];
+        p.totp_secret = "JBSWY3DPEHPK3PXP".to_string();
+        p.notes = "Backup test note".to_string();
+        db.upsert_profile(&p).unwrap();
+
+        // Verify soft-delete -> Trash -> Restore
+        assert_eq!(db.list_profiles().unwrap().len(), 1);
+        assert_eq!(db.list_trashed_profiles().unwrap().len(), 0);
+        db.soft_delete_profile(&p.id).unwrap();
+        assert_eq!(db.list_profiles().unwrap().len(), 0);
+        assert_eq!(db.list_trashed_profiles().unwrap().len(), 1);
+        db.restore_profile(&p.id).unwrap();
+        let active = db.list_profiles().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].tags, vec!["Live", "VIP"]);
+        assert_eq!(active[0].totp_secret, "JBSWY3DPEHPK3PXP");
+
+        // Verify .zip export and import round-trip
+        let zip_path = export_profile_archive_zip(&p).unwrap();
+        assert!(zip_path.is_file());
+        let mut existing = std::collections::HashSet::new();
+        existing.insert(p.id.clone());
+        let restored = import_profile_archive_zip(&zip_path, &existing).unwrap();
+        assert_ne!(restored.id, p.id);
+        assert_eq!(restored.tags, vec!["Live", "VIP"]);
+        assert_eq!(restored.totp_secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(restored.notes, "Backup test note");
+        let _ = std::fs::remove_file(&zip_path);
+        let _ = wipe_profile_data(&restored.id);
+
+        // Verify path-traversal ID in .zip metadata is replaced with a safe UUID
+        let mut malicious = p.clone();
+        malicious.id = "../../outside_dir".to_string();
+        let mal_zip = export_profile_archive_zip(&malicious).unwrap();
+        let sanitized =
+            import_profile_archive_zip(&mal_zip, &std::collections::HashSet::new()).unwrap();
+        assert!(uuid::Uuid::parse_str(&sanitized.id).is_ok());
+        let _ = std::fs::remove_file(&mal_zip);
+        let _ = wipe_profile_data(&sanitized.id);
+
+        // Verify multi-URL startup_url works as cookie domain fallback
+        let bundle = parse_and_normalize_cookies(
+            "sid=abc123; theme=dark",
+            Some("https://shop.example.com, https://google.com"),
+        )
+        .unwrap();
+        assert_eq!(bundle.cookies[0]["domain"], "shop.example.com");
     }
 }

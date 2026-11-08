@@ -134,9 +134,9 @@ cd bon-login
 # Run in development mode (optimized GPUI dependencies enabled in Cargo.toml)
 cargo run
 
-# Or build a production binary
-cargo build --release
-./target/release/bon-login
+# Or build release binary + signed macOS BonLogin.app bundle
+./scripts/build-release.sh
+open target/release/BonLogin.app
 ```
 
 ### Run Tests

@@ -355,7 +355,15 @@ pub fn render_profile_table(
                                     })),
                             ),
                     )
-                    .child(
+                    .child({
+                        let pid_totp = prof.id.clone();
+                        let pid_meta = prof.id.clone();
+                        let totp_opt = prof.current_totp();
+                        let tags_str = if prof.tags.is_empty() {
+                            "None".to_string()
+                        } else {
+                            prof.tags.join(", ")
+                        };
                         v_flex()
                             .id("detail-drawer-body")
                             .w_full()
@@ -364,6 +372,35 @@ pub fn render_profile_table(
                             .gap_2()
                             .overflow_y_scroll()
                             .child(drawer_row("Profile name", prof.name.clone()))
+                            .child(drawer_row("Tags", tags_str))
+                            .children(totp_opt.map(|(code, rem)| {
+                                h_flex()
+                                    .w_full()
+                                    .py_1()
+                                    .border_b_1()
+                                    .border_color(BonTheme::border())
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(BonTheme::text_secondary())
+                                            .child("2FA TOTP"),
+                                    )
+                                    .child(
+                                        Button::new("drawer-copy-totp")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .xsmall()
+                                            .label(format!(
+                                                "🔐 {} {} ({rem}s)",
+                                                &code[..3],
+                                                &code[3..]
+                                            ))
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.copy_profile_totp(&pid_totp, cx);
+                                            })),
+                                    )
+                            }))
                             .child(drawer_row(
                                 "Agent session",
                                 match statuses.get(&prof.id) {
@@ -420,23 +457,43 @@ pub fn render_profile_table(
                                     .to_string(),
                             ))
                             .child(
-                                div().pt_2().child(
-                                    Button::new("drawer-open-edit")
-                                        .with_variant(BonTheme::outline_blue(cx))
-                                        .small()
-                                        .label(format!("{}  Edit Full Settings", SfSymbol::SLIDER_HORIZONTAL_3))
-                                        .on_click(cx.listener(move |app, _, window, cx| {
-                                            app.open_edit_view(&pid_edit, window, cx);
-                                        })),
-                                ),
+                                h_flex()
+                                    .pt_2()
+                                    .gap_1p5()
+                                    .flex_wrap()
+                                    .child(
+                                        Button::new("drawer-open-meta")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .label("🏷 Tags / Note / 2FA")
+                                            .on_click(cx.listener(move |app, _, window, cx| {
+                                                app.open_quick_meta_modal(
+                                                    Some(pid_meta.clone()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("drawer-open-edit")
+                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .small()
+                                            .label(format!(
+                                                "{}  Edit Full Settings",
+                                                SfSymbol::SLIDER_HORIZONTAL_3
+                                            ))
+                                            .on_click(cx.listener(move |app, _, window, cx| {
+                                                app.open_edit_view(&pid_edit, window, cx);
+                                            })),
+                                    ),
                             )
                             .with_animation(
                                 content_anim_id,
                                 Animation::new(Duration::from_millis(120))
                                     .with_easing(ease_out_quint()),
                                 |this, delta| this.opacity(delta),
-                            ),
-                    )
+                            )
+                    })
                     .with_animation(
                         "detail-drawer-panel",
                         Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
@@ -450,15 +507,23 @@ fn build_profile_popup_menu(
     menu: PopupMenu,
     app_entity: Entity<BonLoginApp>,
     profile_id: String,
+    has_totp: bool,
     is_busy: bool,
 ) -> PopupMenu {
     let app_edit = app_entity.clone();
     let pid_edit = profile_id.clone();
-    // Only real implemented actions in row popup/context menu
+    let app_meta = app_entity.clone();
+    let pid_meta = profile_id.clone();
+    let app_totp = app_entity.clone();
+    let pid_totp = profile_id.clone();
+    let app_robot = app_entity.clone();
+    let pid_robot = profile_id.clone();
     let app_import_cookies = app_entity.clone();
     let pid_import_cookies = profile_id.clone();
     let app_cookies = app_entity.clone();
     let pid_cookies = profile_id.clone();
+    let app_zip = app_entity.clone();
+    let pid_zip = profile_id.clone();
     let app_clone = app_entity.clone();
     let pid_clone = profile_id.clone();
     let app_proxy = app_entity.clone();
@@ -468,7 +533,8 @@ fn build_profile_popup_menu(
     let app_del = app_entity;
     let pid_del = profile_id;
 
-    menu.min_w(px(175.))
+    let mut menu = menu
+        .min_w(px(195.))
         .item(
             PopupMenuItem::new(format!("{}   Edit", SfSymbol::PENCIL))
                 .disabled(is_busy)
@@ -478,63 +544,96 @@ fn build_profile_popup_menu(
                     });
                 }),
         )
-        // (Only real actions shown)
         .item(
-            PopupMenuItem::new(format!("{}   Copy Agent CLI", SfSymbol::TERMINAL)).on_click(
-                move |_, _, cx| {
-                    app_agent.update(cx, |app, cx| {
-                        app.copy_agent_browser_cli(&pid_agent, cx);
-                    });
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(format!("{}   Import cookies", SfSymbol::ARROW_UP_DOC)).on_click(
-                move |_, window, cx| {
-                    app_import_cookies.update(cx, |app, cx| {
-                        app.open_edit_cookies_view(&pid_import_cookies, window, cx);
-                    });
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(format!("{}   Export cookies", SfSymbol::ARROW_DOWN_DOC)).on_click(
-                move |_, _, cx| {
-                    app_cookies.update(cx, |app, cx| {
-                        app.export_profile_cookies_json(&pid_cookies, cx);
-                    });
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(format!("{}   Clone", SfSymbol::PLUS_SQUARE_ON_SQUARE)).on_click(
-                move |_, window, cx| {
-                    app_clone.update(cx, |app, cx| {
-                        app.clone_profile(&pid_clone, window, cx);
-                    });
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(format!("{}   Copy proxy", SfSymbol::DOC_ON_DOC)).on_click(
-                move |_, _, cx| {
-                    app_proxy.update(cx, |app, cx| {
-                        app.copy_single_profile_proxy(&pid_proxy, cx);
-                    });
-                },
-            ),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(format!("{}   Delete", SfSymbol::TRASH))
-                .disabled(is_busy)
-                .on_click(move |_, _, cx| {
-                    let pid = pid_del.clone();
-                    app_del.update(cx, |app, cx| {
-                        app.request_delete(PendingDeleteAction::Profile(pid), cx);
-                    });
-                }),
-        )
+            PopupMenuItem::new("🏷   Tags, Note & 2FA").on_click(move |_, window, cx| {
+                let pid = pid_meta.clone();
+                app_meta.update(cx, |app, cx| {
+                    app.open_quick_meta_modal(Some(pid), window, cx);
+                });
+            }),
+        );
+    if has_totp {
+        menu = menu.item(
+            PopupMenuItem::new("🔐   Copy 2FA Code").on_click(move |_, _, cx| {
+                app_totp.update(cx, |app, cx| {
+                    app.copy_profile_totp(&pid_totp, cx);
+                });
+            }),
+        );
+    }
+    menu.item(
+        PopupMenuItem::new("🤖   Cookie Robot (Warm-up)").on_click(move |_, _, cx| {
+            let pid = pid_robot.clone();
+            app_robot.update(cx, |app, cx| {
+                app.open_cookie_robot_modal(Some(pid), cx);
+            });
+        }),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Copy Agent CLI", SfSymbol::TERMINAL)).on_click(
+            move |_, _, cx| {
+                app_agent.update(cx, |app, cx| {
+                    app.copy_agent_browser_cli(&pid_agent, cx);
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Import cookies", SfSymbol::ARROW_UP_DOC)).on_click(
+            move |_, window, cx| {
+                app_import_cookies.update(cx, |app, cx| {
+                    app.open_edit_cookies_view(&pid_import_cookies, window, cx);
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Export cookies", SfSymbol::ARROW_DOWN_DOC)).on_click(
+            move |_, _, cx| {
+                app_cookies.update(cx, |app, cx| {
+                    app.export_profile_cookies_json(&pid_cookies, cx);
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new("📦   Export Backup (.zip)")
+            .disabled(is_busy)
+            .on_click(move |_, _, cx| {
+                app_zip.update(cx, |app, cx| {
+                    app.export_single_profile_zip(&pid_zip, cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Clone", SfSymbol::PLUS_SQUARE_ON_SQUARE)).on_click(
+            move |_, window, cx| {
+                app_clone.update(cx, |app, cx| {
+                    app.clone_profile(&pid_clone, window, cx);
+                });
+            },
+        ),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Copy proxy", SfSymbol::DOC_ON_DOC)).on_click(
+            move |_, _, cx| {
+                app_proxy.update(cx, |app, cx| {
+                    app.copy_single_profile_proxy(&pid_proxy, cx);
+                });
+            },
+        ),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new(format!("{}   Move to Trash", SfSymbol::TRASH))
+            .disabled(is_busy)
+            .on_click(move |_, _, cx| {
+                let pid = pid_del.clone();
+                app_del.update(cx, |app, cx| {
+                    app.request_delete(PendingDeleteAction::Profile(pid), cx);
+                });
+            }),
+    )
 }
 
 fn render_profile_row(
@@ -721,15 +820,46 @@ fn render_profile_row(
                                 .child(profile.name.clone()),
                         )
                 }))
-                // Col 3: Tags (`group_tag` + `+`)
+                // Col 3: Tags (`profile.tags` colored badges + `group_tag`, click to edit tags/note)
                 .children(cols.show_tags.then(|| {
+                    let pid_tag = profile_id.clone();
+                    let first_tag = profile.tags.first().cloned();
+                    let extra_count = profile.tags.len().saturating_sub(1);
                     h_flex()
                         .w(px(76.))
                         .flex_shrink_0()
                         .gap_1()
                         .items_center()
                         .overflow_hidden()
-                        .children((!profile.group_tag.trim().is_empty()).then(|| {
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, window, cx| {
+                                cx.stop_propagation();
+                                app.open_quick_meta_modal(Some(pid_tag.clone()), window, cx);
+                            }),
+                        )
+                        .child(if let Some(tag) = first_tag {
+                            let (fg_hex, bg_hex) = Profile::tag_badge_colors(&tag);
+                            let label = if extra_count > 0 {
+                                format!("{tag} +{extra_count}")
+                            } else {
+                                tag
+                            };
+                            div()
+                                .max_w_full()
+                                .truncate()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(rgba(bg_hex))
+                                .border_1()
+                                .border_color(rgb(fg_hex))
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(rgb(fg_hex))
+                                .child(label)
+                                .into_any_element()
+                        } else if !profile.group_tag.trim().is_empty() {
                             div()
                                 .max_w_full()
                                 .truncate()
@@ -742,32 +872,78 @@ fn render_profile_row(
                                 .text_xs()
                                 .text_color(BonTheme::text_secondary())
                                 .child(profile.group_tag.clone())
-                        }))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_muted())
+                                .hover(|s| s.text_color(BonTheme::accent()))
+                                .child("+ Tag")
+                                .into_any_element()
+                        })
                 }))
-                // Col 4: Note (`Enter note`)
+                // Col 4: Note + 2FA TOTP 1-click badge
                 .children(cols.show_notes.then(|| {
                     let pid_note = profile_id.clone();
-                    div()
+                    let pid_totp = profile_id.clone();
+                    let totp_opt = profile.current_totp();
+                    h_flex()
                         .w(px(78.))
                         .flex_shrink_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(if has_note {
-                            BonTheme::text_primary()
-                        } else {
-                            BonTheme::text_muted()
-                        })
-                        .hover(|s| s.text_color(BonTheme::accent()))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |app, _, window, cx| {
-                                cx.stop_propagation();
-                                app.open_edit_view(&pid_note, window, cx);
-                            }),
+                        .gap_1()
+                        .items_center()
+                        .overflow_hidden()
+                        .children(totp_opt.map(|(code, _)| {
+                            div()
+                                .px_1()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .bg(rgba(0xa855f726))
+                                .border_1()
+                                .border_color(rgb(0xc084fc))
+                                .text_size(px(10.5))
+                                .font_semibold()
+                                .text_color(rgb(0xc084fc))
+                                .hover(|s| s.bg(rgba(0xa855f744)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |app, _, _, cx| {
+                                        cx.stop_propagation();
+                                        app.copy_profile_totp(&pid_totp, cx);
+                                    }),
+                                )
+                                .child(if has_note {
+                                    "2FA".to_string()
+                                } else {
+                                    format!("🔐{code}")
+                                })
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(if has_note {
+                                    BonTheme::text_primary()
+                                } else {
+                                    BonTheme::text_muted()
+                                })
+                                .hover(|s| s.text_color(BonTheme::accent()))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |app, _, window, cx| {
+                                        cx.stop_propagation();
+                                        app.open_quick_meta_modal(
+                                            Some(pid_note.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .child(note_text),
                         )
-                        .child(note_text)
                 }))
-                // Col 5: Proxy (`Local IP` or `🌐 ip:port`)
                 .children(cols.show_proxy.then(|| {
                     let pid_proxy = profile_id.clone();
                     let has_proxy = profile.proxy.is_some();
@@ -871,7 +1047,8 @@ fn render_profile_row(
                                     app.launch_profile(&pid_launch, cx);
                                 }))
                         })
-                        .child(
+                        .child({
+                            let has_totp = !profile.totp_secret.trim().is_empty();
                             Button::new(SharedString::from(format!("row-dots-{profile_id}")))
                                 .ghost()
                                 .small()
@@ -883,20 +1060,244 @@ fn render_profile_row(
                                             menu,
                                             app_for_dots.clone(),
                                             pid_for_dots.clone(),
+                                            has_totp,
                                             is_busy,
                                         )
                                     },
-                                ),
-                        ),
+                                )
+                        }),
                 ),
         )
-        .context_menu(move |menu, _window, _cx| {
-            build_profile_popup_menu(
-                menu,
-                app_for_ctx.clone(),
-                pid_for_ctx.clone(),
-                is_busy,
-            )
+        .context_menu({
+            let has_totp = !profile.totp_secret.trim().is_empty();
+            move |menu, _window, _cx| {
+                build_profile_popup_menu(
+                    menu,
+                    app_for_ctx.clone(),
+                    pid_for_ctx.clone(),
+                    has_totp,
+                    is_busy,
+                )
+            }
         })
         .into_any_element()
+}
+
+pub fn render_trash_table(
+    trashed: &[Profile],
+    cx: &mut Context<BonLoginApp>,
+) -> Div {
+    v_flex()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .gap_3()
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(BonTheme::text_secondary())
+                        .child(
+                            "Deleted profiles keep their isolated browser data & cookies on disk until permanently removed.",
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .children((!trashed.is_empty()).then(|| {
+                            Button::new("trash-restore-all")
+                                .with_variant(BonTheme::outline_blue(cx))
+                                .small()
+                                .label(format!(
+                                    "{}  Restore All ({})",
+                                    SfSymbol::ARROW_CLOCKWISE,
+                                    trashed.len()
+                                ))
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.restore_all_trashed_profiles(window, cx);
+                                }))
+                        }))
+                        .children((!trashed.is_empty()).then(|| {
+                            Button::new("trash-empty-all")
+                                .danger()
+                                .small()
+                                .label(format!("{}  Empty Trash", SfSymbol::TRASH))
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.request_delete(PendingDeleteAction::EmptyTrash, cx);
+                                }))
+                        })),
+                ),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .rounded_xl()
+                .bg(BonTheme::bg_panel())
+                .border_1()
+                .border_color(BonTheme::border())
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_4()
+                        .py_2p5()
+                        .gap_3()
+                        .items_center()
+                        .bg(BonTheme::bg_elevated())
+                        .border_b_1()
+                        .border_color(BonTheme::border())
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(BonTheme::text_secondary())
+                        .child(div().w(px(80.)).child("ID"))
+                        .child(div().w(px(180.)).child("Name"))
+                        .child(div().w(px(130.)).child("Group / Tags"))
+                        .child(div().w(px(150.)).child("Proxy"))
+                        .child(div().w(px(140.)).child("Deleted"))
+                        .child(div().flex_1().flex().justify_end().child("Actions")),
+                )
+                .child(
+                    v_flex()
+                        .id("trash-table-rows")
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(trashed.is_empty().then(|| {
+                            v_flex()
+                                .w_full()
+                                .py_16()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_semibold()
+                                        .text_color(BonTheme::text_primary())
+                                        .child("Trash is empty"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child("Profiles you delete will appear here so you can restore them anytime."),
+                                )
+                        }))
+                        .children(trashed.iter().map(|p| {
+                            let pid_restore = p.id.clone();
+                            let pid_perm = p.id.clone();
+                            let proxy_str = p
+                                .proxy
+                                .as_ref()
+                                .map(|px| px.display_short())
+                                .unwrap_or_else(|| "Local IP".to_string());
+                            let grp_tags = if !p.tags.is_empty() {
+                                p.tags.join(", ")
+                            } else if !p.group_tag.is_empty() {
+                                p.group_tag.clone()
+                            } else {
+                                "—".to_string()
+                            };
+                            h_flex()
+                                .w_full()
+                                .px_4()
+                                .py_2p5()
+                                .gap_3()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(BonTheme::border())
+                                .hover(|s| s.bg(BonTheme::bg_hover()))
+                                .child(
+                                    div()
+                                        .w(px(80.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child(p.short_id()),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(180.))
+                                        .truncate()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::text_primary())
+                                        .child(p.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(130.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child(grp_tags),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(150.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child(proxy_str),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(140.))
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(BonTheme::warning())
+                                        .child(p.format_deleted_at()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .justify_end()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "trash-res-{}",
+                                                p.id
+                                            )))
+                                            .with_variant(BonTheme::launch_cta(cx))
+                                            .small()
+                                            .label("↩ Restore")
+                                            .on_click(cx.listener(move |app, _, window, cx| {
+                                                app.restore_trashed_profile(
+                                                    &pid_restore,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "trash-perm-{}",
+                                                p.id
+                                            )))
+                                            .danger()
+                                            .small()
+                                            .label("Delete Forever")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.request_delete(
+                                                    PendingDeleteAction::PermanentProfile(
+                                                        pid_perm.clone(),
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        ),
+                                )
+                        })),
+                ),
+        )
 }

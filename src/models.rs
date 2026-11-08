@@ -621,6 +621,8 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub group_tag: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub seed: u32,
     pub os_platform: PlatformType,
     pub os_version: String,
@@ -639,8 +641,12 @@ pub struct Profile {
     pub resolved_geo: Option<GeoInfo>,
     pub startup_url: String,
     pub notes: String,
+    #[serde(default)]
+    pub totp_secret: String,
     pub created_at: i64,
     pub last_launched_at: Option<i64>,
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
 }
 
 impl Profile {
@@ -662,6 +668,7 @@ impl Profile {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.into(),
             group_tag: String::new(),
+            tags: Vec::new(),
             seed,
             os_platform,
             os_version: os_platform.os_version_for_seed(seed).to_string(),
@@ -680,8 +687,10 @@ impl Profile {
             resolved_geo: None,
             startup_url: "https://browserscan.net".to_string(),
             notes: String::new(),
+            totp_secret: String::new(),
             created_at: now,
             last_launched_at: None,
+            deleted_at: None,
         }
     }
 
@@ -696,6 +705,7 @@ impl Profile {
         copy.hardware_concurrency = copy.os_platform.optimal_cores_for_seed(new_seed);
         copy.created_at = unix_now();
         copy.last_launched_at = None;
+        copy.deleted_at = None;
         copy
     }
 
@@ -745,6 +755,7 @@ impl Profile {
         contains_ignore_ascii_case(&self.name, q)
             || contains_ignore_ascii_case(&self.id, q)
             || contains_ignore_ascii_case(&self.group_tag, q)
+            || self.tags.iter().any(|t| contains_ignore_ascii_case(t, q))
             || contains_ignore_ascii_case(&self.notes, q)
             || self
                 .proxy
@@ -792,6 +803,78 @@ impl Profile {
             Some(format!("{cut}…"))
         } else {
             Some(single_line.to_string())
+        }
+    }
+
+    pub const PRESET_TAGS: [&'static str; 8] = [
+        "Live",
+        "Warmup",
+        "Ads",
+        "VIP",
+        "Ready",
+        "2FA",
+        "Checkpoint",
+        "Die",
+    ];
+
+    pub fn parse_tags_csv(raw: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for part in raw.split(',') {
+            let t = part.trim();
+            if !t.is_empty() && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(t)) {
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn tags_csv(&self) -> String {
+        self.tags.join(",")
+    }
+
+    /// Returns `(text_rgb_hex, bg_rgba_hex)` for a profile status/category tag.
+    pub fn tag_badge_colors(tag: &str) -> (u32, u32) {
+        let lower = tag.trim().to_ascii_lowercase();
+        if lower.contains("live") || lower.contains("ready") || lower.contains("ok") || lower.contains("active") {
+            (0x34d399, 0x10b98126)
+        } else if lower.contains("die") || lower.contains("ban") || lower.contains("block") || lower.contains("err") {
+            (0xf87171, 0xef444426)
+        } else if lower.contains("warm") || lower.contains("check") || lower.contains("pend") || lower.contains("hold") {
+            (0xfbbf24, 0xf59e0b26)
+        } else if lower.contains("vip") || lower.contains("2fa") || lower.contains("pro") {
+            (0xc084fc, 0xa855f726)
+        } else {
+            (0x60a5fa, 0x3b82f626)
+        }
+    }
+
+    /// Splits `startup_url` by newline, comma, or whitespace into individual URLs for multi-tab launch.
+    pub fn startup_urls(&self) -> Vec<String> {
+        self.startup_url
+            .split(['\n', '\r', ',', ' ', '\t'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    pub fn current_totp(&self) -> Option<(String, u8)> {
+        generate_totp_code(&self.totp_secret, unix_now().max(0) as u64)
+    }
+
+    pub fn format_deleted_at(&self) -> String {
+        let Some(ts) = self.deleted_at else {
+            return String::new();
+        };
+        let diff = unix_now().saturating_sub(ts);
+        if diff < 60 {
+            "Deleted just now".to_string()
+        } else if diff < 3600 {
+            format!("Deleted {}m ago", diff / 60)
+        } else if diff < 86_400 {
+            format!("Deleted {}h ago", diff / 3600)
+        } else {
+            format!("Deleted {}d ago", diff / 86_400)
         }
     }
 }
@@ -894,6 +977,148 @@ fn u32_contains_digits(mut n: u32, needle: &str) -> bool {
     buf[i..]
         .windows(needle.len())
         .any(|w| w == needle.as_bytes())
+}
+
+/// Generates a 6-digit RFC 6238 TOTP code and remaining seconds in the 30s window from a Base32 secret or `otpauth://` URI.
+pub fn generate_totp_code(raw_secret: &str, unix_secs: u64) -> Option<(String, u8)> {
+    let trimmed = raw_secret.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw_part = if let Some(idx) = trimmed.to_ascii_lowercase().find("secret=") {
+        let after = &trimmed[idx + 7..];
+        after.split(['&', '#', ' ']).next().unwrap_or(after)
+    } else {
+        trimmed
+    };
+    let cleaned_secret = raw_part
+        .replace("%20", "")
+        .replace("%3D", "")
+        .replace("%3d", "");
+    let key = decode_base32(&cleaned_secret)?;
+    if key.is_empty() {
+        return None;
+    }
+    let counter = (unix_secs / 30).to_be_bytes();
+    let mac = hmac_sha1(&key, &counter);
+    let offset = (mac[19] & 0x0f) as usize;
+    let bin_code = u32::from_be_bytes([
+        mac[offset] & 0x7f,
+        mac[offset + 1],
+        mac[offset + 2],
+        mac[offset + 3],
+    ]);
+    let otp = bin_code % 1_000_000;
+    let rem = (30 - (unix_secs % 30)) as u8;
+    Some((format!("{otp:06}"), rem))
+}
+
+fn decode_base32(input: &str) -> Option<Vec<u8>> {
+    let mut bits: u32 = 0;
+    let mut bit_count: u8 = 0;
+    let mut out = Vec::new();
+    for b in input.bytes() {
+        if b == b'=' || b == b' ' || b == b'-' || b == b'\t' || b == b'\n' || b == b'\r' {
+            continue;
+        }
+        let val: u8 = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a',
+            b'2'..=b'7' => b - b'2' + 26,
+            _ => return None,
+        };
+        bits = (bits << 5) | u32::from(val);
+        bit_count += 5;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            out.push(((bits >> bit_count) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+    let mut key_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = sha1_digest(key);
+        key_block[..20].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(message);
+    let inner_hash = sha1_digest(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 20);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    sha1_digest(&outer)
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
 }
 
 #[cfg(test)]
@@ -1089,5 +1314,31 @@ mod tests {
         assert_eq!(b6.format_label, "Raw Cookie String");
         assert_eq!(b6.cookies.len(), 3);
         assert_eq!(b6.domains, vec!["facebook.com"]);
+    }
+
+    #[test]
+    fn test_totp_tags_and_startup_urls() {
+        // RFC 6238 SHA1 test secret: "12345678901234567890" -> Base32 "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let (code59, rem59) = generate_totp_code(secret, 59).unwrap();
+        assert_eq!(code59, "287082");
+        assert_eq!(rem59, 1);
+
+        let otpauth = "otpauth://totp/BonLogin:user@example.com?secret=JBSW%20Y3DP%20EHPK%203PXP%3D%3D&issuer=BonLogin";
+        assert!(generate_totp_code(otpauth, 1_700_000_000).is_some());
+        let mut p = Profile::new_default("Tag & Multi-Tab", PlatformType::MacOS);
+        p.tags = Profile::parse_tags_csv("Live, Warmup, live, Ads");
+        assert_eq!(p.tags, vec!["Live", "Warmup", "Ads"]);
+        assert!(p.matches_filter("warmup", None));
+
+        p.startup_url = "https://browserscan.net\nhttps://x.com, https://youtube.com".to_string();
+        assert_eq!(
+            p.startup_urls(),
+            vec![
+                "https://browserscan.net",
+                "https://x.com",
+                "https://youtube.com"
+            ]
+        );
     }
 }

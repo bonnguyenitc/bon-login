@@ -109,7 +109,10 @@ impl Database {
                 startup_url TEXT NOT NULL,
                 notes TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                last_launched_at INTEGER
+                last_launched_at INTEGER,
+                tags TEXT NOT NULL DEFAULT '',
+                totp_secret TEXT NOT NULL DEFAULT '',
+                deleted_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS proxies (
                 id TEXT PRIMARY KEY,
@@ -168,6 +171,9 @@ impl Database {
             "ALTER TABLE profiles ADD COLUMN custom_timezone TEXT",
             "ALTER TABLE profiles ADD COLUMN custom_locale TEXT",
             "ALTER TABLE profiles ADD COLUMN geo_latency_ms INTEGER",
+            "ALTER TABLE profiles ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE profiles ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE profiles ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE proxies ADD COLUMN expired_at INTEGER",
         ] {
             let _ = self.conn.execute(alter, []);
@@ -301,7 +307,7 @@ impl Database {
 
 
     pub fn list_profiles(&self) -> anyhow::Result<Vec<Profile>> {
-        let mut stmt = self.conn.prepare_cached(
+        self.query_profiles_sql(
             "SELECT
                 id, name, group_tag, seed, os_platform, os_version,
                 brand, brand_version, hardware_concurrency, gpu_spoofing,
@@ -309,11 +315,33 @@ impl Database {
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
                 startup_url, notes, created_at, last_launched_at,
                 spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
-                window_size, custom_timezone, custom_locale, geo_latency_ms
+                window_size, custom_timezone, custom_locale, geo_latency_ms,
+                tags, totp_secret, deleted_at
              FROM profiles
+             WHERE deleted_at IS NULL
              ORDER BY created_at DESC",
-        )?;
+        )
+    }
 
+    pub fn list_trashed_profiles(&self) -> anyhow::Result<Vec<Profile>> {
+        self.query_profiles_sql(
+            "SELECT
+                id, name, group_tag, seed, os_platform, os_version,
+                brand, brand_version, hardware_concurrency, gpu_spoofing,
+                proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
+                geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
+                startup_url, notes, created_at, last_launched_at,
+                spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
+                window_size, custom_timezone, custom_locale, geo_latency_ms,
+                tags, totp_secret, deleted_at
+             FROM profiles
+             WHERE deleted_at IS NOT NULL
+             ORDER BY deleted_at DESC",
+        )
+    }
+
+    fn query_profiles_sql(&self, sql: &str) -> anyhow::Result<Vec<Profile>> {
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map([], |row| {
             let os_str: String = row.get(4)?;
             let brand_str: String = row.get(6)?;
@@ -365,11 +393,15 @@ impl Database {
                 .get::<_, Option<String>>(28)?
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| Profile::DEFAULT_WINDOW_SIZE.to_string());
+            let raw_tags: String = row.get::<_, Option<String>>(32)?.unwrap_or_default();
+            let totp_secret: String = row.get::<_, Option<String>>(33)?.unwrap_or_default();
+            let deleted_at: Option<i64> = row.get(34).ok().flatten();
 
             Ok(Profile {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 group_tag: row.get(2)?,
+                tags: Profile::parse_tags_csv(&raw_tags),
                 seed: row.get(3)?,
                 os_platform: PlatformType::from_str_lossy(&os_str),
                 os_version: row.get(5)?,
@@ -392,8 +424,10 @@ impl Database {
                 resolved_geo,
                 startup_url: row.get(20)?,
                 notes: row.get(21)?,
+                totp_secret,
                 created_at: row.get(22)?,
                 last_launched_at: row.get(23)?,
+                deleted_at,
             })
         })?;
 
@@ -429,6 +463,7 @@ impl Database {
                 ),
                 None => (None, None, None, None, None, None),
             };
+        let tags_csv = profile.tags_csv();
 
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO profiles (
@@ -438,7 +473,8 @@ impl Database {
                 window_size, custom_timezone, custom_locale,
                 proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang, geo_latency_ms,
-                startup_url, notes, created_at, last_launched_at
+                startup_url, notes, created_at, last_launched_at,
+                tags, totp_secret, deleted_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
@@ -446,7 +482,8 @@ impl Database {
                 ?15, ?16, ?17,
                 ?18, ?19, ?20, ?21, ?22,
                 ?23, ?24, ?25, ?26, ?27, ?28,
-                ?29, ?30, ?31, ?32
+                ?29, ?30, ?31, ?32,
+                ?33, ?34, ?35
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -479,43 +516,48 @@ impl Database {
                 startup_url = excluded.startup_url,
                 notes = excluded.notes,
                 created_at = excluded.created_at,
-                last_launched_at = excluded.last_launched_at",
+                last_launched_at = excluded.last_launched_at,
+                tags = excluded.tags,
+                totp_secret = excluded.totp_secret,
+                deleted_at = excluded.deleted_at",
         )?;
         stmt.execute(params![
-                profile.id,
-                profile.name,
-                profile.group_tag,
-                profile.seed,
-                profile.os_platform.as_cli_str(),
-                profile.os_version,
-                profile.brand.as_cli_str(),
-                profile.brand_version,
-                profile.hardware_concurrency,
-                profile.gpu_spoofing.as_str(),
-                i64::from(profile.spoof_canvas),
-                i64::from(profile.spoof_audio),
-                i64::from(profile.spoof_font),
-                i64::from(profile.spoof_client_rects),
-                profile.window_size,
-                profile.custom_timezone.as_deref(),
-                profile.custom_locale.as_deref(),
-                proxy_protocol,
-                proxy_host,
-                proxy_port,
-                proxy_username,
-                proxy_password,
-                geo_ip,
-                geo_country,
-                geo_timezone,
-                geo_locale,
-                geo_accept_lang,
-                geo_latency_ms,
-                profile.startup_url,
-                profile.notes,
-                profile.created_at,
-                profile.last_launched_at,
-            ],
-        )?;
+            profile.id,
+            profile.name,
+            profile.group_tag,
+            profile.seed,
+            profile.os_platform.as_cli_str(),
+            profile.os_version,
+            profile.brand.as_cli_str(),
+            profile.brand_version,
+            profile.hardware_concurrency,
+            profile.gpu_spoofing.as_str(),
+            i64::from(profile.spoof_canvas),
+            i64::from(profile.spoof_audio),
+            i64::from(profile.spoof_font),
+            i64::from(profile.spoof_client_rects),
+            profile.window_size,
+            profile.custom_timezone.as_deref(),
+            profile.custom_locale.as_deref(),
+            proxy_protocol,
+            proxy_host,
+            proxy_port,
+            proxy_username,
+            proxy_password,
+            geo_ip,
+            geo_country,
+            geo_timezone,
+            geo_locale,
+            geo_accept_lang,
+            geo_latency_ms,
+            profile.startup_url,
+            profile.notes,
+            profile.created_at,
+            profile.last_launched_at,
+            tags_csv,
+            profile.totp_secret,
+            profile.deleted_at,
+        ])?;
         if !profile.group_tag.trim().is_empty() {
             let _ = self.insert_group(profile.group_tag.trim());
         }
@@ -555,6 +597,37 @@ impl Database {
         Ok(())
     }
 
+    pub fn soft_delete_profile(&self, profile_id: &str) -> anyhow::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE profiles SET deleted_at = ?1 WHERE id = ?2")?;
+        stmt.execute(params![unix_now(), profile_id])?;
+        Ok(())
+    }
+
+    pub fn restore_profile(&self, profile_id: &str) -> anyhow::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE profiles SET deleted_at = NULL WHERE id = ?1")?;
+        stmt.execute(params![profile_id])?;
+        Ok(())
+    }
+
+    pub fn update_profile_quick_meta(
+        &self,
+        profile_id: &str,
+        notes: &str,
+        tags: &[String],
+        totp_secret: &str,
+    ) -> anyhow::Result<()> {
+        let tags_csv = tags.join(",");
+        let mut stmt = self.conn.prepare_cached(
+            "UPDATE profiles SET notes = ?1, tags = ?2, totp_secret = ?3 WHERE id = ?4",
+        )?;
+        stmt.execute(params![notes.trim(), tags_csv, totp_secret.trim(), profile_id])?;
+        Ok(())
+    }
+
     pub fn delete_profile(&self, profile_id: &str) -> anyhow::Result<()> {
         let mut stmt = self
             .conn
@@ -562,7 +635,6 @@ impl Database {
         stmt.execute(params![profile_id])?;
         Ok(())
     }
-
     /// Exports all profiles to `~/Library/Application Support/com.bonlogin.app/backups/bonlogin_profiles_backup.json`.
     pub fn export_profiles_json(&self) -> anyhow::Result<(PathBuf, String)> {
         let profiles = self.list_profiles()?;
@@ -580,6 +652,7 @@ impl Database {
         let existing_ids: std::collections::HashSet<String> = self
             .list_profiles()?
             .into_iter()
+            .chain(self.list_trashed_profiles()?)
             .map(|p| p.id)
             .collect();
         self.with_transaction(|db| {

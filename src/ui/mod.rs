@@ -20,7 +20,7 @@ use crate::models::{
     BrowserBrand, BrowserExtension, PlatformType, Profile, ProfileStatus, ProxyConfig,
     ProxyProtocol, SavedProxy,
 };
-use crate::ui::profile_list::{ColumnVisibility, render_profile_table};
+use crate::ui::profile_list::{ColumnVisibility, render_profile_table, render_trash_table};
 use crate::ui::profile_modal::{
     ProfileModalState, ProxyEditMode, render_edit_profile_view, render_extensions_view,
     render_groups_subtab_view, render_popup_modal, render_proxies_view,
@@ -39,6 +39,7 @@ pub enum WorkspaceView {
 pub enum ProfileSubTab {
     Local,
     Group,
+    Trash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,12 +56,17 @@ pub enum ActivePopupModal {
     InputUrlExtension,
     RemoveExtension,
     ArrangeWindows,
+    QuickMeta,
+    CookieRobot,
+    ImportBackupZip,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDeleteAction {
     Profile(String),
     CheckedProfiles,
+    PermanentProfile(String),
+    EmptyTrash,
     Group(String),
     Proxy(String),
     CheckedProxies,
@@ -70,6 +76,7 @@ pub enum PendingDeleteAction {
 pub struct BonLoginApp {
     pub db: Arc<Mutex<Database>>,
     pub profiles: Vec<Profile>,
+    pub trashed_profiles: Vec<Profile>,
     pub saved_proxies: Vec<SavedProxy>,
     pub saved_groups: Vec<String>,
     pub saved_tags: Vec<String>,
@@ -115,6 +122,15 @@ pub struct BonLoginApp {
     pub batch_brand: BrowserBrand,
     pub arrange_display_idx: usize,
     pub arrange_size_input: Entity<InputState>,
+    pub quick_meta_profile_id: Option<String>,
+    pub quick_meta_tags: Vec<String>,
+    pub quick_meta_tag_input: Entity<InputState>,
+    pub quick_meta_note_input: Entity<TextareaState>,
+    pub quick_meta_totp_input: Entity<InputState>,
+    pub cookie_robot_target_id: Option<String>,
+    pub cookie_robot_urls_input: Entity<TextareaState>,
+    pub cookie_robot_dwell_secs: u64,
+    pub backup_zip_input: Entity<InputState>,
     pub banner_message: Option<String>,
     banner_timer_for: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -129,6 +145,7 @@ impl BonLoginApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let profiles = db.list_profiles().unwrap_or_default();
+        let trashed_profiles = db.list_trashed_profiles().unwrap_or_default();
         let saved_proxies = db.list_proxies().unwrap_or_default();
         let saved_groups = db.list_groups().unwrap_or_default();
         let saved_tags = db.list_tags().unwrap_or_default();
@@ -192,7 +209,25 @@ impl BonLoginApp {
                 .placeholder("Width,Height (e.g. 960,600)")
                 .default_value("960,600")
         });
-
+        let quick_meta_tag_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Custom tag (e.g. Shop-01, Tier1)...")
+        });
+        let quick_meta_note_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .placeholder("Account note, recovery email, status...")
+        });
+        let quick_meta_totp_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Base32 2FA Secret or otpauth:// URI...")
+        });
+        let cookie_robot_urls_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(6)
+                .default_value("https://www.google.com\nhttps://www.youtube.com\nhttps://www.wikipedia.org")
+        });
+        let backup_zip_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Path to backup .zip file...")
+        });
         let search_sub = cx.subscribe_in(&search_input, window, {
             let search_input = search_input.clone();
             move |this, _, ev: &InputEvent, _window, cx| {
@@ -293,6 +328,7 @@ impl BonLoginApp {
         Self {
             db: Arc::new(Mutex::new(db)),
             profiles,
+            trashed_profiles,
             saved_proxies,
             saved_groups,
             saved_tags,
@@ -338,6 +374,15 @@ impl BonLoginApp {
             batch_brand: BrowserBrand::Chrome,
             arrange_display_idx: 0,
             arrange_size_input,
+            quick_meta_profile_id: None,
+            quick_meta_tags: Vec::new(),
+            quick_meta_tag_input,
+            quick_meta_note_input,
+            quick_meta_totp_input,
+            cookie_robot_target_id: None,
+            cookie_robot_urls_input,
+            cookie_robot_dwell_secs: 5,
+            backup_zip_input,
             banner_message: None,
             banner_timer_for: None,
             _subscriptions: vec![search_sub],
@@ -348,6 +393,9 @@ impl BonLoginApp {
         if let Ok(db) = self.db.lock() {
             if let Ok(list) = db.list_profiles() {
                 self.profiles = list;
+            }
+            if let Ok(tlist) = db.list_trashed_profiles() {
+                self.trashed_profiles = tlist;
             }
             if let Ok(plist) = db.list_proxies() {
                 let valid_ids: HashSet<String> = plist.iter().map(|p| p.id.clone()).collect();
@@ -388,19 +436,6 @@ impl BonLoginApp {
             && let Ok(elist) = db.list_extensions()
         {
             self.extensions = elist;
-        }
-    }
-
-    pub fn reload_proxies_and_profiles(&mut self) {
-        if let Ok(db) = self.db.lock() {
-            if let Ok(list) = db.list_profiles() {
-                self.profiles = list;
-            }
-            if let Ok(plist) = db.list_proxies() {
-                let valid_ids: HashSet<String> = plist.iter().map(|p| p.id.clone()).collect();
-                self.checked_proxy_ids.retain(|id| valid_ids.contains(id));
-                self.saved_proxies = plist;
-            }
         }
     }
 
@@ -683,7 +718,7 @@ impl BonLoginApp {
                         if let Ok(db_guard) = db.lock() {
                             let _ = db_guard.sync_geo_for_proxy_endpoint(&cfg_for_profiles, &geo);
                         }
-                        app.reload_proxies_and_profiles();
+                        app.reload_profiles();
                         app.banner_message =
                             Some(format!("Proxy '{proxy_name}' OK: {}", geo.summary_badge()));
                     }
@@ -692,7 +727,7 @@ impl BonLoginApp {
                         if let Ok(db_guard) = db.lock() {
                             let _ = db_guard.update_saved_proxy_check(&pid, None, Some(&err_s));
                         }
-                        app.reload_proxies_and_profiles();
+                        app.reload_profiles();
                         app.banner_message =
                             Some(format!("Proxy '{proxy_name}' failed: {err_s}"));
                     }
@@ -954,7 +989,7 @@ impl BonLoginApp {
                             if let Ok(db_guard) = db.lock() {
                                 let _ = db_guard.sync_geo_for_proxy_endpoint(&cfg_for_db, &geo);
                             }
-                            app.reload_proxies_and_profiles();
+                            app.reload_profiles();
                             app.banner_message =
                                 Some(format!("Proxy OK: {}", geo.summary_badge()));
                         }
@@ -1497,6 +1532,12 @@ impl BonLoginApp {
             PendingDeleteAction::CheckedProfiles => {
                 self.delete_checked_profiles(window, cx);
             }
+            PendingDeleteAction::PermanentProfile(id) => {
+                self.permanently_delete_profile(&id, window, cx);
+            }
+            PendingDeleteAction::EmptyTrash => {
+                self.empty_trash(window, cx);
+            }
             PendingDeleteAction::Group(grp) => {
                 self.delete_group_and_reset(&grp, window, cx);
             }
@@ -1948,9 +1989,8 @@ impl BonLoginApp {
             });
         }
         if let Ok(db) = self.db.lock() {
-            let _ = db.delete_profile(profile_id);
+            let _ = db.soft_delete_profile(profile_id);
         }
-        let _ = crate::launcher::wipe_profile_data(profile_id);
         self.statuses.remove(profile_id);
         self.checked_profile_ids.remove(profile_id);
         self.reload_profiles();
@@ -1960,8 +2000,462 @@ impl BonLoginApp {
             self.selected_profile_id = None;
             self.modal = None;
         }
-        self.banner_message = Some("Profile deleted".to_string());
+        self.banner_message =
+            Some("Moved profile to Trash (restore anytime from Trash tab)".to_string());
         cx.notify();
+    }
+
+    pub fn permanently_delete_profile(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.profile_tasks.remove(profile_id) {
+            handle.abort();
+        }
+        if let Ok(db) = self.db.lock() {
+            let _ = db.delete_profile(profile_id);
+        }
+        let _ = crate::launcher::wipe_profile_data(profile_id);
+        self.statuses.remove(profile_id);
+        self.checked_profile_ids.remove(profile_id);
+        self.reload_profiles();
+        if let Some(first) = self.profiles.first().map(|p| p.id.clone()) {
+            self.select_profile(&first, window, cx);
+        }
+        self.banner_message = Some("Permanently deleted profile and wiped browser data".to_string());
+        cx.notify();
+    }
+
+    pub fn restore_trashed_profile(
+        &mut self,
+        profile_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Ok(db) = self.db.lock() {
+            let _ = db.restore_profile(profile_id);
+        }
+        self.reload_profiles();
+        self.select_profile(profile_id, window, cx);
+        self.banner_message = Some("Restored profile from Trash".to_string());
+        cx.notify();
+    }
+
+    pub fn restore_all_trashed_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.trashed_profiles.iter().map(|p| p.id.clone()).collect();
+        let count = ids.len();
+        if let Ok(db) = self.db.lock() {
+            let _ = db.with_transaction(|db| {
+                for id in &ids {
+                    let _ = db.restore_profile(id);
+                }
+                Ok(())
+            });
+        }
+        self.reload_profiles();
+        if let Some(first) = self.profiles.first().map(|p| p.id.clone()) {
+            self.select_profile(&first, window, cx);
+        }
+        self.profile_sub_tab = ProfileSubTab::Local;
+        self.banner_message = Some(format!("Restored {count} profile(s) from Trash"));
+        cx.notify();
+    }
+
+    pub fn empty_trash(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.trashed_profiles.iter().map(|p| p.id.clone()).collect();
+        let count = ids.len();
+        if let Ok(db) = self.db.lock() {
+            let _ = db.with_transaction(|db| {
+                for id in &ids {
+                    let _ = db.delete_profile(id);
+                }
+                Ok(())
+            });
+        }
+        for id in &ids {
+            let _ = crate::launcher::wipe_profile_data(id);
+        }
+        self.reload_profiles();
+        self.banner_message = Some(format!("Emptied Trash ({count} profile(s) permanently deleted)"));
+        cx.notify();
+    }
+
+    pub fn copy_profile_totp(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id) else {
+            return;
+        };
+        if let Some((code, rem)) = prof.current_totp() {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+            self.banner_message = Some(format!(
+                "Copied 2FA code for '{}': {code} (valid {rem}s)",
+                prof.name
+            ));
+        } else {
+            self.banner_message = Some("Invalid or empty 2FA secret on this profile".to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn open_quick_meta_modal(
+        &mut self,
+        profile_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quick_meta_profile_id = profile_id.clone();
+        let (tags, note, totp) = if let Some(pid) = &profile_id
+            && let Some(p) = self.profiles.iter().find(|x| &x.id == pid)
+        {
+            (p.tags.clone(), p.notes.clone(), p.totp_secret.clone())
+        } else {
+            (Vec::new(), String::new(), String::new())
+        };
+        self.quick_meta_tags = tags;
+        self.quick_meta_tag_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Custom tag (e.g. Shop-01, Tier1)...")
+        });
+        self.quick_meta_note_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .placeholder("Account note, recovery email, status...")
+                .default_value(note)
+        });
+        self.quick_meta_totp_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Base32 2FA Secret or otpauth:// URI...")
+                .default_value(totp)
+        });
+        self.popup_modal = Some(ActivePopupModal::QuickMeta);
+        cx.notify();
+    }
+
+    pub fn save_quick_meta_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tags = self.quick_meta_tags.clone();
+        let note = self.quick_meta_note_input.read(cx).value().trim().to_string();
+        let totp = self.quick_meta_totp_input.read(cx).value().trim().to_string();
+        if let Some(pid) = self.quick_meta_profile_id.clone() {
+            if let Ok(db) = self.db.lock() {
+                let _ = db.update_profile_quick_meta(&pid, &note, &tags, &totp);
+            }
+            self.banner_message = Some("Updated tags, note & 2FA".to_string());
+        } else {
+            let targets: Vec<Profile> = self
+                .profiles
+                .iter()
+                .filter(|p| self.checked_profile_ids.contains(&p.id))
+                .cloned()
+                .collect();
+            let count = targets.len();
+            if let Ok(db) = self.db.lock() {
+                let _ = db.with_transaction(|db| {
+                    for p in &targets {
+                        let new_note = if note.is_empty() { &p.notes } else { &note };
+                        let new_tags = if tags.is_empty() { &p.tags } else { &tags };
+                        let _ = db.update_profile_quick_meta(&p.id, new_note, new_tags, &p.totp_secret);
+                    }
+                    Ok(())
+                });
+            }
+            self.banner_message = Some(format!("Updated tags & note on {count} profile(s)"));
+        }
+        self.popup_modal = None;
+        self.reload_profiles();
+        if let Some(sel) = self.selected_profile_id.clone() {
+            self.select_profile(&sel, window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn export_single_profile_zip(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let name = prof.name.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        self.banner_message = Some(format!("Packing full .zip backup for '{name}'..."));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || crate::launcher::export_profile_archive_zip(&prof))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                match res {
+                    Ok(path) => {
+                        let path_s = path.display().to_string();
+                        cx.write_to_clipboard(ClipboardItem::new_string(path_s.clone()));
+                        app.banner_message =
+                            Some(format!("Exported backup (.zip): {path_s} (copied path)"));
+                    }
+                    Err(e) => {
+                        app.banner_message = Some(format!("Backup export failed: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn export_checked_profiles_zip(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<Profile> = self
+            .profiles
+            .iter()
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
+            .filter(|p| !matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_))))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            self.banner_message =
+                Some("Stop running profiles before exporting full .zip archives".to_string());
+            cx.notify();
+            return;
+        }
+        let count = targets.len();
+        let tokio_handle = self.tokio_handle.clone();
+        self.banner_message = Some(format!("Packing {count} profile archive(s) (.zip)..."));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || {
+                    let mut ok = 0usize;
+                    let mut last_dir = String::new();
+                    for prof in &targets {
+                        if let Ok(path) = crate::launcher::export_profile_archive_zip(prof) {
+                            ok += 1;
+                            if let Some(parent) = path.parent() {
+                                last_dir = parent.display().to_string();
+                            }
+                        }
+                    }
+                    (ok, last_dir)
+                })
+                .await
+                .unwrap_or((0, String::new()));
+            let _ = this.update(cx, |app, cx| {
+                let (ok, dir) = res;
+                app.banner_message =
+                    Some(format!("Exported {ok}/{count} .zip archive(s) to {dir}"));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn browse_and_import_backup_zip(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let chosen = tokio_handle
+                .spawn_blocking(|| {
+                    let script = r#"POSIX path of (choose file with prompt "Select BonLogin Profile Backup (.zip)" of type {"zip"})"#;
+                    std::process::Command::new("/usr/bin/osascript")
+                        .args(["-e", script])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(path) = chosen {
+                let _ = this.update(cx, |app, cx| {
+                    app.import_backup_zip_path(path, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn import_backup_zip_from_input(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.backup_zip_input.read(cx).value().trim().to_string();
+        if raw.is_empty() {
+            self.banner_message = Some("Select or paste a .zip backup file path first".to_string());
+            cx.notify();
+            return;
+        }
+        self.import_backup_zip_path(raw, cx);
+    }
+
+    fn import_backup_zip_path(&mut self, raw: String, cx: &mut Context<Self>) {
+        let existing_ids: HashSet<String> = self
+            .profiles
+            .iter()
+            .chain(self.trashed_profiles.iter())
+            .map(|p| p.id.clone())
+            .collect();
+        let tokio_handle = self.tokio_handle.clone();
+        self.popup_modal = None;
+        self.banner_message = Some("Restoring profile backup (.zip)...".to_string());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || {
+                    crate::launcher::import_profile_archive_zip(
+                        std::path::Path::new(&raw),
+                        &existing_ids,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                match res {
+                    Ok(restored) => {
+                        let rid = restored.id.clone();
+                        let rname = restored.name.clone();
+                        if let Ok(db) = app.db.lock() {
+                            let _ = db.upsert_profile(&restored);
+                        }
+                        app.reload_profiles();
+                        app.selected_profile_id = Some(rid);
+                        app.banner_message =
+                            Some(format!("Restored profile '{rname}' from .zip backup"));
+                    }
+                    Err(e) => {
+                        app.banner_message = Some(format!("Failed to import .zip backup: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn open_cookie_robot_modal(
+        &mut self,
+        profile_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cookie_robot_target_id = profile_id;
+        self.popup_modal = Some(ActivePopupModal::CookieRobot);
+        cx.notify();
+    }
+
+    pub fn start_cookie_robot(&mut self, cx: &mut Context<Self>) {
+        let raw_urls = self.cookie_robot_urls_input.read(cx).value().to_string();
+        let urls: Vec<String> = raw_urls
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if urls.is_empty() {
+            self.banner_message = Some("Enter at least 1 warm-up URL".to_string());
+            cx.notify();
+            return;
+        }
+        let dwell = self.cookie_robot_dwell_secs;
+        let target_ids: Vec<String> = if let Some(pid) = &self.cookie_robot_target_id {
+            vec![pid.clone()]
+        } else {
+            self.checked_profile_ids.iter().cloned().collect()
+        };
+        if target_ids.is_empty() {
+            return;
+        }
+        let targets: Vec<Profile> = self
+            .profiles
+            .iter()
+            .filter(|p| target_ids.contains(&p.id))
+            .cloned()
+            .collect();
+        let total_urls = urls.len();
+        self.banner_message = Some(format!(
+            "Cookie Robot started for {} profile(s) ({total_urls} sites, {dwell}s each)...",
+            targets.len()
+        ));
+        cx.notify();
+
+        for prof in targets {
+            let pid = prof.id.clone();
+            let pid_task = pid.clone();
+            let short_id = prof.short_id();
+            let prof_name = prof.name.clone();
+            let urls_clone = urls.clone();
+            let existing_ws = match self.statuses.get(&pid) {
+                Some(ProfileStatus::Starting(_)) => continue,
+                Some(ProfileStatus::Running(info)) => Some(info.ws_url.clone()),
+                _ => None,
+            };
+            if let Some(prev) = self.profile_tasks.remove(&pid) {
+                prev.abort();
+            }
+            if existing_ws.is_none() {
+                self.statuses.insert(
+                    pid.clone(),
+                    ProfileStatus::Starting("Warming up...".to_string()),
+                );
+            }
+            let tokio_handle = self.tokio_handle.clone();
+            let db = self.db.clone();
+            let running_procs = self.running_processes.clone();
+            let join_handle = tokio_handle.spawn(async move {
+                let ws_url = if let Some(ws) = existing_ws {
+                    ws
+                } else {
+                    let (proc, geo) = crate::launcher::launch_profile(&prof).await?;
+                    let ws = proc.info.ws_url.clone();
+                    if let Ok(db_guard) = db.lock() {
+                        if let Some(g) = &geo {
+                            let _ = db_guard.update_resolved_geo(&pid, Some(g));
+                        }
+                        let _ = db_guard.touch_last_launched(&pid);
+                    }
+                    if let Ok(mut map) = running_procs.lock() {
+                        map.insert(pid.clone(), proc);
+                    }
+                    ws
+                };
+                tokio::task::spawn_blocking(move || {
+                    crate::launcher::run_cookie_robot_warmup(&short_id, &ws_url, &urls_clone, dwell)
+                })
+                .await?
+            });
+            self.profile_tasks
+                .insert(pid_task.clone(), join_handle.abort_handle());
+            cx.spawn(async move |this, cx| {
+                let join_res = join_handle.await;
+                let _ = this.update(cx, |app, cx| {
+                    app.profile_tasks.remove(&pid_task);
+                    let res = match join_res {
+                        Ok(r) => r,
+                        Err(e) if e.is_cancelled() => return,
+                        Err(e) => Err(anyhow::anyhow!("Warm-up task error: {e}")),
+                    };
+                    let live_info = app
+                        .running_processes
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&pid_task).map(|p| p.info.clone()));
+                    match res {
+                        Ok(visited) => {
+                            if let Some(info) = live_info {
+                                app.statuses.insert(pid_task.clone(), ProfileStatus::Running(info));
+                            }
+                            app.reload_profiles();
+                            app.banner_message = Some(format!(
+                                "Cookie Robot finished '{prof_name}': visited {visited}/{total_urls} sites & saved cookies"
+                            ));
+                        }
+                        Err(e) => {
+                            if let Some(info) = live_info {
+                                app.statuses.insert(pid_task.clone(), ProfileStatus::Running(info));
+                            } else {
+                                app.statuses
+                                    .insert(pid_task.clone(), ProfileStatus::Error(e.to_string()));
+                            }
+                            app.banner_message =
+                                Some(format!("Cookie Robot failed on '{prof_name}': {e}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
 
@@ -2436,7 +2930,7 @@ impl BonLoginApp {
             .collect();
         if deletable_ids.is_empty() {
             self.banner_message =
-                Some("Stop running profiles before deleting them".to_string());
+                Some("Stop running profiles before moving them to Trash".to_string());
             cx.notify();
             return;
         }
@@ -2449,13 +2943,12 @@ impl BonLoginApp {
         if let Ok(db) = self.db.lock() {
             let _ = db.with_transaction(|db| {
                 for id in &deletable_ids {
-                    let _ = db.delete_profile(id);
+                    let _ = db.soft_delete_profile(id);
                 }
                 Ok(())
             });
         }
         for id in &deletable_ids {
-            let _ = crate::launcher::wipe_profile_data(id);
             self.statuses.remove(id);
             self.checked_profile_ids.remove(id);
         }
@@ -2466,7 +2959,9 @@ impl BonLoginApp {
             self.selected_profile_id = None;
             self.modal = None;
         }
-        self.banner_message = Some(format!("Deleted {count} selected profile(s)"));
+        self.banner_message = Some(format!(
+            "Moved {count} profile(s) to Trash (restore anytime from Trash tab)"
+        ));
         cx.notify();
     }
 
@@ -2534,7 +3029,7 @@ impl BonLoginApp {
                                 let _ = db_guard.update_resolved_geo(&pid, Some(&geo));
                             }
                         }
-                        app.reload_proxies_and_profiles();
+                        app.reload_profiles();
                         if !still_running {
                             app.statuses.insert(pid.clone(), ProfileStatus::Stopped);
                         }
@@ -3121,6 +3616,13 @@ impl Render for BonLoginApp {
                                                 sub_tab == ProfileSubTab::Group,
                                                 ProfileSubTab::Group,
                                                 cx,
+                                            ))
+                                            .child(genlogin_subtab_item(
+                                                "Trash",
+                                                self.trashed_profiles.len(),
+                                                sub_tab == ProfileSubTab::Trash,
+                                                ProfileSubTab::Trash,
+                                                cx,
                                             )),
                                     )
                                     .children((selected_group != "All").then(|| {
@@ -3142,6 +3644,15 @@ impl Render for BonLoginApp {
                                 render_groups_subtab_view(self, cx)
                                     .with_animation(
                                         "subtab-groups-enter",
+                                        Animation::new(Duration::from_millis(140))
+                                            .with_easing(ease_out_quint()),
+                                        |this, delta| this.opacity(delta),
+                                    )
+                                    .into_any_element()
+                            } else if sub_tab == ProfileSubTab::Trash {
+                                render_trash_table(&self.trashed_profiles, cx)
+                                    .with_animation(
+                                        "subtab-trash-enter",
                                         Animation::new(Duration::from_millis(140))
                                             .with_easing(ease_out_quint()),
                                         |this, delta| this.opacity(delta),
@@ -3180,19 +3691,47 @@ impl Render for BonLoginApp {
                                                     .w(px(270.))
                                                     .child(Input::new(&self.search_input)),
                                             )
-                                            .children((!self.show_detail_drawer).then(|| {
-                                                Button::new("reopen-detail-drawer")
-                                                    .with_variant(BonTheme::row_action(cx))
-                                                    .small()
-                                                    .label(format!(
-                                                        "{}  Show Detail Panel",
-                                                        SfSymbol::SIDEBAR_RIGHT
-                                                    ))
-                                                    .on_click(cx.listener(|app, _, _, cx| {
-                                                        app.show_detail_drawer = true;
-                                                        cx.notify();
-                                                    }))
-                                            })),
+                                            .child(
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(
+                                                        Button::new("top-import-zip-btn")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label("📥  Import .zip")
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.popup_modal = Some(
+                                                                        ActivePopupModal::ImportBackupZip,
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                    .children((!self.show_detail_drawer).then(
+                                                        || {
+                                                            Button::new("reopen-detail-drawer")
+                                                                .with_variant(BonTheme::row_action(
+                                                                    cx,
+                                                                ))
+                                                                .small()
+                                                                .label(format!(
+                                                                    "{}  Show Detail Panel",
+                                                                    SfSymbol::SIDEBAR_RIGHT
+                                                                ))
+                                                                .on_click(cx.listener(
+                                                                    |app, _, _, cx| {
+                                                                        app.show_detail_drawer =
+                                                                            true;
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                        },
+                                                    )),
+                                            ),
                                     )
                                     // GenLogin Top Menu Bar (Batch Action Row below Search when profiles are checked, `docs/genlogin-3.0/assets/menu-bar_profile_top-menu-bar_01.png`)
                                     .children((checked_count > 0).then(|| {
@@ -3352,9 +3891,40 @@ impl Render for BonLoginApp {
                                                                 },
                                                             )),
                                                     )
+                                                    .child(
+                                                        Button::new("batch-tags-note-btn")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label("🏷  Tags & Note")
+                                                            .on_click(cx.listener(
+                                                                |app, _, window, cx| {
+                                                                    app.open_quick_meta_modal(
+                                                                        None, window, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("batch-cookie-robot-btn")
+                                                            .with_variant(BonTheme::outline_blue(
+                                                                cx,
+                                                            ))
+                                                            .small()
+                                                            .label("🤖  Cookie Robot")
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.open_cookie_robot_modal(
+                                                                        None, cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
                                                     .child({
                                                         let app_ids = app_entity.clone();
                                                         let app_names = app_entity.clone();
+                                                        let app_zip = app_entity.clone();
                                                         let app_exp = app_entity.clone();
                                                         let app_del = app_entity.clone();
                                                         Button::new("batch-more-dots")
@@ -3366,9 +3936,10 @@ impl Render for BonLoginApp {
                                                                 move |menu, _window, _cx| {
                                                                     let a1 = app_ids.clone();
                                                                     let a2 = app_names.clone();
+                                                                    let az = app_zip.clone();
                                                                     let a3 = app_exp.clone();
                                                                     let a4 = app_del.clone();
-                                                                    menu.min_w(px(170.))
+                                                                    menu.min_w(px(190.))
                                                                         .item(
                                                                             PopupMenuItem::new(
                                                                                 "\u{100241}   Copy IDs",
@@ -3401,7 +3972,22 @@ impl Render for BonLoginApp {
                                                                         )
                                                                         .item(
                                                                             PopupMenuItem::new(
-                                                                                "\u{10023d}   Export",
+                                                                                "📦   Export Backup (.zip)",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    az.update(
+                                                                                        cx,
+                                                                                        |app, cx| {
+                                                                                            app.export_checked_profiles_zip(cx);
+                                                                                        },
+                                                                                    );
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023d}   Export JSON",
                                                                             )
                                                                             .on_click(
                                                                                 move |_, _, cx| {
@@ -3418,7 +4004,7 @@ impl Render for BonLoginApp {
                                                                         .item(
                                                                             PopupMenuItem::new(
                                                                                 format!(
-                                                                                    "{}   Delete ({checked_count})",
+                                                                                    "{}   Move to Trash ({checked_count})",
                                                                                     SfSymbol::TRASH
                                                                                 ),
                                                                             )
