@@ -268,6 +268,8 @@ pub struct ProxyConfig {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub change_ip_url: Option<String>,
 }
 
 impl ProxyConfig {
@@ -287,11 +289,15 @@ impl ProxyConfig {
         raw: &str,
         default_protocol: ProxyProtocol,
     ) -> anyhow::Result<Option<(Self, Option<String>)>> {
-        // shortcut: strip GenLogin's trailing '|changeIpUrl' metadata if pasted
-        let s = raw.split('|').next().unwrap_or(raw).trim();
+        let (s_part, tail_part) = raw.split_once('|').unwrap_or((raw, ""));
+        let s = s_part.trim();
         if s.is_empty() {
             return Ok(None);
         }
+        let change_ip_url = {
+            let u = tail_part.trim();
+            (u.starts_with("http://") || u.starts_with("https://")).then(|| u.to_string())
+        };
 
         let lower = s.to_ascii_lowercase();
         let (protocol, rest) = if let Some(len) = [
@@ -336,6 +342,7 @@ impl ProxyConfig {
                     port,
                     username,
                     password,
+                    change_ip_url,
                 },
                 None,
             )));
@@ -350,6 +357,7 @@ impl ProxyConfig {
                     port: port_str.parse()?,
                     username: None,
                     password: None,
+                    change_ip_url,
                 },
                 None,
             ))),
@@ -360,6 +368,7 @@ impl ProxyConfig {
                     port: port_str.parse()?,
                     username: None,
                     password: None,
+                    change_ip_url,
                 },
                 Some(name.trim().to_string()).filter(|v| !v.is_empty()),
             ))),
@@ -370,6 +379,7 @@ impl ProxyConfig {
                     port: port_str.parse()?,
                     username: Some((*user).to_string()).filter(|v| !v.is_empty()),
                     password: Some((*pass).to_string()).filter(|v| !v.is_empty()),
+                    change_ip_url,
                 },
                 None,
             ))),
@@ -380,6 +390,7 @@ impl ProxyConfig {
                     port: port_str.parse()?,
                     username: Some((*user).to_string()).filter(|v| !v.is_empty()),
                     password: Some((*pass).to_string()).filter(|v| !v.is_empty()),
+                    change_ip_url,
                 },
                 Some(name.trim().to_string()).filter(|v| !v.is_empty()),
             ))),
@@ -398,10 +409,14 @@ impl ProxyConfig {
             ProxyProtocol::Http => "",
             ProxyProtocol::Socks5 => "socks5:",
         };
-        match (&self.username, &self.password) {
+        let base = match (&self.username, &self.password) {
             (Some(u), Some(p)) => format!("{prefix}{}:{}:{u}:{p}", self.host, self.port),
             (Some(u), None) => format!("{prefix}{}:{}:{u}:", self.host, self.port),
             _ => format!("{prefix}{}:{}", self.host, self.port),
+        };
+        match &self.change_ip_url {
+            Some(url) if !url.trim().is_empty() => format!("{base}|{}", url.trim()),
+            _ => base,
         }
     }
 }
@@ -1158,6 +1173,11 @@ mod tests {
         assert_eq!(p3.port, 45042);
         assert_eq!(p3.username.as_deref(), Some("admin"));
         assert_eq!(p3.password.as_deref(), Some("pass"));
+        assert_eq!(p3.change_ip_url.as_deref(), Some("http://rotate.local/ip"));
+        assert_eq!(
+            p3.to_editable_string(),
+            "socks5:160.250.60.55:45042:admin:pass|http://rotate.local/ip"
+        );
 
         let (p4, name4) = ProxyConfig::parse_with_optional_name(
             "http:160.250.60.55:45042:user1:pass1:Vina Proxy Data Center",

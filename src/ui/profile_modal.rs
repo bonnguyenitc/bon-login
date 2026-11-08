@@ -1062,9 +1062,8 @@ pub fn render_edit_profile_view(
                                 })
                                 .with_animation(
                                     "prof-tab-overview-enter",
-                                    Animation::new(Duration::from_millis(160))
-                                        .with_easing(ease_out_quint()),
-                                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * 6.0)),
+                                    BonTheme::ui_enter_anim(),
+                                    |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
 
@@ -1423,9 +1422,8 @@ pub fn render_edit_profile_view(
                                 )
                                 .with_animation(
                                     "prof-tab-network-enter",
-                                    Animation::new(Duration::from_millis(160))
-                                        .with_easing(ease_out_quint()),
-                                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * 6.0)),
+                                    BonTheme::ui_enter_anim(),
+                                    |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
 
@@ -1553,9 +1551,8 @@ pub fn render_edit_profile_view(
                                 }))
                                 .with_animation(
                                     "prof-tab-location-enter",
-                                    Animation::new(Duration::from_millis(160))
-                                        .with_easing(ease_out_quint()),
-                                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * 6.0)),
+                                    BonTheme::ui_enter_anim(),
+                                    |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
 
@@ -1700,9 +1697,8 @@ pub fn render_edit_profile_view(
                                 )
                                 .with_animation(
                                     "prof-tab-hardware-enter",
-                                    Animation::new(Duration::from_millis(160))
-                                        .with_easing(ease_out_quint()),
-                                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * 6.0)),
+                                    BonTheme::ui_enter_anim(),
+                                    |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
 
@@ -1886,9 +1882,8 @@ pub fn render_edit_profile_view(
                                 )
                                 .with_animation(
                                     "prof-tab-cookies-enter",
-                                    Animation::new(Duration::from_millis(160))
-                                        .with_easing(ease_out_quint()),
-                                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * 6.0)),
+                                    BonTheme::ui_enter_anim(),
+                                    |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
                         }),
@@ -2517,7 +2512,7 @@ pub fn render_proxies_view(
                 )
                 .with_animation(
                     "pmgr-batch-bar-enter",
-                    Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                    BonTheme::ui_enter_anim(),
                     |this, delta| this.opacity(delta),
                 )
         }))
@@ -2715,7 +2710,7 @@ pub fn render_proxies_view(
                             let pid_menu_copy = sp.config.to_editable_string();
                             let pid_menu_assign = sp.id.clone();
                             let pid_menu_del = sp.id.clone();
-
+                            let has_rot_url = sp.config.change_ip_url.is_some();
                             h_flex()
                                 .w_full()
                                 .px_3()
@@ -2976,8 +2971,10 @@ pub fn render_proxies_view(
                                                 let clr_id = pid_menu_del.clone();
                                                 let app_clr = app_row_menu.clone();
                                                 let del_id = pid_menu_del.clone();
+                                                let rot_id = pid_menu_del.clone();
+                                                let app_r = app_row_menu.clone();
                                                 let app_d = app_row_menu.clone();
-                                                menu.item(
+                                                let mut m = menu.item(
                                                     PopupMenuItem::new(format!(
                                                         "{}   Copy proxy",
                                                         SfSymbol::DOC_ON_DOC
@@ -3040,21 +3037,34 @@ pub fn render_proxies_view(
                                                             });
                                                         }),
                                                 )
-                                                .separator()
-                                                .item(
+                                                ;
+                                                if has_rot_url {
+                                                    m = m.item(
+                                                        PopupMenuItem::new(
+                                                            "🔄   Rotate Proxy IP",
+                                                        )
+                                                        .on_click(move |_, _, cx| {
+                                                            let rid = rot_id.clone();
+                                                            app_r.update(cx, |app, cx| {
+                                                                app.rotate_saved_proxy_ip(&rid, cx);
+                                                            });
+                                                        }),
+                                                    );
+                                                }
+                                                m.separator().item(
                                                     PopupMenuItem::new(format!(
                                                         "{}   Delete proxy",
                                                         SfSymbol::TRASH
                                                     ))
-                                                        .on_click(move |_, _, cx| {
-                                                            let did = del_id.clone();
-                                                            app_d.update(cx, |app, cx| {
-                                                                app.request_delete(
-                                                                    PendingDeleteAction::Proxy(did),
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        }),
+                                                    .on_click(move |_, _, cx| {
+                                                        let did = del_id.clone();
+                                                        app_d.update(cx, |app, cx| {
+                                                            app.request_delete(
+                                                                PendingDeleteAction::Proxy(did),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
                                                 )
                                             }),
                                         ),
@@ -5427,13 +5437,13 @@ pub fn render_popup_modal(
             })
             .with_animation(
                 modal_anim_id,
-                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
-                |this, delta| this.opacity(delta).mt(px((1.0 - delta) * -10.0)),
+                BonTheme::ui_enter_anim(),
+                |this, delta| this.opacity(delta),
             ),
         )
         .with_animation(
             backdrop_anim_id,
-            Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+            BonTheme::ui_enter_anim(),
             |this, delta| this.opacity(delta),
         )
         .into_any_element()

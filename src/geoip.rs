@@ -179,6 +179,37 @@ pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoIn
     )
 }
 
+/// Calls a proxy provider's IP rotation webhook (`change_ip_url`) directly and returns a short status summary.
+pub async fn trigger_proxy_rotation(change_ip_url: &str) -> Result<String> {
+    let url = change_ip_url.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        bail!("Rotation URL must start with http:// or https://");
+    }
+    let resp = DIRECT_CLIENT
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Rotation webhook failed: {url}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("Rotation webhook returned HTTP {status}");
+    }
+    let summary: String = body
+        .lines()
+        .next()
+        .unwrap_or("OK")
+        .trim()
+        .chars()
+        .take(80)
+        .collect();
+    Ok(if summary.is_empty() {
+        format!("HTTP {}", status.as_u16())
+    } else {
+        summary
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

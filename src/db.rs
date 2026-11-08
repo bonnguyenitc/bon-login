@@ -112,7 +112,8 @@ impl Database {
                 last_launched_at INTEGER,
                 tags TEXT NOT NULL DEFAULT '',
                 totp_secret TEXT NOT NULL DEFAULT '',
-                deleted_at INTEGER
+                deleted_at INTEGER,
+                proxy_change_ip_url TEXT
             );
             CREATE TABLE IF NOT EXISTS proxies (
                 id TEXT PRIMARY KEY,
@@ -131,7 +132,8 @@ impl Database {
                 geo_latency_ms INTEGER,
                 last_error TEXT,
                 created_at INTEGER NOT NULL,
-                expired_at INTEGER
+                expired_at INTEGER,
+                change_ip_url TEXT
             );
             CREATE TABLE IF NOT EXISTS profile_groups (
                 name TEXT PRIMARY KEY COLLATE NOCASE,
@@ -175,6 +177,8 @@ impl Database {
             "ALTER TABLE profiles ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE profiles ADD COLUMN deleted_at INTEGER",
             "ALTER TABLE proxies ADD COLUMN expired_at INTEGER",
+            "ALTER TABLE profiles ADD COLUMN proxy_change_ip_url TEXT",
+            "ALTER TABLE proxies ADD COLUMN change_ip_url TEXT",
         ] {
             let _ = self.conn.execute(alter, []);
         }
@@ -316,7 +320,7 @@ impl Database {
                 startup_url, notes, created_at, last_launched_at,
                 spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
                 window_size, custom_timezone, custom_locale, geo_latency_ms,
-                tags, totp_secret, deleted_at
+                tags, totp_secret, deleted_at, proxy_change_ip_url
              FROM profiles
              WHERE deleted_at IS NULL
              ORDER BY created_at DESC",
@@ -333,7 +337,7 @@ impl Database {
                 startup_url, notes, created_at, last_launched_at,
                 spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
                 window_size, custom_timezone, custom_locale, geo_latency_ms,
-                tags, totp_secret, deleted_at
+                tags, totp_secret, deleted_at, proxy_change_ip_url
              FROM profiles
              WHERE deleted_at IS NOT NULL
              ORDER BY deleted_at DESC",
@@ -361,6 +365,11 @@ impl Database {
                         port,
                         username,
                         password,
+                        change_ip_url: row
+                            .get::<_, Option<String>>(35)
+                            .ok()
+                            .flatten()
+                            .filter(|s| !s.trim().is_empty()),
                     })
                 }
                 _ => None,
@@ -439,17 +448,24 @@ impl Database {
     }
 
     pub fn upsert_profile(&self, profile: &Profile) -> anyhow::Result<()> {
-        let (proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password) =
-            match &profile.proxy {
-                Some(p) => (
-                    Some(p.protocol.as_str()),
-                    Some(p.host.as_str()),
-                    Some(p.port),
-                    p.username.as_deref(),
-                    p.password.as_deref(),
-                ),
-                None => (None, None, None, None, None),
-            };
+        let (
+            proxy_protocol,
+            proxy_host,
+            proxy_port,
+            proxy_username,
+            proxy_password,
+            proxy_change_ip_url,
+        ) = match &profile.proxy {
+            Some(p) => (
+                Some(p.protocol.as_str()),
+                Some(p.host.as_str()),
+                Some(p.port),
+                p.username.as_deref(),
+                p.password.as_deref(),
+                p.change_ip_url.as_deref(),
+            ),
+            None => (None, None, None, None, None, None),
+        };
 
         let (geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang, geo_latency_ms) =
             match &profile.resolved_geo {
@@ -474,7 +490,7 @@ impl Database {
                 proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang, geo_latency_ms,
                 startup_url, notes, created_at, last_launched_at,
-                tags, totp_secret, deleted_at
+                tags, totp_secret, deleted_at, proxy_change_ip_url
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
@@ -483,7 +499,7 @@ impl Database {
                 ?18, ?19, ?20, ?21, ?22,
                 ?23, ?24, ?25, ?26, ?27, ?28,
                 ?29, ?30, ?31, ?32,
-                ?33, ?34, ?35
+                ?33, ?34, ?35, ?36
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -519,7 +535,8 @@ impl Database {
                 last_launched_at = excluded.last_launched_at,
                 tags = excluded.tags,
                 totp_secret = excluded.totp_secret,
-                deleted_at = excluded.deleted_at",
+                deleted_at = excluded.deleted_at,
+                proxy_change_ip_url = excluded.proxy_change_ip_url",
         )?;
         stmt.execute(params![
             profile.id,
@@ -557,6 +574,7 @@ impl Database {
             tags_csv,
             profile.totp_secret,
             profile.deleted_at,
+            proxy_change_ip_url,
         ])?;
         if !profile.group_tag.trim().is_empty() {
             let _ = self.insert_group(profile.group_tag.trim());
@@ -677,7 +695,7 @@ impl Database {
             "SELECT
                 id, name, group_tag, protocol, host, port, username, password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                geo_latency_ms, last_error, created_at, expired_at
+                geo_latency_ms, last_error, created_at, expired_at, change_ip_url
              FROM proxies
              ORDER BY created_at DESC",
         )?;
@@ -716,6 +734,11 @@ impl Database {
                     port: row.get(5)?,
                     username: row.get(6)?,
                     password: row.get(7)?,
+                    change_ip_url: row
+                        .get::<_, Option<String>>(17)
+                        .ok()
+                        .flatten()
+                        .filter(|s| !s.trim().is_empty()),
                 },
                 resolved_geo,
                 last_error: row
@@ -750,11 +773,11 @@ impl Database {
             "INSERT INTO proxies (
                 id, name, group_tag, protocol, host, port, username, password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                geo_latency_ms, last_error, created_at, expired_at
+                geo_latency_ms, last_error, created_at, expired_at, change_ip_url
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17
+                ?14, ?15, ?16, ?17, ?18
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -771,7 +794,8 @@ impl Database {
                 geo_accept_lang = excluded.geo_accept_lang,
                 geo_latency_ms = excluded.geo_latency_ms,
                 last_error = excluded.last_error,
-                expired_at = excluded.expired_at",
+                expired_at = excluded.expired_at,
+                change_ip_url = excluded.change_ip_url",
         )?;
         stmt.execute(params![
                 proxy.id,
@@ -791,6 +815,7 @@ impl Database {
                 proxy.last_error.as_deref(),
                 proxy.created_at,
                 proxy.expired_at,
+                proxy.config.change_ip_url.as_deref(),
             ],
         )?;
         if !proxy.group_tag.trim().is_empty() {
@@ -1058,6 +1083,7 @@ mod tests {
             port: 1080,
             username: Some("user1".to_string()),
             password: Some("pass1".to_string()),
+            change_ip_url: Some("http://rotate.local/api".to_string()),
         });
         custom.resolved_geo = Some(GeoInfo {
             ip: "198.51.100.10".to_string(),
@@ -1094,6 +1120,7 @@ mod tests {
                 port: 1080,
                 username: Some("u".to_string()),
                 password: Some("p".to_string()),
+                change_ip_url: None,
             },
         );
         let _ = sp;
@@ -1106,6 +1133,7 @@ mod tests {
                 port: 1080,
                 username: Some("u".to_string()),
                 password: Some("p".to_string()),
+                change_ip_url: Some("https://rotate.example.com/key".to_string()),
             },
         );
         sp.expired_at = SavedProxy::parse_expiration_input("24/03/2027");

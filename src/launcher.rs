@@ -1315,7 +1315,12 @@ pub const ADRYFISH_MACOS_DMG_URL: &str = "https://github.com/adryfish/fingerprin
 pub const ADRYFISH_MACOS_VERSION_DIR: &str = "chromium-148.0.7778.215";
 
 pub fn install_adryfish_kernel_blocking() -> Result<KernelInfo> {
-    if let Some(existing) = locate_chromium_kernel() {
+    install_adryfish_kernel_blocking_opts(false)
+}
+
+pub fn install_adryfish_kernel_blocking_opts(force: bool) -> Result<KernelInfo> {
+    if !force && let Some(existing) = locate_chromium_kernel() {
+        unquarantine_macos_app(&existing.path);
         return Ok(existing);
     }
 
@@ -1587,6 +1592,113 @@ pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
     let _ = std::fs::remove_file(states_dir.join(format!("bon_{short_id}_prelaunch.json")));
     let _ = std::fs::remove_file(states_dir.join(format!("bon_{short_id}_state.json")));
     Ok(())
+}
+
+pub fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path()));
+        } else if ft.is_file()
+            && let Ok(meta) = entry.metadata()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn is_safe_cache_cleanup_entry(name: &str) -> bool {
+    matches!(
+        name,
+        "Cache"
+            | "Code Cache"
+            | "GPUCache"
+            | "ShaderCache"
+            | "DawnCache"
+            | "DawnWebGPUCache"
+            | "DawnGraphiteCache"
+            | "GrShaderCache"
+            | "GraphiteDawnCache"
+            | "Crashpad"
+            | "BrowserMetrics"
+            | "Safe Browsing"
+            | "ComponentMetrics"
+            | "CacheStorage"
+            | "ScriptCache"
+    ) || name.ends_with(".tmp")
+}
+
+fn clean_dir_ephemeral_recursive(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let p = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if is_safe_cache_cleanup_entry(&name_str) {
+            let sz = if ft.is_dir() {
+                dir_size_bytes(&p)
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            let removed = if ft.is_dir() {
+                std::fs::remove_dir_all(&p).is_ok()
+            } else {
+                std::fs::remove_file(&p).is_ok()
+            };
+            if removed {
+                freed = freed.saturating_add(sz);
+            }
+        } else if ft.is_dir() {
+            freed = freed.saturating_add(clean_dir_ephemeral_recursive(&p));
+        }
+    }
+    freed
+}
+
+/// Removes Chromium cache/shader/crashpad bloat from a stopped profile's user-data-dir while preserving Cookies & LocalStorage.
+/// Returns `(freed_bytes, remaining_bytes)`.
+pub fn clean_profile_cache(profile_id: &str) -> Result<(u64, u64)> {
+    if probe_live_runtime(profile_id).is_some() {
+        bail!("Cannot clean disk cache while profile '{profile_id}' is running");
+    }
+    let dir = app_support_dir().join("profiles").join(profile_id);
+    if !dir.is_dir() {
+        return Ok((0, 0));
+    }
+    let freed = clean_dir_ephemeral_recursive(&dir);
+    let remaining = dir_size_bytes(&dir);
+    Ok((freed, remaining))
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2891,38 +3003,9 @@ pub fn compute_tile_bounds(
 
 /// Resizes and positions a running Chromium window via Browser-domain CDP (`Browser.setWindowBounds`),
 /// preserving 100% stealth (no `Emulation.*` or `Runtime.enable`).
-pub fn cdp_set_window_bounds(
-    cdp_port: u16,
-    ws_url: &str,
-    left: i32,
-    top: i32,
-    width: i32,
-    height: i32,
-) -> Result<()> {
+fn cdp_ws_connect(cdp_port: u16, ws_url: &str) -> Result<(std::net::TcpStream, Vec<u8>)> {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-
-    let list_body = cdp_http_get_body(cdp_port, "/json/list")
-        .context("Failed to query CDP /json/list")?;
-    let targets: serde_json::Value = serde_json::from_str(list_body.trim())?;
-    let target_id = targets
-        .as_array()
-        .and_then(|arr| {
-            let find_page = |skip_internal: bool| {
-                arr.iter().find_map(|t| {
-                    let ty = t.get("type")?.as_str()?;
-                    let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                    let ok_url = !skip_internal
-                        || (!url.starts_with("chrome-extension://")
-                            && !url.starts_with("devtools://"));
-                    (matches!(ty, "page" | "app") && ok_url)
-                        .then(|| t.get("id")?.as_str().map(ToString::to_string))
-                        .flatten()
-                })
-            };
-            find_page(true).or_else(|| find_page(false))
-        })
-        .context("No open browser window target found")?;
 
     let ws_path = ws_url
         .strip_prefix("ws://127.0.0.1:")
@@ -2933,8 +3016,8 @@ pub fn cdp_set_window_bounds(
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cdp_port);
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(350))?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(600)));
 
     let handshake = format!(
         "GET {ws_path} HTTP/1.1\r\n\
@@ -2965,93 +3048,139 @@ pub fn cdp_set_window_bounds(
         bail!("CDP WebSocket upgrade rejected");
     }
     buf.drain(..header_end);
+    Ok((stream, buf))
+}
 
-    fn ws_send(stream: &mut TcpStream, msg: &str) -> Result<()> {
-        let payload = msg.as_bytes();
-        let mask = [0x12u8, 0x34, 0x56, 0x78];
-        let mut frame = Vec::with_capacity(14 + payload.len());
-        frame.push(0x81);
-        if payload.len() < 126 {
-            frame.push(0x80 | (payload.len() as u8));
+fn cdp_ws_send(stream: &mut std::net::TcpStream, msg: &str) -> Result<()> {
+    use std::io::Write;
+    let payload = msg.as_bytes();
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    let mut frame = Vec::with_capacity(14 + payload.len());
+    frame.push(0x81);
+    if payload.len() < 126 {
+        frame.push(0x80 | (payload.len() as u8));
+    } else {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        frame.push(b ^ mask[i & 3]);
+    }
+    stream.write_all(&frame)?;
+    Ok(())
+}
+
+fn cdp_ws_recv_id(
+    stream: &mut std::net::TcpStream,
+    buf: &mut Vec<u8>,
+    expected_id: u64,
+) -> Result<serde_json::Value> {
+    use std::io::Read;
+    let mut chunk = [0u8; 2048];
+    for _ in 0..16 {
+        while buf.len() < 2 {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                bail!("EOF reading CDP WebSocket frame");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let opcode = buf[0] & 0x0f;
+        let len0 = (buf[1] & 0x7f) as usize;
+        let (hdr_len, payload_len) = if len0 < 126 {
+            (2usize, len0)
+        } else if len0 == 126 {
+            while buf.len() < 4 {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    bail!("EOF reading CDP frame length");
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            (4, u16::from_be_bytes([buf[2], buf[3]]) as usize)
         } else {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            while buf.len() < 10 {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    bail!("EOF reading CDP 64-bit frame length");
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&buf[2..10]);
+            (10, u64::from_be_bytes(arr) as usize)
+        };
+        while buf.len() < hdr_len + payload_len {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                bail!("EOF reading CDP frame payload");
+            }
+            buf.extend_from_slice(&chunk[..n]);
         }
-        frame.extend_from_slice(&mask);
-        for (i, b) in payload.iter().enumerate() {
-            frame.push(b ^ mask[i & 3]);
+        let data: Vec<u8> = buf.drain(..hdr_len + payload_len).skip(hdr_len).collect();
+        if opcode == 0x1
+            && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data)
+            && val.get("id").and_then(|v| v.as_u64()) == Some(expected_id)
+        {
+            if let Some(err) = val.get("error") {
+                bail!("CDP error: {err}");
+            }
+            return Ok(val);
         }
-        stream.write_all(&frame)?;
-        Ok(())
     }
+    bail!("Timed out waiting for CDP response id={expected_id}")
+}
 
-    fn ws_recv_id(
-        stream: &mut TcpStream,
-        buf: &mut Vec<u8>,
-        expected_id: u64,
-    ) -> Result<serde_json::Value> {
-        let mut chunk = [0u8; 2048];
-        for _ in 0..16 {
-            while buf.len() < 2 {
-                let n = stream.read(&mut chunk)?;
-                if n == 0 {
-                    bail!("EOF reading CDP WebSocket frame");
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            let opcode = buf[0] & 0x0f;
-            let len0 = (buf[1] & 0x7f) as usize;
-            let (hdr_len, payload_len) = if len0 < 126 {
-                (2usize, len0)
-            } else if len0 == 126 {
-                while buf.len() < 4 {
-                    let n = stream.read(&mut chunk)?;
-                    if n == 0 {
-                        bail!("EOF reading CDP frame length");
+fn cdp_first_page_target(cdp_port: u16) -> Result<(String, String)> {
+    let list_body =
+        cdp_http_get_body(cdp_port, "/json/list").context("Failed to query CDP /json/list")?;
+    let targets: serde_json::Value = serde_json::from_str(list_body.trim())?;
+    targets
+        .as_array()
+        .and_then(|arr| {
+            let find_page = |skip_internal: bool| {
+                arr.iter().find_map(|t| {
+                    let ty = t.get("type")?.as_str()?;
+                    let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                    let ok_url = !skip_internal
+                        || (!url.starts_with("chrome-extension://")
+                            && !url.starts_with("devtools://"));
+                    if !matches!(ty, "page" | "app") || !ok_url {
+                        return None;
                     }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                (4, u16::from_be_bytes([buf[2], buf[3]]) as usize)
-            } else {
-                while buf.len() < 10 {
-                    let n = stream.read(&mut chunk)?;
-                    if n == 0 {
-                        bail!("EOF reading CDP 64-bit frame length");
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&buf[2..10]);
-                (10, u64::from_be_bytes(arr) as usize)
+                    let id = t.get("id")?.as_str()?.to_string();
+                    let ws = t
+                        .get("webSocketDebuggerUrl")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("ws://127.0.0.1:{cdp_port}/devtools/page/{id}"));
+                    Some((id, ws))
+                })
             };
-            while buf.len() < hdr_len + payload_len {
-                let n = stream.read(&mut chunk)?;
-                if n == 0 {
-                    bail!("EOF reading CDP frame payload");
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            let data: Vec<u8> = buf.drain(..hdr_len + payload_len).skip(hdr_len).collect();
-            if opcode == 0x1
-                && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data)
-                && val.get("id").and_then(|v| v.as_u64()) == Some(expected_id)
-            {
-                if let Some(err) = val.get("error") {
-                    bail!("CDP error: {err}");
-                }
-                return Ok(val);
-            }
-        }
-        bail!("Timed out waiting for CDP response id={expected_id}")
-    }
+            find_page(true).or_else(|| find_page(false))
+        })
+        .context("No open browser page target found")
+}
+
+pub fn cdp_set_window_bounds(
+    cdp_port: u16,
+    ws_url: &str,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    let (target_id, _) = cdp_first_page_target(cdp_port)?;
+    let (mut stream, mut buf) = cdp_ws_connect(cdp_port, ws_url)?;
 
     let get_win = serde_json::json!({
         "id": 1,
         "method": "Browser.getWindowForTarget",
         "params": { "targetId": target_id }
     });
-    ws_send(&mut stream, &get_win.to_string())?;
-    let win_resp = ws_recv_id(&mut stream, &mut buf, 1)?;
+    cdp_ws_send(&mut stream, &get_win.to_string())?;
+    let win_resp = cdp_ws_recv_id(&mut stream, &mut buf, 1)?;
     let window_id = win_resp
         .get("result")
         .and_then(|r| r.get("windowId"))
@@ -3073,8 +3202,8 @@ pub fn cdp_set_window_bounds(
                 "bounds": { "windowState": "normal" }
             }
         });
-        ws_send(&mut stream, &restore.to_string())?;
-        let _ = ws_recv_id(&mut stream, &mut buf, 2)?;
+        cdp_ws_send(&mut stream, &restore.to_string())?;
+        let _ = cdp_ws_recv_id(&mut stream, &mut buf, 2)?;
     }
 
     let set_bounds = serde_json::json!({
@@ -3090,17 +3219,90 @@ pub fn cdp_set_window_bounds(
             }
         }
     });
-    ws_send(&mut stream, &set_bounds.to_string())?;
-    let _ = ws_recv_id(&mut stream, &mut buf, 3)?;
+    cdp_ws_send(&mut stream, &set_bounds.to_string())?;
+    let _ = cdp_ws_recv_id(&mut stream, &mut buf, 3)?;
 
     let activate = serde_json::json!({
         "id": 4,
         "method": "Target.activateTarget",
         "params": { "targetId": target_id }
     });
-    let _ = ws_send(&mut stream, &activate.to_string());
-    let _ = ws_recv_id(&mut stream, &mut buf, 4);
+    let _ = cdp_ws_send(&mut stream, &activate.to_string());
+    let _ = cdp_ws_recv_id(&mut stream, &mut buf, 4);
     Ok(())
+}
+
+/// Types `text` character-by-character into the focused element of a running Chromium window via
+/// page-target CDP `Input.dispatchKeyEvent` (no `Runtime.enable` or clipboard paste event).
+pub fn cdp_type_as_human(cdp_port: u16, text: &str) -> Result<usize> {
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let (_, page_ws_url) = cdp_first_page_target(cdp_port)?;
+    let (mut stream, mut buf) = cdp_ws_connect(cdp_port, &page_ws_url)?;
+    let mut req_id = 1u64;
+    let mut typed = 0usize;
+    for ch in text.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        let (down_params, up_params) = if ch == '\n' {
+            (
+                serde_json::json!({
+                    "type": "rawKeyDown",
+                    "key": "Enter",
+                    "code": "Enter",
+                    "windowsVirtualKeyCode": 13,
+                    "nativeVirtualKeyCode": 13,
+                    "text": "\r",
+                    "unmodifiedText": "\r"
+                }),
+                serde_json::json!({
+                    "type": "keyUp",
+                    "key": "Enter",
+                    "code": "Enter",
+                    "windowsVirtualKeyCode": 13,
+                    "nativeVirtualKeyCode": 13
+                }),
+            )
+        } else {
+            let s = ch.to_string();
+            (
+                serde_json::json!({
+                    "type": "keyDown",
+                    "key": s,
+                    "text": s,
+                    "unmodifiedText": s
+                }),
+                serde_json::json!({
+                    "type": "keyUp",
+                    "key": s
+                }),
+            )
+        };
+        let down_id = req_id;
+        req_id += 1;
+        let down_msg = serde_json::json!({
+            "id": down_id,
+            "method": "Input.dispatchKeyEvent",
+            "params": down_params
+        });
+        cdp_ws_send(&mut stream, &down_msg.to_string())?;
+        let _ = cdp_ws_recv_id(&mut stream, &mut buf, down_id)?;
+
+        let up_id = req_id;
+        req_id += 1;
+        let up_msg = serde_json::json!({
+            "id": up_id,
+            "method": "Input.dispatchKeyEvent",
+            "params": up_params
+        });
+        cdp_ws_send(&mut stream, &up_msg.to_string())?;
+        let _ = cdp_ws_recv_id(&mut stream, &mut buf, up_id)?;
+        typed += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(typed)
 }
 
 /// Attaches any `chrome-extension://` page tabs that opened at browser startup (before `agent-browser connect`)
@@ -4165,6 +4367,18 @@ pub async fn check_proxy_config_live(cfg: &ProxyConfig) -> Result<GeoInfo> {
     res
 }
 
+pub async fn rotate_and_check_proxy_live(cfg: &ProxyConfig) -> Result<(String, GeoInfo)> {
+    let url = cfg
+        .change_ip_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("Proxy has no rotation URL (append |http://... to proxy string)"))?;
+    let rotate_msg = crate::geoip::trigger_proxy_rotation(url).await?;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let geo = check_proxy_config_live(cfg).await?;
+    Ok((rotate_msg, geo))
+}
+
 fn print_cli_help() {
     println!(
         "BonLogin — Full CLI & Agent-Browser Control Plane\n\n\
@@ -4174,6 +4388,9 @@ fn print_cli_help() {
            bon-login launch <id|name|--group <g>|--all> [--pin-tab <t>] [--url <u>] Launch profile(s) & connect agent-browser\n  \
            bon-login stop <id|name|--group <g>|--all>                    Stop running profile(s) & flush cookies\n  \
            bon-login sync <id|name>                                      Sync OAuth popups & extension windows into tabs\n  \
+           bon-login arrange [--size <W,H>]                              Tile all running browser windows into a screen grid\n  \
+           bon-login type <id|name> <text...>                            Human-type text into focused input via CDP (bypass paste block)\n  \
+           bon-login serve [--port <19820>]                              Start local HTTP JSON control plane for n8n/Python/agents\n  \
            bon-login agent <id|name> [--record <flow>] <ab args...>      Run agent-browser (auto-records DOM steps)\n\n\
          AGENT FLOW PLAYBOOKS (`bon-login flow ...`):\n  \
            bon-login flow list                                           List saved DOM flows & required {{vars}}\n  \
@@ -4192,6 +4409,8 @@ fn print_cli_help() {
            bon-login profile clone <id|name> [--count <n>] [--name <prefix>]\n  \
            bon-login profile batch-create --count <n> [--prefix <p>] [--group <g>] [--os <os>] [--brand <b>] [--proxy-tag <tag>]\n  \
            bon-login profile check-proxy <id|name|--group <g>|--all>\n  \
+           bon-login profile rotate-proxy <id|name|--group <g>|--all>\n  \
+           bon-login profile clean-cache <id|name|--group <g>|--all>\n  \
            bon-login profile export-cookies <id|name> [--out <file>]\n  \
            bon-login profile import-cookies <id|name> <file_or_json>\n  \
            bon-login profile wipe <id|name|--group <g>|--all>\n  \
@@ -4203,6 +4422,7 @@ fn print_cli_help() {
            bon-login proxy add <raw_proxy_or_file> [--protocol http|socks5] [--tag <t>] [--name <n>] [--expire <days_or_date>]\n  \
            bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>]\n  \
            bon-login proxy check <id|name|--tag <t>|--all>\n  \
+           bon-login proxy rotate <id|name|--tag <t>|--all>\n  \
            bon-login proxy extend <id|name|--tag <t>|--all> <days|0|clear>\n  \
            bon-login proxy assign <proxy_id_or_name|--tag <t>|--all|none> --to <profile_id|name|--group <g>|--all>\n  \
            bon-login proxy export [--tag <t>] [--out <file>]\n  \
@@ -4217,7 +4437,7 @@ fn print_cli_help() {
            bon-login ext remove <id|name>\n  \
            bon-login ext open <ext_id|name> [--profile <profile_id|name>]\n\n\
          KERNEL (`bon-login kernel ...`):\n  \
-           bon-login kernel status | install"
+           bon-login kernel status | check | install [--force]"
     );
 }
 
@@ -4272,6 +4492,9 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 println!("{}", serde_json::to_string_pretty(&res)?);
                 Ok(())
             }
+            "arrange" | "tile" => run_arrange_cli(&args[1..]),
+            "type" | "human-type" => run_type_cli(&args[1..]),
+            "serve" | "server" => tokio_handle.block_on(run_serve_cli(&args[1..])),
             "agent" | "ab" => run_agent_cli(&args[1..]),
             "flow" | "flows" => run_flow_subcommand(&args[1..]),
             "profile" | "profiles" => run_profile_subcommand(tokio_handle, &args[1..]),
@@ -4683,6 +4906,83 @@ fn run_profile_subcommand(
                 }
             }
             println!("{}", serde_json::to_string_pretty(&out)?);
+            Ok(())
+        }
+        "rotate-proxy" | "rotate" => {
+            let profiles = db.list_profiles()?;
+            let (targets, _) = select_profiles_by_target(&profiles, rest)?;
+            let mut out = Vec::new();
+            let mut any_failed = false;
+            for p in targets {
+                let Some(cfg) = &p.proxy else {
+                    any_failed = true;
+                    out.push(serde_json::json!({
+                        "id": p.id,
+                        "short_id": p.short_id(),
+                        "name": p.name,
+                        "ok": false,
+                        "error": "Profile has no proxy configured",
+                    }));
+                    continue;
+                };
+                match tokio_handle.block_on(rotate_and_check_proxy_live(cfg)) {
+                    Ok((rot_msg, geo)) => {
+                        let _ = db.sync_geo_for_proxy_endpoint(cfg, &geo);
+                        out.push(serde_json::json!({
+                            "id": p.id,
+                            "short_id": p.short_id(),
+                            "name": p.name,
+                            "ok": true,
+                            "rotation": rot_msg,
+                            "geo": geo,
+                        }));
+                    }
+                    Err(e) => {
+                        any_failed = true;
+                        out.push(serde_json::json!({
+                            "id": p.id,
+                            "short_id": p.short_id(),
+                            "name": p.name,
+                            "ok": false,
+                            "error": e.to_string(),
+                        }));
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            if any_failed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        "clean-cache" | "clean" => {
+            let profiles = db.list_profiles()?;
+            let (targets, _) = select_profiles_by_target(&profiles, rest).map_err(|_| {
+                anyhow!("Usage: bon-login profile clean-cache <id|name|--group <g>|--all>")
+            })?;
+            let mut results = Vec::new();
+            let mut total_freed = 0u64;
+            for p in targets {
+                let (freed, remaining) = clean_profile_cache(&p.id)?;
+                total_freed = total_freed.saturating_add(freed);
+                results.push(serde_json::json!({
+                    "short_id": p.short_id(),
+                    "name": p.name,
+                    "freed_bytes": freed,
+                    "freed_label": format_bytes(freed),
+                    "remaining_bytes": remaining,
+                    "remaining_label": format_bytes(remaining),
+                }));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "total_freed_bytes": total_freed,
+                    "total_freed_label": format_bytes(total_freed),
+                    "profiles": results,
+                }))?
+            );
             Ok(())
         }
         "export-cookies" | "export-state" => {
@@ -5103,6 +5403,43 @@ fn run_proxy_subcommand(
             println!("{}", serde_json::to_string_pretty(&results)?);
             Ok(())
         }
+        "rotate" => {
+            let proxies = db.list_proxies()?;
+            let (targets, _) = select_proxies_by_target(&proxies, rest)?;
+            let mut results = Vec::new();
+            let mut any_failed = false;
+            for sp in targets {
+                match tokio_handle.block_on(rotate_and_check_proxy_live(&sp.config)) {
+                    Ok((rot_msg, geo)) => {
+                        let _ = db.sync_geo_for_proxy_endpoint(&sp.config, &geo);
+                        results.push(serde_json::json!({
+                            "id": sp.id,
+                            "name": sp.name,
+                            "host": sp.config.display_short(),
+                            "ok": true,
+                            "rotation": rot_msg,
+                            "geo": geo,
+                        }));
+                    }
+                    Err(e) => {
+                        any_failed = true;
+                        let msg = e.to_string();
+                        results.push(serde_json::json!({
+                            "id": sp.id,
+                            "name": sp.name,
+                            "host": sp.config.display_short(),
+                            "ok": false,
+                            "error": msg,
+                        }));
+                    }
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&results)?);
+            if any_failed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         "extend" => {
             let proxies = db.list_proxies()?;
             let (targets, consumed) = select_proxies_by_target(&proxies, rest)?;
@@ -5513,21 +5850,33 @@ fn run_ext_subcommand(
 
 fn run_kernel_subcommand(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("status");
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
     match sub {
-        "status" | "info" => {
+        "status" | "info" | "check" => {
             let k = locate_chromium_kernel();
+            let version_out = k.as_ref().and_then(|info| {
+                unquarantine_macos_app(&info.path);
+                Command::new(&info.path)
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "installed": k.is_some(),
+                    "healthy": version_out.is_some(),
                     "version": k.as_ref().map(|i| &i.version_label),
+                    "binary_version": version_out,
                     "path": k.as_ref().map(|i| &i.path),
                 }))?
             );
             Ok(())
         }
-        "install" | "download" => {
-            let k = install_adryfish_kernel_blocking()?;
+        "install" | "download" | "update" => {
+            let k = install_adryfish_kernel_blocking_opts(force)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -5538,7 +5887,361 @@ fn run_kernel_subcommand(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
-        other => bail!("Unknown kernel subcommand '{other}' (expected status or install)"),
+        other => bail!("Unknown kernel subcommand '{other}' (expected status, check, or install [--force])"),
+    }
+}
+
+fn run_arrange_cli(args: &[String]) -> Result<()> {
+    let raw_size = args
+        .windows(2)
+        .find_map(|w| (w[0] == "--size" || w[0] == "-s").then_some(w[1].as_str()))
+        .unwrap_or("960,600");
+    let (win_w, win_h) =
+        parse_window_size(raw_size).ok_or_else(|| anyhow!("Invalid --size '{raw_size}' (use W,H)"))?;
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let running: Vec<(String, RuntimeInfo)> = profiles
+        .into_iter()
+        .filter_map(|p| probe_live_runtime(&p.id).map(|rt| (p.short_id(), rt)))
+        .collect();
+    let bounds = compute_tile_bounds(0, 0, 1920, 1080, win_w, win_h, running.len());
+    let mut arranged = 0usize;
+    for ((_, rt), (l, t, w, h)) in running.iter().zip(bounds.iter()) {
+        if cdp_set_window_bounds(rt.cdp_port, &rt.ws_url, *l, *t, *w, *h).is_ok() {
+            arranged += 1;
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "arranged": arranged,
+            "total_running": running.len(),
+            "window_size": [win_w, win_h],
+        }))?
+    );
+    Ok(())
+}
+
+fn run_type_cli(args: &[String]) -> Result<()> {
+    let target = args
+        .first()
+        .ok_or_else(|| anyhow!("Usage: bon-login type <short_id|name> <text...>"))?;
+    let text = args.get(1..).unwrap_or(&[]).join(" ");
+    if text.is_empty() {
+        bail!("Usage: bon-login type <short_id|name> <text...>");
+    }
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let p = find_profile_by_query(&profiles, target)?;
+    let rt = probe_live_runtime(&p.id)
+        .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
+    let typed = cdp_type_as_human(rt.cdp_port, &text)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "short_id": p.short_id(),
+            "typed_chars": typed,
+        }))?
+    );
+    Ok(())
+}
+
+pub fn handle_control_http_request(
+    method: &str,
+    path: &str,
+    body: &str,
+    tokio_handle: &tokio::runtime::Handle,
+) -> (u16, String) {
+    let db = match crate::db::Database::open_default() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                500,
+                serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+            );
+        }
+    };
+    let clean_path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    match (method, clean_path) {
+        ("GET", "" | "/health" | "/status") => (
+            200,
+            serde_json::json!({"ok": true, "service": "bon-login"}).to_string(),
+        ),
+        ("GET", "/profiles") => match db.list_profiles() {
+            Ok(list) => {
+                let items: Vec<serde_json::Value> = list.iter().map(profile_summary_json).collect();
+                (
+                    200,
+                    serde_json::json!({"ok": true, "profiles": items}).to_string(),
+                )
+            }
+            Err(e) => (
+                500,
+                serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+            ),
+        },
+        ("POST", "/arrange") => {
+            let (w, h) = parse_window_size(body).unwrap_or((960, 600));
+            let profiles = db.list_profiles().unwrap_or_default();
+            let running: Vec<RuntimeInfo> = profiles
+                .into_iter()
+                .filter_map(|p| probe_live_runtime(&p.id))
+                .collect();
+            let bounds = compute_tile_bounds(0, 0, 1920, 1080, w, h, running.len());
+            let mut arranged = 0usize;
+            for (rt, (l, t, bw, bh)) in running.iter().zip(bounds.iter()) {
+                if cdp_set_window_bounds(rt.cdp_port, &rt.ws_url, *l, *t, *bw, *bh).is_ok() {
+                    arranged += 1;
+                }
+            }
+            (
+                200,
+                serde_json::json!({"ok": true, "arranged": arranged, "total": running.len()})
+                    .to_string(),
+            )
+        }
+        ("POST", p_path) if p_path.starts_with("/profiles/") => {
+            let rest = &p_path["/profiles/".len()..];
+            let Some((target, action)) = rest.rsplit_once('/') else {
+                return (
+                    404,
+                    serde_json::json!({"ok": false, "error": "Expected /profiles/<id>/<action>"})
+                        .to_string(),
+                );
+            };
+            let target_decoded = target.replace("%20", " ");
+            let profiles = db.list_profiles().unwrap_or_default();
+            let profile = match find_profile_by_query(&profiles, &target_decoded) {
+                Ok(p) => p.clone(),
+                Err(e) => {
+                    return (
+                        404,
+                        serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                    );
+                }
+            };
+            match action {
+                "launch" | "start" => match ensure_profile_launched_via_supervisor(&db, &profile) {
+                    Ok(info) => (
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "id": profile.id,
+                            "short_id": profile.short_id(),
+                            "pid": info.pid,
+                            "cdp_port": info.cdp_port,
+                            "ws_url": info.ws_url,
+                        })
+                        .to_string(),
+                    ),
+                    Err(e) => (
+                        500,
+                        serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                    ),
+                },
+                "stop" | "close" => {
+                    let stopped = stop_external_runtime(&profile.id, &profile.short_id());
+                    (
+                        200,
+                        serde_json::json!({"ok": true, "short_id": profile.short_id(), "stopped": stopped})
+                            .to_string(),
+                    )
+                }
+                "clean-cache" => match clean_profile_cache(&profile.id) {
+                    Ok((freed, rem)) => (
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "short_id": profile.short_id(),
+                            "freed_bytes": freed,
+                            "remaining_bytes": rem,
+                        })
+                        .to_string(),
+                    ),
+                    Err(e) => (
+                        500,
+                        serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                    ),
+                },
+                "rotate-proxy" => {
+                    let Some(cfg) = &profile.proxy else {
+                        return (
+                            400,
+                            serde_json::json!({"ok": false, "error": "No proxy configured"})
+                                .to_string(),
+                        );
+                    };
+                    let cfg_cl = cfg.clone();
+                    let h_cl = tokio_handle.clone();
+                    let rot_res = std::thread::spawn(move || {
+                        h_cl.block_on(rotate_and_check_proxy_live(&cfg_cl))
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow!("Proxy rotation thread panicked")));
+                    match rot_res {
+                        Ok((rot, geo)) => {
+                            let _ = db.sync_geo_for_proxy_endpoint(cfg, &geo);
+                            (
+                                200,
+                                serde_json::json!({"ok": true, "rotation": rot, "geo": geo})
+                                    .to_string(),
+                            )
+                        }
+                        Err(e) => (
+                            502,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        ),
+                    }
+                }
+                "type" => {
+                    let Some(rt) = probe_live_runtime(&profile.id) else {
+                        return (
+                            409,
+                            serde_json::json!({"ok": false, "error": "Profile is not running"})
+                                .to_string(),
+                        );
+                    };
+                    match cdp_type_as_human(rt.cdp_port, body) {
+                        Ok(n) => (
+                            200,
+                            serde_json::json!({"ok": true, "typed_chars": n}).to_string(),
+                        ),
+                        Err(e) => (
+                            500,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        ),
+                    }
+                }
+                _ => (
+                    404,
+                    serde_json::json!({"ok": false, "error": "Unknown profile action"}).to_string(),
+                ),
+            }
+        }
+        _ => (
+            404,
+            serde_json::json!({"ok": false, "error": "Not found"}).to_string(),
+        ),
+    }
+}
+
+async fn run_serve_cli(args: &[String]) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let port: u16 = args
+        .windows(2)
+        .find_map(|w| (w[0] == "--port" || w[0] == "-p").then(|| w[1].parse().ok()).flatten())
+        .unwrap_or(19820);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("Failed to bind 127.0.0.1:{port}"))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "listening": format!("http://127.0.0.1:{port}"),
+            "endpoints": [
+                "GET /health",
+                "GET /profiles",
+                "POST /profiles/:id/launch",
+                "POST /profiles/:id/stop",
+                "POST /profiles/:id/rotate-proxy",
+                "POST /profiles/:id/clean-cache",
+                "POST /profiles/:id/type",
+                "POST /arrange"
+            ]
+        })
+    );
+    let handle = tokio::runtime::Handle::current();
+    loop {
+        let (mut sock, _) = listener.accept().await?;
+        let h = handle.clone();
+        tokio::spawn(async move {
+            let mut raw_buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            while raw_buf.len() < 65536 {
+                let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(5), sock.read(&mut chunk)).await
+                else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                raw_buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = raw_buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let end = pos + 4;
+                    header_end = Some(end);
+                    let hdr_s = String::from_utf8_lossy(&raw_buf[..end]);
+                    for line in hdr_s.lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(end) = header_end
+                    && raw_buf.len() >= end.saturating_add(content_len)
+                {
+                    break;
+                }
+            }
+            let Some(end) = header_end else {
+                return;
+            };
+            let hdr_part = String::from_utf8_lossy(&raw_buf[..end]).to_string();
+            // Reject browser-initiated cross-origin requests (CSRF / DNS rebinding defense)
+            if hdr_part.lines().any(|l| {
+                l.split_once(':').is_some_and(|(k, v)| {
+                    let k = k.trim();
+                    let v = v.trim().to_ascii_lowercase();
+                    k.eq_ignore_ascii_case("origin")
+                        || k.eq_ignore_ascii_case("sec-fetch-site")
+                        || (k.eq_ignore_ascii_case("host")
+                            && !v.starts_with("127.0.0.1")
+                            && !v.starts_with("localhost"))
+                })
+            }) {
+                let forbidden = "{\"ok\":false,\"error\":\"Browser cross-origin requests forbidden\"}";
+                let resp = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{forbidden}",
+                    forbidden.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                return;
+            }
+            let body_end = end.saturating_add(content_len).min(raw_buf.len());
+            let body = String::from_utf8_lossy(&raw_buf[end..body_end]).to_string();
+            let mut first_line = hdr_part.lines().next().unwrap_or("").split_whitespace();
+            let method = first_line.next().unwrap_or("GET").to_string();
+            let path = first_line.next().unwrap_or("/").to_string();
+            let Ok((status, resp_body)) = tokio::task::spawn_blocking(move || {
+                handle_control_http_request(&method, &path, &body, &h)
+            })
+            .await
+            else {
+                return;
+            };
+            let status_text = match status {
+                200 => "OK",
+                400 => "Bad Request",
+                404 => "Not Found",
+                409 => "Conflict",
+                502 => "Bad Gateway",
+                _ => "Internal Server Error",
+            };
+            let http_resp = format!(
+                "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            let _ = sock.write_all(http_resp.as_bytes()).await;
+        });
     }
 }
 
@@ -7540,6 +8243,7 @@ mod tests {
                 port: 1080,
                 username: Some("u".to_string()),
                 password: Some("pw".to_string()),
+                change_ip_url: None,
             },
         );
         let flags: Vec<String> = [
@@ -7954,5 +8658,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bundle.cookies[0]["domain"], "shop.example.com");
+        // Verify clean_profile_cache removes Cache/GPUCache while keeping Cookies intact
+        let cache_test_id = format!("bon_cache_test_{}", rand::random::<u32>());
+        let p_dir = app_support_dir().join("profiles").join(&cache_test_id);
+        let def_dir = p_dir.join("Default");
+        std::fs::create_dir_all(def_dir.join("Cache")).unwrap();
+        std::fs::create_dir_all(p_dir.join("GPUCache")).unwrap();
+        std::fs::write(def_dir.join("Cache/data_0"), vec![0u8; 4096]).unwrap();
+        std::fs::write(p_dir.join("GPUCache/shader_0"), vec![0u8; 2048]).unwrap();
+        std::fs::write(def_dir.join("Cookies"), b"SQLite format 3\0keep").unwrap();
+        let (freed, rem) = clean_profile_cache(&cache_test_id).unwrap();
+        assert_eq!(freed, 6144);
+        assert_eq!(rem, 20);
+        assert!(def_dir.join("Cookies").is_file());
+        assert!(!def_dir.join("Cache").exists());
+        let _ = wipe_profile_data(&cache_test_id);
+
+        // Verify cdp_type_as_human sends Input.dispatchKeyEvent frames without Runtime.enable
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s1, _) = listener.accept().unwrap();
+            let mut b1 = [0u8; 512];
+            let _ = s1.read(&mut b1);
+            let body = format!(
+                r#"[{{"id":"t1","type":"page","url":"https://x.com","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/t1"}}]"#
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s1.write_all(resp.as_bytes()).unwrap();
+
+            let (mut s2, _) = listener.accept().unwrap();
+            let mut b2 = [0u8; 1024];
+            let _ = s2.read(&mut b2);
+            s2.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            for req_id in 1..=4 {
+                let mut h = [0u8; 2];
+                s2.read_exact(&mut h).unwrap();
+                let len = (h[1] & 0x7f) as usize;
+                let len = if len == 126 {
+                    let mut ext = [0u8; 2];
+                    s2.read_exact(&mut ext).unwrap();
+                    u16::from_be_bytes(ext) as usize
+                } else {
+                    len
+                };
+                let mut discard = vec![0u8; 4 + len];
+                s2.read_exact(&mut discard).unwrap();
+                let reply = format!(r#"{{"id":{req_id},"result":{{}}}}"#);
+                let mut frame = vec![0x81, reply.len() as u8];
+                frame.extend_from_slice(reply.as_bytes());
+                s2.write_all(&frame).unwrap();
+            }
+        });
+        let typed = cdp_type_as_human(port, "A\n").unwrap();
+        assert_eq!(typed, 2);
+        server.join().unwrap();
+
+        // Verify local HTTP control handler inside spawn_blocking (including %20 decoding)
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let h = rt.handle().clone();
+        let (code, body_s) = rt
+            .block_on(rt.spawn_blocking(move || {
+                handle_control_http_request("GET", "/health", "", &h)
+            }))
+            .unwrap();
+        assert_eq!(code, 200);
+        assert!(body_s.contains("\"bon-login\""));
+        let h2 = rt.handle().clone();
+        let (code404, _) = rt
+            .block_on(rt.spawn_blocking(move || {
+                handle_control_http_request(
+                    "POST",
+                    "/profiles/NonExistent%20Profile/rotate-proxy",
+                    "",
+                    &h2,
+                )
+            }))
+            .unwrap();
+        assert_eq!(code404, 404);
     }
 }

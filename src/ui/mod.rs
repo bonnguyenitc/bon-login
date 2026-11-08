@@ -20,7 +20,9 @@ use crate::models::{
     BrowserBrand, BrowserExtension, PlatformType, Profile, ProfileStatus, ProxyConfig,
     ProxyProtocol, SavedProxy,
 };
-use crate::ui::profile_list::{ColumnVisibility, render_profile_table, render_trash_table};
+use crate::ui::profile_list::{
+    ColumnVisibility, ProfileSortColumn, render_profile_table, render_trash_table,
+};
 use crate::ui::profile_modal::{
     ProfileModalState, ProxyEditMode, render_edit_profile_view, render_extensions_view,
     render_groups_subtab_view, render_popup_modal, render_proxies_view,
@@ -108,6 +110,8 @@ pub struct BonLoginApp {
     pub selected_profile_id: Option<String>,
     pub checked_profile_ids: HashSet<String>,
     pub col_vis: ColumnVisibility,
+    pub sort_col: Option<ProfileSortColumn>,
+    pub sort_asc: bool,
     pub profile_sub_tab: ProfileSubTab,
     pub popup_modal: Option<ActivePopupModal>,
     pub show_detail_drawer: bool,
@@ -360,6 +364,8 @@ impl BonLoginApp {
             selected_profile_id,
             checked_profile_ids: HashSet::new(),
             col_vis: ColumnVisibility::default(),
+            sort_col: None,
+            sort_asc: true,
             profile_sub_tab: ProfileSubTab::Local,
             popup_modal: None,
             show_detail_drawer: true,
@@ -670,6 +676,14 @@ impl BonLoginApp {
     }
 
     pub fn check_saved_proxy(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
+        self.run_saved_proxy_action(proxy_id, false, cx);
+    }
+
+    pub fn rotate_saved_proxy_ip(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
+        self.run_saved_proxy_action(proxy_id, true, cx);
+    }
+
+    fn run_saved_proxy_action(&mut self, proxy_id: &str, rotate: bool, cx: &mut Context<Self>) {
         let Some(sp) = self.saved_proxies.iter().find(|p| p.id == proxy_id).cloned() else {
             return;
         };
@@ -681,14 +695,25 @@ impl BonLoginApp {
             prev.abort();
         }
         self.checking_proxy_ids.insert(pid.clone());
-        self.banner_message = Some(format!("Checking proxy '{proxy_name}' ({})...", cfg.display_short()));
+        self.banner_message = Some(if rotate {
+            format!("Rotating IP for '{proxy_name}'...")
+        } else {
+            format!("Checking proxy '{proxy_name}' ({})...", cfg.display_short())
+        });
         cx.notify();
 
         let tokio_handle = self.tokio_handle.clone();
         let db = self.db.clone();
-
         let join_handle = tokio_handle.spawn(async move {
-            crate::launcher::check_proxy_config_live(&cfg).await
+            if rotate {
+                crate::launcher::rotate_and_check_proxy_live(&cfg)
+                    .await
+                    .map(|(m, g)| (Some(m), g))
+            } else {
+                crate::launcher::check_proxy_config_live(&cfg)
+                    .await
+                    .map(|g| (None, g))
+            }
         });
         let abort_handle = join_handle.abort_handle();
         let task_id = abort_handle.id();
@@ -714,17 +739,24 @@ impl BonLoginApp {
                     return;
                 }
                 match res {
-                    Ok(geo) => {
+                    Ok((rot_opt, geo)) => {
                         if let Ok(db_guard) = db.lock() {
                             let _ = db_guard.sync_geo_for_proxy_endpoint(&cfg_for_profiles, &geo);
                         }
                         app.reload_profiles();
-                        app.banner_message =
-                            Some(format!("Proxy '{proxy_name}' OK: {}", geo.summary_badge()));
+                        app.banner_message = Some(match rot_opt {
+                            Some(rot) => format!(
+                                "Rotated '{proxy_name}' ({rot}) -> {}",
+                                geo.summary_badge()
+                            ),
+                            None => format!("Proxy '{proxy_name}' OK: {}", geo.summary_badge()),
+                        });
                     }
                     Err(e) => {
                         let err_s = e.to_string();
-                        if let Ok(db_guard) = db.lock() {
+                        if !rotate
+                            && let Ok(db_guard) = db.lock()
+                        {
                             let _ = db_guard.update_saved_proxy_check(&pid, None, Some(&err_s));
                         }
                         app.reload_profiles();
@@ -1576,13 +1608,90 @@ impl BonLoginApp {
         }
     }
 
+    pub fn toggle_profile_sort(&mut self, col: ProfileSortColumn, cx: &mut Context<Self>) {
+        if self.sort_col == Some(col) {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_col = Some(col);
+            self.sort_asc = !matches!(col, ProfileSortColumn::Updated | ProfileSortColumn::Status);
+        }
+        cx.notify();
+    }
+
     pub fn filtered_profiles(&self) -> Vec<Profile> {
         let group_opt = (self.selected_group != "All").then_some(self.selected_group.as_str());
-        self.profiles
+        let mut out: Vec<Profile> = self
+            .profiles
             .iter()
             .filter(|p| p.matches_filter(&self.search_query, group_opt))
             .cloned()
-            .collect()
+            .collect();
+        if let Some(col) = self.sort_col {
+            let asc = self.sort_asc;
+            let status_rank = |id: &str| -> u8 {
+                match self.statuses.get(id) {
+                    Some(ProfileStatus::Running(_)) => 3,
+                    Some(ProfileStatus::Starting(_)) => 2,
+                    Some(ProfileStatus::Error(_)) => 1,
+                    _ => 0,
+                }
+            };
+            let cmp_ci = |s1: &str, s2: &str| {
+                s1.bytes()
+                    .map(|b| b.to_ascii_lowercase())
+                    .cmp(s2.bytes().map(|b| b.to_ascii_lowercase()))
+            };
+            out.sort_by(|a, b| {
+                let empty_ord = match col {
+                    ProfileSortColumn::Tags => {
+                        let a_empty = a.tags.is_empty() && a.group_tag.trim().is_empty();
+                        let b_empty = b.tags.is_empty() && b.group_tag.trim().is_empty();
+                        a_empty.cmp(&b_empty)
+                    }
+                    ProfileSortColumn::Notes => {
+                        a.notes.trim().is_empty().cmp(&b.notes.trim().is_empty())
+                    }
+                    ProfileSortColumn::Proxy => a.proxy.is_none().cmp(&b.proxy.is_none()),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                if empty_ord != std::cmp::Ordering::Equal {
+                    return empty_ord;
+                }
+                let ord = match col {
+                    ProfileSortColumn::Id => cmp_ci(&a.id, &b.id),
+                    ProfileSortColumn::Name => cmp_ci(&a.name, &b.name),
+                    ProfileSortColumn::Tags => {
+                        let a_lbl = a
+                            .tags
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(a.group_tag.trim());
+                        let b_lbl = b
+                            .tags
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or(b.group_tag.trim());
+                        cmp_ci(a_lbl, b_lbl)
+                    }
+                    ProfileSortColumn::Notes => cmp_ci(a.notes.trim(), b.notes.trim()),
+                    ProfileSortColumn::Proxy => match (&a.proxy, &b.proxy) {
+                        (Some(pa), Some(pb)) => {
+                            cmp_ci(&pa.host, &pb.host).then_with(|| pa.port.cmp(&pb.port))
+                        }
+                        _ => std::cmp::Ordering::Equal,
+                    },
+                    ProfileSortColumn::Updated => a
+                        .last_launched_at
+                        .unwrap_or(0)
+                        .cmp(&b.last_launched_at.unwrap_or(0))
+                        .then_with(|| a.created_at.cmp(&b.created_at)),
+                    ProfileSortColumn::Status => status_rank(&a.id).cmp(&status_rank(&b.id)),
+                };
+                let final_ord = if asc { ord } else { ord.reverse() };
+                final_ord.then_with(|| b.created_at.cmp(&a.created_at))
+            });
+        }
+        out
     }
 
     pub fn distinct_groups_with_counts(&self) -> Vec<(String, usize)> {
@@ -2193,6 +2302,76 @@ impl BonLoginApp {
                         app.banner_message = Some(format!("Backup export failed: {e}"));
                     }
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn clean_single_profile_cache(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        if matches!(
+            self.statuses.get(&prof.id),
+            Some(ProfileStatus::Running(_) | ProfileStatus::Starting(_))
+        ) {
+            self.banner_message =
+                Some("Stop the browser before cleaning profile disk cache".to_string());
+            cx.notify();
+            return;
+        }
+        let pid = prof.id.clone();
+        let name = prof.name.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || crate::launcher::clean_profile_cache(&pid))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                app.banner_message = Some(match res {
+                    Ok((freed, rem)) => format!(
+                        "Cleaned '{name}': freed {} (remaining {})",
+                        crate::launcher::format_bytes(freed),
+                        crate::launcher::format_bytes(rem)
+                    ),
+                    Err(e) => format!("Clean cache failed: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn type_clipboard_as_human(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.banner_message = Some("Clipboard is empty".to_string());
+            cx.notify();
+            return;
+        };
+        if clip.is_empty() {
+            self.banner_message = Some("Clipboard text is empty".to_string());
+            cx.notify();
+            return;
+        }
+        let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() else {
+            self.banner_message = Some("Start the profile first to human-type clipboard".to_string());
+            cx.notify();
+            return;
+        };
+        let cdp_port = info.cdp_port;
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || crate::launcher::cdp_type_as_human(cdp_port, &clip))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                app.banner_message = Some(match res {
+                    Ok(n) => format!("Human-typed {n} character(s) from clipboard"),
+                    Err(e) => format!("Human-type failed: {e}"),
+                });
                 cx.notify();
             });
         })
@@ -2966,10 +3145,29 @@ impl BonLoginApp {
     }
 
     pub fn check_profile_proxy(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        self.run_profile_proxy_action(profile_id, false, cx);
+    }
+
+    pub fn rotate_profile_proxy_ip(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        self.run_profile_proxy_action(profile_id, true, cx);
+    }
+
+    fn run_profile_proxy_action(
+        &mut self,
+        profile_id: &str,
+        rotate: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
             return;
         };
+        if rotate && profile.proxy.is_none() {
+            self.banner_message = Some("Profile has no proxy configured".to_string());
+            cx.notify();
+            return;
+        }
         let pid = profile.id.clone();
+        let prof_name = profile.name.clone();
         let was_running = matches!(self.statuses.get(&pid), Some(ProfileStatus::Running(_)));
         if !was_running {
             if let Some(prev) = self.profile_tasks.remove(&pid) {
@@ -2977,10 +3175,21 @@ impl BonLoginApp {
             }
             self.statuses.insert(
                 pid.clone(),
-                ProfileStatus::Starting("Checking proxy...".to_string()),
+                ProfileStatus::Starting(
+                    if rotate {
+                        "Rotating proxy..."
+                    } else {
+                        "Checking proxy..."
+                    }
+                    .to_string(),
+                ),
             );
         }
-        self.banner_message = Some(format!("Checking proxy for '{}'...", profile.name));
+        self.banner_message = Some(if rotate {
+            format!("Rotating proxy IP for '{prof_name}'...")
+        } else {
+            format!("Checking proxy for '{prof_name}'...")
+        });
         cx.notify();
 
         let tokio_handle = self.tokio_handle.clone();
@@ -2989,9 +3198,19 @@ impl BonLoginApp {
 
         let join_handle = tokio_handle.spawn(async move {
             if let Some(proxy_cfg) = profile.proxy {
-                crate::launcher::check_proxy_config_live(&proxy_cfg).await
+                if rotate {
+                    crate::launcher::rotate_and_check_proxy_live(&proxy_cfg)
+                        .await
+                        .map(|(m, g)| (Some(m), g))
+                } else {
+                    crate::launcher::check_proxy_config_live(&proxy_cfg)
+                        .await
+                        .map(|g| (None, g))
+                }
             } else {
-                crate::geoip::resolve_geo_via_port(None).await
+                crate::geoip::resolve_geo_via_port(None)
+                    .await
+                    .map(|g| (None, g))
             }
         });
         let abort_handle = join_handle.abort_handle();
@@ -3021,19 +3240,24 @@ impl BonLoginApp {
                 let still_running =
                     matches!(app.statuses.get(&pid), Some(ProfileStatus::Running(_)));
                 match res {
-                    Ok(geo) => {
+                    Ok((rot_opt, geo)) => {
                         if let Ok(db_guard) = db.lock() {
                             if let Some(cfg) = &proxy_for_sync {
                                 let _ = db_guard.sync_geo_for_proxy_endpoint(cfg, &geo);
-                            } else {
-                                let _ = db_guard.update_resolved_geo(&pid, Some(&geo));
                             }
+                            let _ = db_guard.update_resolved_geo(&pid, Some(&geo));
                         }
                         app.reload_profiles();
                         if !still_running {
                             app.statuses.insert(pid.clone(), ProfileStatus::Stopped);
                         }
-                        app.banner_message = Some(format!("Proxy OK: {}", geo.summary_badge()));
+                        app.banner_message = Some(match rot_opt {
+                            Some(rot) => format!(
+                                "Rotated '{prof_name}' ({rot}) -> {}",
+                                geo.summary_badge()
+                            ),
+                            None => format!("Proxy OK: {}", geo.summary_badge()),
+                        });
                     }
                     Err(e) => {
                         let err_s = e.to_string();
@@ -3041,7 +3265,7 @@ impl BonLoginApp {
                             app.statuses
                                 .insert(pid.clone(), ProfileStatus::Error(err_s.clone()));
                         }
-                        app.banner_message = Some(format!("Proxy check failed: {err_s}"));
+                        app.banner_message = Some(format!("Proxy failed: {err_s}"));
                     }
                 }
                 cx.notify();
@@ -3369,11 +3593,6 @@ impl Render for BonLoginApp {
                                     .cursor_pointer()
                                     .justify_between()
                                     .items_center()
-                                    .bg(if is_creating_profile {
-                                        BonTheme::accent()
-                                    } else {
-                                        BonTheme::bg_elevated()
-                                    })
                                     .border_1()
                                     .border_color(if is_creating_profile {
                                         BonTheme::accent()
@@ -3644,8 +3863,7 @@ impl Render for BonLoginApp {
                                 render_groups_subtab_view(self, cx)
                                     .with_animation(
                                         "subtab-groups-enter",
-                                        Animation::new(Duration::from_millis(140))
-                                            .with_easing(ease_out_quint()),
+                                        BonTheme::ui_enter_anim(),
                                         |this, delta| this.opacity(delta),
                                     )
                                     .into_any_element()
@@ -3653,8 +3871,7 @@ impl Render for BonLoginApp {
                                 render_trash_table(&self.trashed_profiles, cx)
                                     .with_animation(
                                         "subtab-trash-enter",
-                                        Animation::new(Duration::from_millis(140))
-                                            .with_easing(ease_out_quint()),
+                                        BonTheme::ui_enter_anim(),
                                         |this, delta| this.opacity(delta),
                                     )
                                     .into_any_element()
@@ -4028,8 +4245,7 @@ impl Render for BonLoginApp {
                                             )
                                             .with_animation(
                                                 "batch-action-bar-enter",
-                                                Animation::new(Duration::from_millis(140))
-                                                    .with_easing(ease_out_quint()),
+                                                BonTheme::ui_enter_anim(),
                                                 |this, delta| this.opacity(delta),
                                             )
                                     }))
@@ -4040,29 +4256,23 @@ impl Render for BonLoginApp {
                                         selected_id.as_deref(),
                                         &self.checked_profile_ids,
                                         self.col_vis,
+                                        self.sort_col,
+                                        self.sort_asc,
                                         show_drawer,
                                         cx,
                                     ))
                                     .with_animation(
                                         "subtab-local-enter",
-                                        Animation::new(Duration::from_millis(160))
-                                            .with_easing(ease_out_quint()),
+                                        BonTheme::ui_enter_anim(),
                                         |this, delta| this.opacity(delta),
                                     )
                                     .into_any_element()
                             })
-                            .with_animation(
-                                "view-profiles-enter",
-                                Animation::new(Duration::from_millis(140))
-                                    .with_easing(ease_out_quint()),
-                                |this, delta| this.opacity(delta),
-                            )
                             .into_any_element(),
                         WorkspaceView::Proxies => render_proxies_view(self, cx)
                             .with_animation(
                                 "view-proxies-enter",
-                                Animation::new(Duration::from_millis(140))
-                                    .with_easing(ease_out_quint()),
+                                BonTheme::ui_enter_anim(),
                                 |this, delta| this.opacity(delta),
                             )
                             .into_any_element(),
@@ -4077,8 +4287,7 @@ impl Render for BonLoginApp {
                                 )
                                 .with_animation(
                                     "view-edit-profile-enter",
-                                    Animation::new(Duration::from_millis(140))
-                                        .with_easing(ease_out_quint()),
+                                    BonTheme::ui_enter_anim(),
                                     |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element()
@@ -4089,8 +4298,7 @@ impl Render for BonLoginApp {
                         WorkspaceView::Extensions => render_extensions_view(self, cx)
                             .with_animation(
                                 "view-extensions-enter",
-                                Animation::new(Duration::from_millis(140))
-                                    .with_easing(ease_out_quint()),
+                                BonTheme::ui_enter_anim(),
                                 |this, delta| this.opacity(delta),
                             )
                             .into_any_element(),
@@ -4197,11 +4405,6 @@ fn genlogin_subtab_item(
         .items_center()
         .cursor_pointer()
         .rounded_md()
-        .bg(if active {
-            BonTheme::accent()
-        } else {
-            rgba(0x00000000).into()
-        })
         .hover(|s| {
             if active {
                 s.bg(rgb(0x2997ff))
@@ -4270,11 +4473,6 @@ fn sidebar_nav_item(
         .py_1p5()
         .rounded_lg()
         .cursor_pointer()
-        .bg(if active {
-            BonTheme::accent()
-        } else {
-            Hsla::from(rgba(0x00000000))
-        })
         .hover(|s| {
             if active {
                 s.bg(rgb(0x2997ff))

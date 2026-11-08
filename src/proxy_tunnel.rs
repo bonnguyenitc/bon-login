@@ -561,6 +561,7 @@ mod tests {
             port: mock_port,
             username: Some("bonuser".to_string()),
             password: Some("bonpass".to_string()),
+            change_ip_url: None,
         })
         .await
         .unwrap();

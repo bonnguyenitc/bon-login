@@ -9,6 +9,16 @@ use crate::models::{Profile, ProfileStatus};
 use crate::ui::profile_modal::detail_summary_row as drawer_row;
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSortColumn {
+    Id,
+    Name,
+    Tags,
+    Notes,
+    Proxy,
+    Updated,
+    Status,
+}
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnVisibility {
     pub show_id: bool,
@@ -40,6 +50,8 @@ pub fn render_profile_table(
     selected_profile_id: Option<&str>,
     checked_profile_ids: &std::collections::HashSet<String>,
     cols: ColumnVisibility,
+    sort_col: Option<ProfileSortColumn>,
+    sort_asc: bool,
     show_detail_drawer: bool,
     cx: &mut Context<BonLoginApp>,
 ) -> impl IntoElement {
@@ -57,7 +69,6 @@ pub fn render_profile_table(
     let selected_profile = selected_profile_id
         .and_then(|id| profiles.iter().find(|p| p.id == id))
         .cloned();
-
     h_flex()
         .w_full()
         .flex_1()
@@ -138,58 +149,74 @@ pub fn render_profile_table(
                                         ),
                                 )
                                 .children(cols.show_id.then(|| {
-                                    h_flex()
-                                        .w(px(68.))
-                                        .flex_shrink_0()
-                                        .justify_between()
-                                        .items_center()
-                                        .pr_1()
-                                        .child("ID")
-                                        .child(
-                                            div()
-                                                .text_color(BonTheme::accent())
-                                                .child(SfSymbol::ARROW_DOWN),
-                                        )
+                                    sortable_col_header(
+                                        "ID",
+                                        68.,
+                                        ProfileSortColumn::Id,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .children(cols.show_name.then(|| {
-                                    h_flex()
-                                        .w(px(128.))
-                                        .flex_shrink_0()
-                                        .justify_between()
-                                        .items_center()
-                                        .pr_1()
-                                        .child("Name")
-                                        .child(
-                                            div()
-                                                .text_color(BonTheme::accent())
-                                                .child(SfSymbol::ARROW_DOWN),
-                                        )
+                                    sortable_col_header(
+                                        "Name",
+                                        128.,
+                                        ProfileSortColumn::Name,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .children(cols.show_tags.then(|| {
-                                    div().w(px(76.)).flex_shrink_0().child("Tags")
+                                    sortable_col_header(
+                                        "Tags",
+                                        76.,
+                                        ProfileSortColumn::Tags,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .children(cols.show_notes.then(|| {
-                                    div().w(px(78.)).flex_shrink_0().child("Note")
+                                    sortable_col_header(
+                                        "Note",
+                                        78.,
+                                        ProfileSortColumn::Notes,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .children(cols.show_proxy.then(|| {
-                                    div().w(px(96.)).flex_shrink_0().child("Proxy")
+                                    sortable_col_header(
+                                        "Proxy",
+                                        96.,
+                                        ProfileSortColumn::Proxy,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .children(cols.show_updated.then(|| {
-                                    h_flex()
-                                        .w(px(84.))
-                                        .flex_shrink_0()
-                                        .justify_between()
-                                        .items_center()
-                                        .pr_1()
-                                        .child("Updated")
-                                        .child(
-                                            div()
-                                                .text_color(BonTheme::accent())
-                                                .child(SfSymbol::ARROW_DOWN),
-                                        )
+                                    sortable_col_header(
+                                        "Updated",
+                                        84.,
+                                        ProfileSortColumn::Updated,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .children(cols.show_status.then(|| {
-                                    div().w(px(64.)).flex_shrink_0().child("Status")
+                                    sortable_col_header(
+                                        "Status",
+                                        64.,
+                                        ProfileSortColumn::Status,
+                                        sort_col,
+                                        sort_asc,
+                                        cx,
+                                    )
                                 }))
                                 .child(
                                     h_flex()
@@ -291,8 +318,7 @@ pub fn render_profile_table(
                     .clone()
                     .or_else(|| prof.resolved_geo.as_ref().map(|g| g.timezone.clone()))
                     .unwrap_or_else(|| "Auto (Based on IP)".to_string());
-                let content_anim_id =
-                    SharedString::from(format!("detail-content-{}-{}", prof.id, prof.seed));
+                let content_anim_id = SharedString::from(format!("detail-seed-{}", prof.seed));
                 v_flex()
                     .w(px(285.))
                     .h_full()
@@ -489,17 +515,65 @@ pub fn render_profile_table(
                             )
                             .with_animation(
                                 content_anim_id,
-                                Animation::new(Duration::from_millis(120))
-                                    .with_easing(ease_out_quint()),
+                                BonTheme::ui_enter_anim(),
                                 |this, delta| this.opacity(delta),
                             )
                     })
                     .with_animation(
                         "detail-drawer-panel",
-                        Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint()),
+                        BonTheme::ui_enter_anim(),
                         |this, delta| this.opacity(delta),
                     )
             }),
+        )
+}
+
+fn sortable_col_header(
+    label: &'static str,
+    width: f32,
+    col: ProfileSortColumn,
+    active_col: Option<ProfileSortColumn>,
+    sort_asc: bool,
+    cx: &mut Context<BonLoginApp>,
+) -> Div {
+    let is_active = active_col == Some(col);
+    let arrow = if is_active {
+        if sort_asc {
+            SfSymbol::ARROW_UP
+        } else {
+            SfSymbol::ARROW_DOWN
+        }
+    } else {
+        SfSymbol::ARROW_DOWN
+    };
+    h_flex()
+        .w(px(width))
+        .flex_shrink_0()
+        .justify_between()
+        .items_center()
+        .pr_1()
+        .cursor_pointer()
+        .text_color(if is_active {
+            BonTheme::text_primary()
+        } else {
+            BonTheme::text_secondary()
+        })
+        .hover(|s| s.text_color(BonTheme::text_primary()))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, cx| {
+                app.toggle_profile_sort(col, cx);
+            }),
+        )
+        .child(label)
+        .child(
+            div()
+                .text_color(if is_active {
+                    BonTheme::accent()
+                } else {
+                    BonTheme::text_muted()
+                })
+                .child(arrow),
         )
 }
 
@@ -508,6 +582,8 @@ fn build_profile_popup_menu(
     app_entity: Entity<BonLoginApp>,
     profile_id: String,
     has_totp: bool,
+    has_rotate_url: bool,
+    is_running: bool,
     is_busy: bool,
 ) -> PopupMenu {
     let app_edit = app_entity.clone();
@@ -516,6 +592,10 @@ fn build_profile_popup_menu(
     let pid_meta = profile_id.clone();
     let app_totp = app_entity.clone();
     let pid_totp = profile_id.clone();
+    let app_type = app_entity.clone();
+    let pid_type = profile_id.clone();
+    let app_rot = app_entity.clone();
+    let pid_rot = profile_id.clone();
     let app_robot = app_entity.clone();
     let pid_robot = profile_id.clone();
     let app_import_cookies = app_entity.clone();
@@ -524,6 +604,8 @@ fn build_profile_popup_menu(
     let pid_cookies = profile_id.clone();
     let app_zip = app_entity.clone();
     let pid_zip = profile_id.clone();
+    let app_clean = app_entity.clone();
+    let pid_clean = profile_id.clone();
     let app_clone = app_entity.clone();
     let pid_clone = profile_id.clone();
     let app_proxy = app_entity.clone();
@@ -532,7 +614,6 @@ fn build_profile_popup_menu(
     let pid_agent = profile_id.clone();
     let app_del = app_entity;
     let pid_del = profile_id;
-
     let mut menu = menu
         .min_w(px(195.))
         .item(
@@ -557,6 +638,24 @@ fn build_profile_popup_menu(
             PopupMenuItem::new("🔐   Copy 2FA Code").on_click(move |_, _, cx| {
                 app_totp.update(cx, |app, cx| {
                     app.copy_profile_totp(&pid_totp, cx);
+                });
+            }),
+        );
+    }
+    if is_running {
+        menu = menu.item(
+            PopupMenuItem::new("⌨️   Human-Type Clipboard").on_click(move |_, _, cx| {
+                app_type.update(cx, |app, cx| {
+                    app.type_clipboard_as_human(&pid_type, cx);
+                });
+            }),
+        );
+    }
+    if has_rotate_url {
+        menu = menu.item(
+            PopupMenuItem::new("🔄   Rotate Proxy IP").on_click(move |_, _, cx| {
+                app_rot.update(cx, |app, cx| {
+                    app.rotate_profile_proxy_ip(&pid_rot, cx);
                 });
             }),
         );
@@ -602,6 +701,15 @@ fn build_profile_popup_menu(
             .on_click(move |_, _, cx| {
                 app_zip.update(cx, |app, cx| {
                     app.export_single_profile_zip(&pid_zip, cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new("🧹   Clean Disk Cache")
+            .disabled(is_busy)
+            .on_click(move |_, _, cx| {
+                app_clean.update(cx, |app, cx| {
+                    app.clean_single_profile_cache(&pid_clean, cx);
                 });
             }),
     )
@@ -1004,7 +1112,7 @@ fn render_profile_row(
                         )
                         .child(state_title);
                     div().w(px(64.)).flex_shrink_0().child(
-                        h_flex().child(if is_starting || is_running {
+                        h_flex().child(if is_starting {
                             badge
                                 .with_animation(
                                     SharedString::from(format!("prof-status-pulse-{profile_id}")),
@@ -1049,6 +1157,11 @@ fn render_profile_row(
                         })
                         .child({
                             let has_totp = !profile.totp_secret.trim().is_empty();
+                            let has_rotate_url = profile
+                                .proxy
+                                .as_ref()
+                                .and_then(|p| p.change_ip_url.as_ref())
+                                .is_some();
                             Button::new(SharedString::from(format!("row-dots-{profile_id}")))
                                 .ghost()
                                 .small()
@@ -1061,6 +1174,8 @@ fn render_profile_row(
                                             app_for_dots.clone(),
                                             pid_for_dots.clone(),
                                             has_totp,
+                                            has_rotate_url,
+                                            is_running,
                                             is_busy,
                                         )
                                     },
@@ -1070,12 +1185,19 @@ fn render_profile_row(
         )
         .context_menu({
             let has_totp = !profile.totp_secret.trim().is_empty();
+            let has_rotate_url = profile
+                .proxy
+                .as_ref()
+                .and_then(|p| p.change_ip_url.as_ref())
+                .is_some();
             move |menu, _window, _cx| {
                 build_profile_popup_menu(
                     menu,
                     app_for_ctx.clone(),
                     pid_for_ctx.clone(),
                     has_totp,
+                    has_rotate_url,
+                    is_running,
                     is_busy,
                 )
             }

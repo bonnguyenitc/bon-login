@@ -1,5 +1,6 @@
 use gpui_kit::component::button::{ButtonCustomVariant, ButtonVariant};
-use gpui_kit::{App, Hsla, SpringConfig, rgb, rgba};
+use gpui_kit::{Animation, App, Hsla, SpringConfig, ease_out_quint, rgb, rgba};
+use std::time::Duration;
 
 /// macOS Sequoia / Sonoma Dark Mode Material & System Color Palette.
 pub struct BonTheme;
@@ -38,6 +39,11 @@ impl BonTheme {
     /// Critically-damped Apple spring (`damping = 1.0`, `response ≈ 0.3s`)
     pub const fn snappy_spring() -> SpringConfig {
         SpringConfig::new(420.0, 38.0, 1.0)
+    }
+
+    /// Crisp 140ms `ease_out_quint` entrance token for views, drawers, and modals
+    pub fn ui_enter_anim() -> Animation {
+        Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint())
     }
 
     /// macOS Recessed Segmented Control Track / Code Well (`#151517`)
@@ -215,6 +221,7 @@ impl SfSymbol {
     pub const GEARSHAPE_FILL: &'static str = "\u{1008cc}";
     pub const ARROW_CLOCKWISE: &'static str = "\u{100148}";
     pub const ARROW_TRIANGLE_2_CIRCLEPATH: &'static str = "\u{1002af}";
+    pub const ARROW_UP: &'static str = "\u{100127}";
     pub const ARROW_DOWN: &'static str = "\u{100128}";
     pub const ARROW_UP_DOC: &'static str = "\u{10023b}";
     pub const ARROW_DOWN_DOC: &'static str = "\u{10023d}";
