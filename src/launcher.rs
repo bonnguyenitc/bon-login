@@ -4460,6 +4460,21 @@ pub fn apply_profile_cli_flags(
                 profile.totp_secret = next_val()?.trim().to_string();
                 idx += 2;
             }
+            "--bookmarks" => {
+                let raw = next_val()?.trim();
+                let items = if raw.is_empty()
+                    || raw.eq_ignore_ascii_case("none")
+                    || raw.eq_ignore_ascii_case("clear")
+                {
+                    Vec::new()
+                } else {
+                    parse_bookmarks_editable(raw)
+                };
+                if let Ok(user_data_dir) = profile_user_data_dir(&profile.id) {
+                    write_profile_bookmarks_items(&user_data_dir, &items);
+                }
+                idx += 2;
+            }
             "--cookies" => {
                 let raw = next_val()?;
                 let payload = if Path::new(raw).is_file() {
@@ -4654,6 +4669,7 @@ fn print_cli_help() {
            bon-login stop <id|name|--group <g>|--all>                    Stop running profile(s) & flush cookies\n  \
            bon-login sync <id|name>                                      Sync OAuth popups & extension windows into tabs\n  \
            bon-login arrange [--size <W,H>]                              Tile all running browser windows into a screen grid\n  \
+           bon-login focus <id|name>                                     Bring running browser window to the front on macOS\n  \
            bon-login type <id|name> <text...>                            Human-type text into focused input via CDP (bypass paste block)\n  \
            bon-login totp <id|name> [--type]                             Generate 6-digit 2FA code (and optionally type into browser)\n  \
            bon-login screenshot <id|name> [--out <file>]                 Capture PNG screenshot of running profile via CDP\n  \
@@ -4671,30 +4687,31 @@ fn print_cli_help() {
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
            bon-login profile list [--group <g>] [--search <q>]\n  \
            bon-login profile show <id|name>\n  \
-           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--tags <t1,t2>] [--totp <secret>] [--proxy <saved_proxy|none>]\n                            [--proxy-tag <tag>] [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--cookies <file_or_json>]\n  \
+           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--tags <t1,t2>] [--totp <secret>] [--proxy <saved_proxy|none>]\n                            [--proxy-tag <tag>] [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--bookmarks <Name|URL,...>] [--cookies <file_or_json>]\n  \
            bon-login profile update <id|name|--group <g>|--all> [same flags as create]\n  \
+           bon-login profile bookmarks <id|name> [list|add <Name|URL>|clear]\n  \
            bon-login profile reseed <id|name|--group <g>|--all>\n  \
            bon-login profile clone <id|name> [--count <n>] [--name <prefix>]\n  \
            bon-login profile batch-create --count <n> [--prefix <p>] [--group <g>] [--os <os>] [--brand <b>] [--proxy-tag <tag>]\n  \
            bon-login profile check-proxy <id|name|--group <g>|--all>\n  \
            bon-login profile rotate-proxy <id|name|--group <g>|--all>\n  \
            bon-login profile clean-cache <id|name|--group <g>|--all>\n  \
-           bon-login profile warmup <id|name> [url1,url2...]\n  \
+           bon-login profile warmup <id|name|--group <g>|--all> [url1,url2...] [--dwell <secs>]\n  \
            bon-login profile export-cookies <id|name> [--out <file>]\n  \
            bon-login profile import-cookies <id|name> <file_or_json>\n  \
-           bon-login profile export-zip <id|name>                        Export full profile archive (.zip with cookies & user-data)\n  \
+           bon-login profile export-zip <id|name|--group <g>|--all>      Export full profile archive (.zip with cookies & user-data)\n  \
            bon-login profile import-zip <zip_file>                       Restore profile from .zip archive\n  \
            bon-login profile export-csv [--out <file>]                   Export profiles to CSV\n  \
            bon-login profile import-csv <csv_or_tsv_file>                Bulk import profiles from CSV/TSV\n  \
            bon-login profile trash [list|restore <id|--all>|empty]       Manage soft-deleted profiles in Trash\n  \
            bon-login profile wipe <id|name|--group <g>|--all>\n  \
-           bon-login profile delete <id|name|--group <g>|--all>\n  \
+           bon-login profile delete <id|name|--group <g>|--all> [--permanent]\n  \
            bon-login profile backup [--out <file>]\n  \
            bon-login profile restore <file>\n\n\
          PROXY MANAGER (`bon-login proxy ...`):\n  \
            bon-login proxy list [--tag <t>]\n  \
            bon-login proxy add <raw_proxy_or_file> [--protocol http|socks5] [--tag <t>] [--name <n>] [--expire <days_or_date>]\n  \
-           bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>]\n  \
+           bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>] [--rotate-url <url|none>]\n  \
            bon-login proxy check <id|name|--tag <t>|--all>\n  \
            bon-login proxy rotate <id|name|--tag <t>|--all>\n  \
            bon-login proxy extend <id|name|--tag <t>|--all> <days|0|clear>\n  \
@@ -4764,6 +4781,28 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 })?;
                 let res = agent_sync_targets(&p.short_id(), &info.ws_url)?;
                 println!("{}", serde_json::to_string_pretty(&res)?);
+                Ok(())
+            }
+            "focus" => {
+                let target = args
+                    .get(1)
+                    .ok_or_else(|| anyhow!("Usage: bon-login focus <short_id|name>"))?;
+                let db = crate::db::Database::open_default()?;
+                let profiles = db.list_profiles()?;
+                let p = find_profile_by_query(&profiles, target)?;
+                let rt = probe_live_runtime(&p.id).ok_or_else(|| {
+                    anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id())
+                })?;
+                cdp_focus_window(&p.id, rt.pid, rt.cdp_port, &rt.ws_url)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "short_id": p.short_id(),
+                        "pid": rt.pid,
+                        "focused": true,
+                    }))?
+                );
                 Ok(())
             }
             "arrange" | "tile" => run_arrange_cli(&args[1..]),
@@ -4966,6 +5005,17 @@ fn run_profile_subcommand(
                     "has_prelaunch_cookies".into(),
                     serde_json::json!(!read_prelaunch_cookies(&sid).trim().is_empty()),
                 );
+                let disk_bytes = profile_user_data_dir(&p.id)
+                    .ok()
+                    .map(|d| dir_size_bytes(&d))
+                    .unwrap_or(0);
+                let bms: Vec<serde_json::Value> = read_profile_bookmarks(p)
+                    .into_iter()
+                    .map(|(n, u)| serde_json::json!({"name": n, "url": u}))
+                    .collect();
+                obj.insert("disk_bytes".into(), serde_json::json!(disk_bytes));
+                obj.insert("disk_usage".into(), serde_json::json!(format_bytes(disk_bytes)));
+                obj.insert("bookmarks".into(), serde_json::json!(bms));
                 obj.insert(
                     "download_dir".into(),
                     serde_json::json!(profile_download_dir(&sid)),
@@ -5372,19 +5422,30 @@ fn run_profile_subcommand(
             Ok(())
         }
         "delete" | "rm" => {
+            let permanent = rest.iter().any(|a| a == "--permanent" || a == "--hard" || a == "--force");
+            let clean_args: Vec<String> = rest
+                .iter()
+                .filter(|a| !matches!(a.as_str(), "--permanent" | "--hard" | "--force"))
+                .cloned()
+                .collect();
             let profiles = db.list_profiles()?;
-            let (targets, _) = select_profiles_by_target(&profiles, rest)?;
+            let (targets, _) = select_profiles_by_target(&profiles, &clean_args)?;
             let mut deleted = Vec::new();
             for p in targets {
                 stop_external_runtime(&p.id, &p.short_id());
-                let _ = wipe_profile_data(&p.id);
-                db.delete_profile(&p.id)?;
+                if permanent {
+                    let _ = wipe_profile_data(&p.id);
+                    db.delete_profile(&p.id)?;
+                } else {
+                    db.soft_delete_profile(&p.id)?;
+                }
                 deleted.push(p.short_id());
             }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": true,
+                    "mode": if permanent { "permanent" } else { "trash" },
                     "deleted": deleted,
                 }))?
             );
@@ -5453,23 +5514,28 @@ fn run_profile_subcommand(
             Ok(())
         }
         "export-zip" => {
-            let target = rest
-                .first()
-                .ok_or_else(|| anyhow!("Usage: bon-login profile export-zip <id|name>"))?;
             let profiles = db.list_profiles()?;
-            let p = find_profile_by_query(&profiles, target)?;
-            if probe_live_runtime(&p.id).is_some() {
-                bail!("Stop profile '{}' before exporting .zip archive", p.name);
-            }
-            let path = export_profile_archive_zip(p)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+            let (targets, _) = select_profiles_by_target(&profiles, rest).map_err(|_| {
+                anyhow!("Usage: bon-login profile export-zip <id|name|--group <g>|--all>")
+            })?;
+            let mut exported = Vec::new();
+            for p in &targets {
+                if probe_live_runtime(&p.id).is_some() {
+                    bail!("Stop profile '{}' before exporting .zip archive", p.name);
+                }
+                let path = export_profile_archive_zip(p)?;
+                exported.push(serde_json::json!({
                     "ok": true,
                     "short_id": p.short_id(),
+                    "name": p.name,
                     "path": path,
-                }))?
-            );
+                }));
+            }
+            if exported.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&exported[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&exported)?);
+            }
             Ok(())
         }
         "import-zip" => {
@@ -5496,13 +5562,17 @@ fn run_profile_subcommand(
             Ok(())
         }
         "warmup" | "cookie-robot" => {
-            let target = rest
-                .first()
-                .ok_or_else(|| anyhow!("Usage: bon-login profile warmup <id|name> [url1,url2...]"))?;
             let profiles = db.list_profiles()?;
-            let p = find_profile_by_query(&profiles, target)?;
-            let info = ensure_profile_launched_via_supervisor(&db, p)?;
-            let urls: Vec<String> = if let Some(raw_urls) = rest.get(1) {
+            let (targets, consumed) = select_profiles_by_target(&profiles, rest).map_err(|_| {
+                anyhow!("Usage: bon-login profile warmup <id|name|--group <g>|--all> [url1,url2...] [--dwell <secs>]")
+            })?;
+            let tail = &rest[consumed..];
+            let dwell: u64 = tail
+                .windows(2)
+                .find_map(|w| (w[0] == "--dwell" || w[0] == "-d").then(|| w[1].parse().ok()).flatten())
+                .unwrap_or(4)
+                .clamp(1, 60);
+            let urls: Vec<String> = if let Some(raw_urls) = tail.first().filter(|s| !s.starts_with('-')) {
                 raw_urls
                     .split([',', ' ', '\n'])
                     .map(str::trim)
@@ -5517,14 +5587,65 @@ fn run_profile_subcommand(
                     "https://www.amazon.com".to_string(),
                 ]
             };
-            let visited = run_cookie_robot_warmup(&p.short_id(), &info.ws_url, &urls, 4)?;
+            let mut results = Vec::new();
+            for p in &targets {
+                let info = ensure_profile_launched_via_supervisor(&db, p)?;
+                let visited = run_cookie_robot_warmup(&p.short_id(), &info.ws_url, &urls, dwell)?;
+                results.push(serde_json::json!({
+                    "ok": true,
+                    "short_id": p.short_id(),
+                    "name": p.name,
+                    "visited": visited,
+                    "dwell_secs": dwell,
+                    "urls": urls,
+                }));
+            }
+            if results.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&results[0])?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            }
+            Ok(())
+        }
+        "bookmarks" | "bookmark" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile bookmarks <id|name> [list|add <Name|URL,...>|clear]"))?;
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            let action = rest.get(1).map(String::as_str).unwrap_or("list");
+            let user_data_dir = profile_user_data_dir(&p.id)?;
+            match action {
+                "list" | "ls" => {}
+                "clear" | "reset" => {
+                    write_profile_bookmarks_items(&user_data_dir, &[]);
+                }
+                "add" | "set" => {
+                    let raw = rest.get(2..).unwrap_or(&[]).join(",");
+                    let mut items = if action == "set" {
+                        Vec::new()
+                    } else {
+                        read_profile_bookmarks(p)
+                    };
+                    for (n, u) in parse_bookmarks_editable(&raw) {
+                        if !items.iter().any(|(_, eu)| eu.eq_ignore_ascii_case(&u)) {
+                            items.push((n, u));
+                        }
+                    }
+                    write_profile_bookmarks_items(&user_data_dir, &items);
+                }
+                other => bail!("Unknown bookmarks action '{other}' (expected list, add, set, or clear)"),
+            }
+            let bms: Vec<serde_json::Value> = read_profile_bookmarks(p)
+                .into_iter()
+                .map(|(n, u)| serde_json::json!({"name": n, "url": u}))
+                .collect();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": true,
                     "short_id": p.short_id(),
-                    "visited": visited,
-                    "urls": urls,
+                    "bookmarks": bms,
                 }))?
             );
             Ok(())
@@ -5711,12 +5832,13 @@ fn run_proxy_subcommand(
             let (mut targets, consumed) = select_proxies_by_target(&proxies, rest)?;
             let flags = &rest[consumed..];
             if flags.is_empty() {
-                bail!("Usage: bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>]");
+                bail!("Usage: bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>] [--rotate-url <url|none>]");
             }
             let mut idx = 0;
             let mut new_name: Option<String> = None;
             let mut new_tag: Option<String> = None;
             let mut new_expire: Option<Option<i64>> = None;
+            let mut new_rotate_url: Option<Option<String>> = None;
             while idx < flags.len() {
                 match flags[idx].as_str() {
                     "--name" => {
@@ -5741,11 +5863,23 @@ fn run_proxy_subcommand(
                         }
                         idx += 2;
                     }
+                    "--rotate-url" | "--change-ip-url" => {
+                        let v = flags.get(idx + 1).map(|s| s.trim()).unwrap_or("");
+                        if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("clear") {
+                            new_rotate_url = Some(None);
+                        } else if v.starts_with("http://") || v.starts_with("https://") {
+                            new_rotate_url = Some(Some(v.to_string()));
+                        } else {
+                            bail!("--rotate-url must start with http:// or https:// (or 'none')");
+                        }
+                        idx += 2;
+                    }
                     other => bail!("Unknown proxy update flag '{other}'"),
                 }
             }
             let count = targets.len();
             let mut updated = Vec::new();
+            let all_profiles = db.list_profiles().unwrap_or_default();
             for (i, mut sp) in targets.drain(..).enumerate() {
                 if let Some(n) = &new_name {
                     sp.name = if count == 1 {
@@ -5759,6 +5893,19 @@ fn run_proxy_subcommand(
                 }
                 if let Some(exp) = new_expire {
                     sp.expired_at = exp;
+                }
+                if let Some(rot) = &new_rotate_url {
+                    sp.config.change_ip_url = rot.clone();
+                    for mut prof in all_profiles.iter().cloned() {
+                        if let Some(cfg) = prof.proxy.as_mut()
+                            && cfg.protocol == sp.config.protocol
+                            && cfg.host == sp.config.host
+                            && cfg.port == sp.config.port
+                        {
+                            cfg.change_ip_url = rot.clone();
+                            let _ = db.upsert_profile(&prof);
+                        }
+                    }
                 }
                 db.upsert_proxy(&sp)?;
                 updated.push(saved_proxy_summary_json(&sp));
@@ -6705,33 +6852,11 @@ pub fn handle_control_http_request(
     }
 }
 
-async fn run_serve_cli(args: &[String]) -> Result<()> {
+pub async fn serve_control_http_on_listener(
+    listener: tokio::net::TcpListener,
+    handle: tokio::runtime::Handle,
+) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let port: u16 = args
-        .windows(2)
-        .find_map(|w| (w[0] == "--port" || w[0] == "-p").then(|| w[1].parse().ok()).flatten())
-        .unwrap_or(19820);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("Failed to bind 127.0.0.1:{port}"))?;
-    println!(
-        "{}",
-        serde_json::json!({
-            "ok": true,
-            "listening": format!("http://127.0.0.1:{port}"),
-            "endpoints": [
-                "GET /health",
-                "GET /profiles",
-                "POST /profiles/:id/launch",
-                "POST /profiles/:id/stop",
-                "POST /profiles/:id/rotate-proxy",
-                "POST /profiles/:id/clean-cache",
-                "POST /profiles/:id/type",
-                "POST /arrange"
-            ]
-        })
-    );
-    let handle = tokio::runtime::Handle::current();
     loop {
         let (mut sock, _) = listener.accept().await?;
         let h = handle.clone();
@@ -6823,6 +6948,34 @@ async fn run_serve_cli(args: &[String]) -> Result<()> {
     }
 }
 
+async fn run_serve_cli(args: &[String]) -> Result<()> {
+    let port: u16 = args
+        .windows(2)
+        .find_map(|w| (w[0] == "--port" || w[0] == "-p").then(|| w[1].parse().ok()).flatten())
+        .unwrap_or(19820);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("Failed to bind 127.0.0.1:{port}"))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "listening": format!("http://127.0.0.1:{port}"),
+            "endpoints": [
+                "GET /health",
+                "GET /profiles",
+                "POST /profiles/:id/launch",
+                "POST /profiles/:id/stop",
+                "POST /profiles/:id/rotate-proxy",
+                "POST /profiles/:id/clean-cache",
+                "POST /profiles/:id/type",
+                "POST /arrange"
+            ]
+        })
+    );
+    serve_control_http_on_listener(listener, tokio::runtime::Handle::current()).await
+}
+
 // ---------------------------------------------------------------------------
 // Agent Flow Playbooks (Record @eN -> Stable Locators, Replay & Self-Heal)
 // ---------------------------------------------------------------------------
@@ -6875,7 +7028,7 @@ pub fn flows_dir() -> PathBuf {
     dir
 }
 
-fn sanitize_flow_name(raw: &str) -> Result<String> {
+pub fn sanitize_flow_name(raw: &str) -> Result<String> {
     let clean: String = raw
         .trim()
         .chars()
@@ -6894,7 +7047,7 @@ fn sanitize_flow_name(raw: &str) -> Result<String> {
     Ok(clean)
 }
 
-fn flow_file_path(name: &str) -> Result<PathBuf> {
+pub fn flow_file_path(name: &str) -> Result<PathBuf> {
     let clean = sanitize_flow_name(name)?;
     Ok(flows_dir().join(format!("{clean}.json")))
 }
@@ -6903,11 +7056,11 @@ fn snap_cache_path(short_id: &str) -> PathBuf {
     flows_dir().join(format!("_snap_{short_id}.json"))
 }
 
-fn history_flow_path(short_id: &str) -> PathBuf {
+pub fn history_flow_path(short_id: &str) -> PathBuf {
     flows_dir().join(format!("_history_{short_id}.json"))
 }
 
-fn clear_flow_session_cache(short_id: &str) {
+pub fn clear_flow_session_cache(short_id: &str) {
     let _ = std::fs::remove_file(snap_cache_path(short_id));
     let _ = std::fs::remove_file(history_flow_path(short_id));
 }
@@ -7550,7 +7703,7 @@ fn extract_domain_from_url(url: &str) -> String {
         .to_string()
 }
 
-fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
+pub fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<AgentFlow>(&s).ok())
@@ -7562,7 +7715,7 @@ fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
         })
 }
 
-fn save_flow_to_path(path: &Path, flow: &mut AgentFlow) -> Result<()> {
+pub fn save_flow_to_path(path: &Path, flow: &mut AgentFlow) -> Result<()> {
     flow.updated_at = unix_now();
     if flow.domain.is_empty()
         && let Some(first_url) = flow
@@ -7863,7 +8016,7 @@ pub fn build_locator_candidate_commands(
     vec![cmd]
 }
 
-fn execute_single_flow_step(
+pub fn execute_single_flow_step(
     short_id: &str,
     session: &str,
     ws_url: &str,
@@ -8007,35 +8160,136 @@ pub fn normalize_heal_agent_args(raw: &[String]) -> Vec<String> {
     }
 }
 
+pub fn list_saved_flows() -> Vec<AgentFlow> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(flows_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if fname.starts_with('_') || !fname.ends_with(".json") {
+                continue;
+            }
+            let stem = fname.trim_end_matches(".json");
+            out.push(load_flow_from_path(&path, stem));
+        }
+    }
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.name.cmp(&b.name)));
+    out
+}
+
+pub fn parse_flow_vars_text(raw: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in raw.split(['\n', '\r', ',']) {
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
+}
+
+pub fn run_flow_on_live_session(
+    flow_name: &str,
+    profile: &Profile,
+    ws_url: &str,
+    extra_vars: &std::collections::HashMap<String, String>,
+) -> Result<usize> {
+    let clean_name = sanitize_flow_name(flow_name)?;
+    let path = flow_file_path(&clean_name)?;
+    if !path.is_file() {
+        bail!("Flow '{}' not found", clean_name);
+    }
+    let mut flow = load_flow_from_path(&path, &clean_name);
+    if flow.steps.is_empty() {
+        bail!("Flow '{}' has 0 steps", clean_name);
+    }
+    let short_id = profile.short_id();
+    let session = format!("bon_{short_id}");
+    let mut vars = extra_vars.clone();
+    vars.entry("profile.name".to_string())
+        .or_insert_with(|| profile.name.clone());
+    vars.entry("profile.short_id".to_string())
+        .or_insert_with(|| short_id.clone());
+    vars.entry("profile.notes".to_string())
+        .or_insert_with(|| profile.notes.clone());
+    let mut flow_dirty = false;
+    let mut executed = 0usize;
+    for step_idx in 0..flow.steps.len() {
+        let step = flow.steps[step_idx].clone();
+        match execute_single_flow_step(&short_id, &session, ws_url, &step, &vars) {
+            Ok((winning_loc_idx, _)) => {
+                if winning_loc_idx > 0 && winning_loc_idx < flow.steps[step_idx].locators.len() {
+                    let winner = flow.steps[step_idx].locators.remove(winning_loc_idx);
+                    flow.steps[step_idx].locators.insert(0, winner);
+                    flow_dirty = true;
+                }
+                executed += 1;
+            }
+            Err(e) => {
+                if step.optional {
+                    continue;
+                }
+                if flow_dirty {
+                    let _ = save_flow_to_path(&path, &mut flow);
+                }
+                bail!("Step #{} ({}) failed: {e}", step_idx + 1, step.op);
+            }
+        }
+    }
+    if flow_dirty {
+        let _ = save_flow_to_path(&path, &mut flow);
+    }
+    Ok(executed)
+}
+
+pub fn save_profile_history_as_flow(
+    flow_raw: &str,
+    profile: &Profile,
+    var_pairs: &[(String, String)],
+) -> Result<AgentFlow> {
+    let flow_name = sanitize_flow_name(flow_raw)?;
+    let short_id = profile.short_id();
+    let hist_path = history_flow_path(&short_id);
+    let mut hist = load_flow_from_path(&hist_path, &flow_name);
+    if hist.steps.is_empty() {
+        bail!(
+            "No recorded DOM steps in history for '{}' (bon_{short_id})",
+            profile.name
+        );
+    }
+    parameterize_flow_steps(&mut hist.steps, var_pairs);
+    hist.name = flow_name.clone();
+    let out_path = flow_file_path(&flow_name)?;
+    save_flow_to_path(&out_path, &mut hist)?;
+    Ok(hist)
+}
+
 fn run_flow_subcommand(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     let rest = if args.is_empty() { &[] } else { &args[1..] };
 
     match sub {
         "list" | "ls" => {
-            let mut items = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(flows_dir()) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
-                        continue;
-                    };
-                    if fname.starts_with('_') || !fname.ends_with(".json") {
-                        continue;
-                    }
-                    let stem = fname.trim_end_matches(".json");
-                    let flow = load_flow_from_path(&path, stem);
+            let items: Vec<serde_json::Value> = list_saved_flows()
+                .into_iter()
+                .map(|flow| {
                     let vars = extract_flow_vars(&flow);
-                    items.push(serde_json::json!({
+                    let path = flow_file_path(&flow.name).unwrap_or_default();
+                    serde_json::json!({
                         "name": flow.name,
                         "domain": flow.domain,
                         "steps_count": flow.steps.len(),
                         "vars": vars,
                         "updated_at": flow.updated_at,
                         "path": path,
-                    }));
-                }
-            }
+                    })
+                })
+                .collect();
             println!("{}", serde_json::to_string_pretty(&items)?);
             Ok(())
         }
@@ -8074,19 +8328,9 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                     "Usage: bon-login flow save <flow_name> <profile_id|name> [--var key=literal ...]"
                 )
             })?;
-            let flow_name = sanitize_flow_name(flow_raw)?;
             let db = crate::db::Database::open_default()?;
             let profiles = db.list_profiles()?;
             let profile = find_profile_by_query(&profiles, prof_target)?;
-            let short_id = profile.short_id();
-            let hist_path = history_flow_path(&short_id);
-            let mut hist = load_flow_from_path(&hist_path, &flow_name);
-            if hist.steps.is_empty() {
-                bail!(
-                    "No recorded steps found in session history for profile '{}' (bon_{short_id})",
-                    profile.name
-                );
-            }
             let mut var_pairs = Vec::new();
             let mut idx = 2;
             while idx < rest.len() {
@@ -8097,10 +8341,8 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                     idx += 1;
                 }
             }
-            parameterize_flow_steps(&mut hist.steps, &var_pairs);
-            hist.name = flow_name.clone();
-            let out_path = flow_file_path(&flow_name)?;
-            save_flow_to_path(&out_path, &mut hist)?;
+            let hist = save_profile_history_as_flow(flow_raw, profile, &var_pairs)?;
+            let out_path = flow_file_path(&hist.name)?;
             let vars = extract_flow_vars(&hist);
             println!(
                 "{}",
@@ -9361,5 +9603,35 @@ mod tests {
         write_profile_bookmarks_items(&bm_dir, &[]);
         assert!(read_profile_bookmarks(&bm_prof).is_empty());
         let _ = wipe_profile_data(&bm_prof.id);
+        // Verify parse_flow_vars_text and save_profile_history_as_flow
+        let parsed_vars = parse_flow_vars_text("email=user@test.com, pass=secret123\notp=999999");
+        assert_eq!(parsed_vars.get("email").map(String::as_str), Some("user@test.com"));
+        assert_eq!(parsed_vars.get("pass").map(String::as_str), Some("secret123"));
+        assert_eq!(parsed_vars.get("otp").map(String::as_str), Some("999999"));
+        let hist_prof = Profile::new_default("FlowUIProf", PlatformType::Linux);
+        let hist_path = history_flow_path(&hist_prof.short_id());
+        let mut dummy_hist = AgentFlow {
+            name: "hist".to_string(),
+            domain: "example.com".to_string(),
+            updated_at: 1,
+            steps: vec![FlowStep {
+                op: "fill".to_string(),
+                locators: vec!["#email".to_string()],
+                value: Some("user@test.com".to_string()),
+                extra_args: vec![],
+                optional: false,
+            }],
+        };
+        save_flow_to_path(&hist_path, &mut dummy_hist).unwrap();
+        let saved_fl = save_profile_history_as_flow(
+            "ui_test_flow_tmp",
+            &hist_prof,
+            &[("email".to_string(), "user@test.com".to_string())],
+        )
+        .unwrap();
+        assert_eq!(saved_fl.steps[0].value.as_deref(), Some("{{email}}"));
+        assert!(list_saved_flows().iter().any(|f| f.name == "ui_test_flow_tmp"));
+        let _ = std::fs::remove_file(flow_file_path("ui_test_flow_tmp").unwrap());
+        clear_flow_session_cache(&hist_prof.short_id());
     }
 }

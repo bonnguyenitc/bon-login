@@ -48,6 +48,7 @@ pub fn render_profile_table(
     profiles: &[Profile],
     statuses: &std::collections::HashMap<String, ProfileStatus>,
     selected_profile_id: Option<&str>,
+    selected_disk_usage: &str,
     checked_profile_ids: &std::collections::HashSet<String>,
     cols: ColumnVisibility,
     sort_col: Option<ProfileSortColumn>,
@@ -543,8 +544,11 @@ pub fn render_profile_table(
                                     .1
                                     .to_string(),
                             ))
+                            .child(drawer_row("Disk Usage", selected_disk_usage.to_string()))
                             .child({
                                 let pid_clean = prof.id.clone();
+                                let pid_wipe = prof.id.clone();
+                                let pid_flow = prof.id.clone();
                                 let pid_rot = prof.id.clone();
                                 let pid_type = prof.id.clone();
                                 let pid_shot = prof.id.clone();
@@ -574,6 +578,19 @@ pub fn render_profile_table(
                                             })),
                                     )
                                     .child(
+                                        Button::new("drawer-open-flows")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .label("▶️ Agent Flows")
+                                            .on_click(cx.listener(move |app, _, window, cx| {
+                                                app.open_agent_flows_modal(
+                                                    Some(pid_flow.clone()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
                                         Button::new("drawer-clean-cache")
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
@@ -581,6 +598,21 @@ pub fn render_profile_table(
                                             .label("🧹 Clean Cache")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.clean_single_profile_cache(&pid_clean, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("drawer-wipe-data")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .disabled(is_prof_running)
+                                            .label("🧼 Wipe Data")
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                app.request_delete(
+                                                    PendingDeleteAction::WipeProfile(
+                                                        pid_wipe.clone(),
+                                                    ),
+                                                    cx,
+                                                );
                                             })),
                                     )
                                     .children(has_proxy_rot.then(|| {
@@ -721,6 +753,8 @@ fn build_profile_popup_menu(
     let pid_rot = profile_id.clone();
     let app_robot = app_entity.clone();
     let pid_robot = profile_id.clone();
+    let app_flow = app_entity.clone();
+    let pid_flow = profile_id.clone();
     let app_import_cookies = app_entity.clone();
     let pid_import_cookies = profile_id.clone();
     let app_cookies = app_entity.clone();
@@ -729,14 +763,20 @@ fn build_profile_popup_menu(
     let pid_zip = profile_id.clone();
     let app_clean = app_entity.clone();
     let pid_clean = profile_id.clone();
+    let app_wipe = app_entity.clone();
+    let pid_wipe = profile_id.clone();
     let app_clone = app_entity.clone();
     let pid_clone = profile_id.clone();
+    let app_bclone = app_entity.clone();
+    let pid_bclone = profile_id.clone();
     let app_proxy = app_entity.clone();
     let pid_proxy = profile_id.clone();
     let app_copy_id = app_entity.clone();
     let pid_copy_id = profile_id.clone();
     let app_agent = app_entity.clone();
     let pid_agent = profile_id.clone();
+    let app_pin = app_entity.clone();
+    let pid_pin = profile_id.clone();
     let app_del = app_entity;
     let pid_del = profile_id;
     let mut menu = menu
@@ -813,6 +853,14 @@ fn build_profile_popup_menu(
         }),
     )
     .item(
+        PopupMenuItem::new("▶️   Agent Flows (Playbooks)").on_click(move |_, window, cx| {
+            let pid = pid_flow.clone();
+            app_flow.update(cx, |app, cx| {
+                app.open_agent_flows_modal(Some(pid), window, cx);
+            });
+        }),
+    )
+    .item(
         PopupMenuItem::new(format!("{}   Copy Agent CLI", SfSymbol::TERMINAL)).on_click(
             move |_, _, cx| {
                 app_agent.update(cx, |app, cx| {
@@ -820,6 +868,13 @@ fn build_profile_popup_menu(
                 });
             },
         ),
+    )
+    .item(
+        PopupMenuItem::new("📌   Copy Pinned-Tab CLI").on_click(move |_, _, cx| {
+            app_pin.update(cx, |app, cx| {
+                app.copy_pinned_tab_cli(&pid_pin, cx);
+            });
+        }),
     )
     .item(
         PopupMenuItem::new(format!("{}   Import cookies", SfSymbol::ARROW_UP_DOC)).on_click(
@@ -858,13 +913,29 @@ fn build_profile_popup_menu(
             }),
     )
     .item(
-        PopupMenuItem::new(format!("{}   Clone", SfSymbol::PLUS_SQUARE_ON_SQUARE)).on_click(
-            move |_, window, cx| {
+        PopupMenuItem::new("🧼   Wipe Browser Data")
+            .disabled(is_busy)
+            .on_click(move |_, _, cx| {
+                let pid = pid_wipe.clone();
+                app_wipe.update(cx, |app, cx| {
+                    app.request_delete(PendingDeleteAction::WipeProfile(pid), cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new(format!("{}   Clone (1-click)", SfSymbol::PLUS_SQUARE_ON_SQUARE))
+            .on_click(move |_, window, cx| {
                 app_clone.update(cx, |app, cx| {
                     app.clone_profile(&pid_clone, window, cx);
                 });
-            },
-        ),
+            }),
+    )
+    .item(
+        PopupMenuItem::new("📑   Clone Multiple...").on_click(move |_, window, cx| {
+            app_bclone.update(cx, |app, cx| {
+                app.open_clone_modal(&pid_bclone, window, cx);
+            });
+        }),
     )
     .item(
         PopupMenuItem::new(format!("{}   Copy ID", SfSymbol::DOC_ON_DOC)).on_click(

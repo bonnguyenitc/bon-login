@@ -739,17 +739,22 @@ pub fn render_edit_profile_view(
                                         .items_center()
                                         .child(field_label("Operating System"))
                                         .child(
-                                            h_flex()
-                                                .gap_1p5()
-                                                .child(
-                                                    Button::new("os-windows")
+                                            h_flex().gap_1p5().children(
+                                                [
+                                                    ("os-windows", PlatformType::Windows, SfSymbol::PC, "Windows 11"),
+                                                    ("os-macos", PlatformType::MacOS, SfSymbol::APPLE_LOGO, "Mac OS"),
+                                                    ("os-linux", PlatformType::Linux, SfSymbol::TERMINAL, "Linux"),
+                                                ]
+                                                .into_iter()
+                                                .map(|(btn_id, target_os, icon, lbl)| {
+                                                    Button::new(btn_id)
                                                         .small()
                                                         .with_variant(BonTheme::toggle_pill(
                                                             cx,
-                                                            os_platform == PlatformType::Windows,
+                                                            os_platform == target_os,
                                                         ))
-                                                        .label(format!("{}  Windows 11", SfSymbol::PC))
-                                                        .on_click(cx.listener(|app, _, _, cx| {
+                                                        .label(format!("{icon}  {lbl}"))
+                                                        .on_click(cx.listener(move |app, _, _, cx| {
                                                             if let Some(m) = app.modal.as_mut() {
                                                                 let s: u32 = m
                                                                     .seed_input
@@ -758,52 +763,19 @@ pub fn render_edit_profile_view(
                                                                     .trim()
                                                                     .parse()
                                                                     .unwrap_or(1000);
-                                                                m.os_platform =
-                                                                    PlatformType::Windows;
+                                                                m.os_platform = target_os;
                                                                 m.gpu_spoofing =
                                                                     GpuSpoofMode::SeedGenerated;
                                                                 m.hardware_concurrency =
-                                                                    PlatformType::Windows
-                                                                        .optimal_cores_for_seed(s);
-                                                                m.window_size =
-                                                                    PlatformType::Windows
-                                                                        .default_window_size()
-                                                                        .to_string();
+                                                                    target_os.optimal_cores_for_seed(s);
+                                                                m.window_size = target_os
+                                                                    .default_window_size()
+                                                                    .to_string();
                                                                 cx.notify();
                                                             }
-                                                        })),
-                                                )
-                                                .child(
-                                                    Button::new("os-macos")
-                                                        .small()
-                                                        .with_variant(BonTheme::toggle_pill(
-                                                            cx,
-                                                            os_platform == PlatformType::MacOS,
-                                                        ))
-                                                        .label(format!("{}  Mac OS", SfSymbol::APPLE_LOGO))
-                                                        .on_click(cx.listener(|app, _, _, cx| {
-                                                            if let Some(m) = app.modal.as_mut() {
-                                                                let s: u32 = m
-                                                                    .seed_input
-                                                                    .read(cx)
-                                                                    .value()
-                                                                    .trim()
-                                                                    .parse()
-                                                                    .unwrap_or(1000);
-                                                                m.os_platform = PlatformType::MacOS;
-                                                                m.gpu_spoofing =
-                                                                    GpuSpoofMode::SeedGenerated;
-                                                                m.hardware_concurrency =
-                                                                    PlatformType::MacOS
-                                                                        .optimal_cores_for_seed(s);
-                                                                m.window_size =
-                                                                    PlatformType::MacOS
-                                                                        .default_window_size()
-                                                                        .to_string();
-                                                                cx.notify();
-                                                            }
-                                                        })),
-                                                ),
+                                                        }))
+                                                }),
+                                            ),
                                         ),
                                 )
                                 // User Agent / Fingerprint Seed + Random button
@@ -2528,6 +2500,15 @@ pub fn render_proxies_view(
                         })),
                 )
                 .child(
+                    Button::new("pmgr-batch-rotate")
+                        .with_variant(BonTheme::outline_blue(cx))
+                        .small()
+                        .label("🔄 Rotate IP")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.rotate_checked_saved_proxies(cx);
+                        })),
+                )
+                .child(
                     Button::new("pmgr-batch-copy")
                         .with_variant(BonTheme::primary_cta(cx))
                         .small()
@@ -3005,6 +2986,8 @@ pub fn render_proxies_view(
                                             .dropdown_menu(move |menu, _, _| {
                                                 let copy_val = pid_menu_copy.clone();
                                                 let app_c = app_row_menu.clone();
+                                                let edit_id = pid_menu_del.clone();
+                                                let app_ed = app_row_menu.clone();
                                                 let assign_id = pid_menu_assign.clone();
                                                 let app_a = app_row_menu.clone();
                                                 let ext_id = pid_menu_del.clone();
@@ -3016,6 +2999,20 @@ pub fn render_proxies_view(
                                                 let app_r = app_row_menu.clone();
                                                 let app_d = app_row_menu.clone();
                                                 let mut m = menu.item(
+                                                    PopupMenuItem::new(format!(
+                                                        "{}   Edit proxy / Rotate URL",
+                                                        SfSymbol::PENCIL
+                                                    ))
+                                                    .on_click(move |_, window, cx| {
+                                                        let eid = edit_id.clone();
+                                                        app_ed.update(cx, |app, cx| {
+                                                            app.open_edit_proxy_modal(
+                                                                &eid, window, cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                                .item(
                                                     PopupMenuItem::new(format!(
                                                         "{}   Copy proxy",
                                                         SfSymbol::DOC_ON_DOC
@@ -3227,25 +3224,23 @@ fn render_batch_browser_os_selector(
                     cx.notify();
                 }))
         }))
-        .child(
-            Button::new(SharedString::from(format!("{prefix}-os-win")))
-                .small()
-                .with_variant(BonTheme::toggle_pill(cx, batch_os == PlatformType::Windows))
-                .label(format!("{}  Windows 11", SfSymbol::PC))
-                .on_click(cx.listener(|app, _, _, cx| {
-                    app.batch_os = PlatformType::Windows;
-                    cx.notify();
-                })),
-        )
-        .child(
-            Button::new(SharedString::from(format!("{prefix}-os-mac")))
-                .small()
-                .with_variant(BonTheme::toggle_pill(cx, batch_os == PlatformType::MacOS))
-                .label(format!("{}  Mac OS", SfSymbol::APPLE_LOGO))
-                .on_click(cx.listener(|app, _, _, cx| {
-                    app.batch_os = PlatformType::MacOS;
-                    cx.notify();
-                })),
+        .children(
+            [
+                ("win", PlatformType::Windows, SfSymbol::PC, "Windows 11"),
+                ("mac", PlatformType::MacOS, SfSymbol::APPLE_LOGO, "Mac OS"),
+                ("linux", PlatformType::Linux, SfSymbol::TERMINAL, "Linux"),
+            ]
+            .into_iter()
+            .map(|(sfx, os_val, icon, lbl)| {
+                Button::new(SharedString::from(format!("{prefix}-os-{sfx}")))
+                    .small()
+                    .with_variant(BonTheme::toggle_pill(cx, batch_os == os_val))
+                    .label(format!("{icon}  {lbl}"))
+                    .on_click(cx.listener(move |app, _, _, cx| {
+                        app.batch_os = os_val;
+                        cx.notify();
+                    }))
+            }),
         )
 }
 
@@ -4240,13 +4235,11 @@ pub fn render_popup_modal(
                         .text_color(BonTheme::text_secondary())
                         .child("1. If you do not fill in proxy type, it will default to HTTP")
                         .child("2. Only support HTTP, HTTPS, Socks4, Socks5")
-                        .child("3. Name is optional")
+                        .child("3. Name & IP Rotation URL (|http://...) are optional")
                         .child("Example:")
                         .child("http://192.168.1.1:3000:admin:admin")
-                        .child("socks://192.168.1.1:3000")
                         .child("socks://192.168.1.1:3000:user:user")
-                        .child("192.168.1.1:3000")
-                        .child("http:192.168.1.1:3000:admin:admin:Vina Proxy"),
+                        .child("http:192.168.1.1:3000:admin:admin:Vina Proxy|https://api.proxy.local/rotate?key=1"),
                 )
                 // Default protocol selector + Proxy input
                 .child(
@@ -4720,6 +4713,21 @@ pub fn render_popup_modal(
                         "Remove the extension?",
                         format!("Are you sure to remove {name}?"),
                         "Yes, remove",
+                    )
+                }
+                Some(PendingDeleteAction::WipeProfile(id)) => {
+                    let name = app
+                        .profiles
+                        .iter()
+                        .find(|p| &p.id == id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "this profile".to_string());
+                    (
+                        "Wipe profile browser data?",
+                        format!(
+                            "Reset cookies, LocalStorage & browser state for '{name}' while keeping its fingerprint & proxy settings?"
+                        ),
+                        "Yes, wipe data",
                     )
                 }
                 None => (
@@ -5515,6 +5523,419 @@ pub fn render_popup_modal(
                                     app.import_backup_zip_from_input(window, cx);
                                 })),
                         ),
+                )
+        }
+
+        ActivePopupModal::CloneProfile => {
+            let src_name = app
+                .clone_target_id
+                .as_ref()
+                .and_then(|id| app.profiles.iter().find(|p| &p.id == id))
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "Profile".to_string());
+            v_flex()
+                .w(px(420.))
+                .p_5()
+                .gap_3p5()
+                .rounded_lg()
+                .bg(BonTheme::bg_elevated())
+                .border_1()
+                .border_color(BonTheme::border_active())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_bold()
+                                .text_color(BonTheme::text_primary())
+                                .child(format!("📑  Clone Profile — {src_name}")),
+                        )
+                        .child(
+                            Button::new("cln-close")
+                                .ghost()
+                                .small()
+                                .label(SfSymbol::XMARK)
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .w(px(110.))
+                                .gap_1()
+                                .child(field_label("Copies (1–50)"))
+                                .child(Input::new(&app.clone_count_input)),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1()
+                                .child(field_label("Name Prefix"))
+                                .child(Input::new(&app.clone_prefix_input)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(BonTheme::border())
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cln-cancel")
+                                .with_variant(BonTheme::row_action(cx))
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("cln-submit")
+                                .with_variant(BonTheme::primary_cta(cx))
+                                .small()
+                                .label("Clone")
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.submit_clone_modal(window, cx);
+                                })),
+                        ),
+                )
+        }
+
+        ActivePopupModal::EditProxy => {
+            let proxy_groups = app.distinct_proxy_groups_with_counts();
+            let cur_tag = app.proxy_selected_tag.clone();
+            v_flex()
+                .w(px(480.))
+                .p_5()
+                .gap_3p5()
+                .rounded_lg()
+                .bg(BonTheme::bg_elevated())
+                .border_1()
+                .border_color(BonTheme::border_active())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_bold()
+                                .text_color(BonTheme::text_primary())
+                                .child(format!("{}  Edit Proxy & Rotation URL", SfSymbol::PENCIL)),
+                        )
+                        .child(
+                            Button::new("edpx-close")
+                                .ghost()
+                                .small()
+                                .label(SfSymbol::XMARK)
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(field_label("Proxy Name"))
+                        .child(Input::new(&app.proxy_edit_name_input)),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .child(field_label("Tag"))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_1p5()
+                                .flex_wrap()
+                                .child(
+                                    Button::new("edpx-tag-none")
+                                        .xsmall()
+                                        .with_variant(BonTheme::toggle_pill(
+                                            cx,
+                                            cur_tag.trim().is_empty(),
+                                        ))
+                                        .label("No tag")
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.proxy_selected_tag = String::new();
+                                            cx.notify();
+                                        })),
+                                )
+                                .children(proxy_groups.into_iter().map(|(grp, _)| {
+                                    let g_c = grp.clone();
+                                    let active = cur_tag.eq_ignore_ascii_case(&grp);
+                                    Button::new(SharedString::from(format!("edpx-tag-{grp}")))
+                                        .xsmall()
+                                        .with_variant(BonTheme::toggle_pill(cx, active))
+                                        .label(format!("#{grp}"))
+                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                            app.proxy_selected_tag = g_c.clone();
+                                            cx.notify();
+                                        }))
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(field_label("IP Rotation Webhook URL (http://... or https://...)"))
+                        .child(Input::new(&app.proxy_edit_rotate_input)),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(field_label("Expiration Date (DD/MM/YYYY or days)"))
+                        .child(Input::new(&app.proxy_expire_input)),
+                )
+                .child(
+                    h_flex()
+                        .w_full()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(BonTheme::border())
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("edpx-cancel")
+                                .with_variant(BonTheme::row_action(cx))
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("edpx-save")
+                                .with_variant(BonTheme::primary_cta(cx))
+                                .small()
+                                .label("Save")
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.save_edit_proxy_modal(window, cx);
+                                })),
+                        ),
+                )
+        }
+
+        ActivePopupModal::AgentFlows => {
+            let target_prof = app
+                .flow_target_id
+                .as_ref()
+                .or(app.selected_profile_id.as_ref())
+                .and_then(|id| app.profiles.iter().find(|p| &p.id == id));
+            let (target_label, hist_count) = if let Some(p) = target_prof {
+                let sid = p.short_id();
+                let h = crate::launcher::load_flow_from_path(
+                    &crate::launcher::history_flow_path(&sid),
+                    "hist",
+                );
+                (
+                    if app.flow_target_id.is_none() && app.checked_profile_ids.len() > 1 {
+                        format!("{} checked profiles", app.checked_profile_ids.len())
+                    } else {
+                        format!("{} (bon_{sid})", p.name)
+                    },
+                    h.steps.len(),
+                )
+            } else {
+                ("Selected profile(s)".to_string(), 0)
+            };
+            let flows = app.saved_flows.clone();
+            v_flex()
+                .w(px(540.))
+                .p_5()
+                .gap_3p5()
+                .rounded_lg()
+                .bg(BonTheme::bg_elevated())
+                .border_1()
+                .border_color(BonTheme::border_active())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_bold()
+                                .text_color(BonTheme::text_primary())
+                                .child(format!("▶️  Agent Flow Playbooks — {target_label}")),
+                        )
+                        .child(
+                            Button::new("flw-close")
+                                .ghost()
+                                .small()
+                                .label(SfSymbol::XMARK)
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.popup_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(field_label(
+                            "Variables {{var}} Override (key=value, comma-separated)",
+                        ))
+                        .child(Input::new(&app.flow_vars_input)),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .p_3()
+                        .gap_2()
+                        .rounded_md()
+                        .bg(BonTheme::bg_panel())
+                        .border_1()
+                        .border_color(BonTheme::border())
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .child(field_label("Save Recorded Profile History as Flow"))
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(format!("{hist_count} recorded step(s)")),
+                                        )
+                                        .children((hist_count > 0).then(|| {
+                                            Button::new("flw-clr-hist")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("Clear")
+                                                .on_click(cx.listener(|app, _, _, cx| {
+                                                    app.clear_profile_flow_history_ui(cx);
+                                                }))
+                                        })),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(Input::new(&app.flow_save_name_input)),
+                                )
+                                .child(
+                                    Button::new("flw-save-hist-btn")
+                                        .with_variant(BonTheme::outline_blue(cx))
+                                        .small()
+                                        .label("+ Save Flow")
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            app.save_history_as_flow_ui(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .id("saved-flows-list")
+                        .w_full()
+                        .max_h(px(230.))
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .children(flows.is_empty().then(|| {
+                            div()
+                                .w_full()
+                                .py_6()
+                                .flex()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
+                                .child("No saved flows yet. Run `bon-login agent <id> ...` and click '+ Save Flow' above.")
+                        }))
+                        .children(flows.into_iter().map(|fl| {
+                            let fn_run = fl.name.clone();
+                            let fn_del = fl.name.clone();
+                            let vars = crate::launcher::extract_flow_vars(&fl);
+                            let meta = if vars.is_empty() {
+                                format!("{} steps • {}", fl.steps.len(), if fl.domain.is_empty() { "any domain" } else { &fl.domain })
+                            } else {
+                                format!("{} steps • vars: {{{{{}}}}}", fl.steps.len(), vars.join("}}, {{"))
+                            };
+                            h_flex()
+                                .w_full()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .bg(BonTheme::bg_panel())
+                                .border_1()
+                                .border_color(BonTheme::border())
+                                .justify_between()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_bold()
+                                                .text_color(BonTheme::text_primary())
+                                                .child(fl.name),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(meta),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .child(
+                                            Button::new(SharedString::from(format!("flw-run-{fn_run}")))
+                                                .with_variant(BonTheme::launch_cta(cx))
+                                                .small()
+                                                .label("▶ Run")
+                                                .on_click(cx.listener(move |app, _, _, cx| {
+                                                    app.run_saved_flow_ui(&fn_run, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("flw-del-{fn_del}")))
+                                                .ghost()
+                                                .small()
+                                                .label(SfSymbol::TRASH)
+                                                .on_click(cx.listener(move |app, _, _, cx| {
+                                                    app.delete_saved_flow_ui(&fn_del, cx);
+                                                })),
+                                        ),
+                                )
+                        })),
                 )
         }
     };
