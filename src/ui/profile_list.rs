@@ -101,54 +101,15 @@ pub fn render_profile_table(
                         .text_xs()
                         .font_semibold()
                         .text_color(BonTheme::text_secondary())
-                                .child(
-                                    div()
-                                        .w(px(16.))
-                                        .h(px(16.))
-                                        .flex_shrink_0()
-                                        .rounded(px(4.5))
-                                        .cursor_pointer()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(if all_checked || any_checked {
-                                            BonTheme::accent()
-                                        } else {
-                                            BonTheme::bg_panel()
-                                        })
-                                        .border_1()
-                                        .border_color(if all_checked || any_checked {
-                                            BonTheme::accent()
-                                        } else {
-                                            BonTheme::border()
-                                        })
-                                        .hover(|s| s.border_color(BonTheme::accent()))
-                                        .text_xs()
-                                        .font_bold()
-                                        .text_color(rgb(0xffffff))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|app, _, _, cx| {
-                                                app.toggle_check_all_filtered(cx);
-                                            }),
-                                        )
-                                        .child(header_check_mark)
-                                        .with_spring(
-                                            "prof-hdr-chk-spring",
-                                            SpringAnimation::new(BonTheme::snappy_spring())
-                                                .to(all_checked || any_checked),
-                                            |this, phase| {
-                                                this.bg(phase.interpolate_clamped(
-                                                    BonTheme::bg_panel(),
-                                                    BonTheme::accent(),
-                                                ))
-                                                .border_color(phase.interpolate_clamped(
-                                                    BonTheme::border(),
-                                                    BonTheme::accent(),
-                                                ))
-                                            },
-                                        ),
-                                )
+                        .child(BonTheme::checkbox(
+                            "prof-hdr-chk-spring",
+                            all_checked || any_checked,
+                            header_check_mark,
+                            BonTheme::bg_panel(),
+                            cx.listener(|app, _, _, cx| {
+                                app.toggle_check_all_filtered(cx);
+                            }),
+                        ))
                                 .children(cols.show_id.then(|| {
                                     sortable_col_header(
                                         "ID",
@@ -453,7 +414,7 @@ pub fn render_profile_table(
                                                 Button::new(SharedString::from(format!("drawer-bm-chip-{i}")))
                                                     .with_variant(BonTheme::row_action(cx))
                                                     .xsmall()
-                                                    .label(format!("🔖 {bm_name}"))
+                                                    .label(format!("{} {bm_name}", SfSymbol::BOOKMARK_FILL))
                                                     .on_click(cx.listener(move |app, _, _, cx| {
                                                         app.open_or_copy_bookmark(&pid_c, &n_c, &u_c, cx);
                                                     }))
@@ -480,7 +441,7 @@ pub fn render_profile_table(
                                             .with_variant(BonTheme::outline_blue(cx))
                                             .xsmall()
                                             .label(format!(
-                                                "🔐 {} {} ({rem}s)",
+                                                "{} {} {} ({rem}s)", SfSymbol::LOCK_FILL,
                                                 &code[..3],
                                                 &code[3..]
                                             ))
@@ -561,14 +522,17 @@ pub fn render_profile_table(
                                     .and_then(|p| p.change_ip_url.as_ref())
                                     .is_some();
                                 h_flex()
-                                    .pt_2()
+                                    .pt_3()
+                                    .mt_1()
+                                    .border_t_1()
+                                    .border_color(BonTheme::border())
                                     .gap_1p5()
                                     .flex_wrap()
                                     .child(
                                         Button::new("drawer-open-meta")
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
-                                            .label("🔖 Bookmarks / Tags / 2FA")
+                                            .label("\u{1002e2} Bookmarks / Tags / 2FA")
                                             .on_click(cx.listener(move |app, _, window, cx| {
                                                 app.open_quick_meta_modal(
                                                     Some(pid_meta.clone()),
@@ -581,7 +545,7 @@ pub fn render_profile_table(
                                         Button::new("drawer-open-flows")
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
-                                            .label("▶️ Agent Flows")
+                                            .label("\u{100284} Agent Flows")
                                             .on_click(cx.listener(move |app, _, window, cx| {
                                                 app.open_agent_flows_modal(
                                                     Some(pid_flow.clone()),
@@ -595,7 +559,7 @@ pub fn render_profile_table(
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
                                             .disabled(is_prof_running)
-                                            .label("🧹 Clean Cache")
+                                            .label("\u{1002af} Clean Cache")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.clean_single_profile_cache(&pid_clean, cx);
                                             })),
@@ -605,7 +569,7 @@ pub fn render_profile_table(
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
                                             .disabled(is_prof_running)
-                                            .label("🧼 Wipe Data")
+                                            .label("\u{100211} Wipe Data")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.request_delete(
                                                     PendingDeleteAction::WipeProfile(
@@ -619,7 +583,7 @@ pub fn render_profile_table(
                                         Button::new("drawer-rotate-proxy")
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
-                                            .label("🔄 Rotate IP")
+                                            .label("\u{1002af} Rotate IP")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.rotate_profile_proxy_ip(&pid_rot, cx);
                                             }))
@@ -628,7 +592,7 @@ pub fn render_profile_table(
                                         Button::new("drawer-focus-win")
                                             .with_variant(BonTheme::outline_blue(cx))
                                             .small()
-                                            .label("🔍 Focus Window")
+                                            .label("\u{1002ab} Focus Window")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.focus_profile_browser(&pid_focus, cx);
                                             }))
@@ -637,7 +601,7 @@ pub fn render_profile_table(
                                         Button::new("drawer-human-type")
                                             .with_variant(BonTheme::outline_blue(cx))
                                             .small()
-                                            .label("⌨️ Human Type")
+                                            .label("\u{100a7c} Human Type")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.type_clipboard_as_human(&pid_type, cx);
                                             }))
@@ -646,7 +610,7 @@ pub fn render_profile_table(
                                         Button::new("drawer-screenshot")
                                             .with_variant(BonTheme::outline_blue(cx))
                                             .small()
-                                            .label("📸 Screenshot")
+                                            .label("\u{100241} Screenshot")
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.capture_profile_screenshot(&pid_shot, cx);
                                             }))
@@ -791,7 +755,7 @@ fn build_profile_popup_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("🔖   Bookmarks, Tags & 2FA").on_click(move |_, window, cx| {
+            PopupMenuItem::new("\u{1002e2}   Bookmarks, Tags & 2FA").on_click(move |_, window, cx| {
                 let pid = pid_meta.clone();
                 app_meta.update(cx, |app, cx| {
                     app.open_quick_meta_modal(Some(pid), window, cx);
@@ -800,7 +764,7 @@ fn build_profile_popup_menu(
         );
     if has_totp {
         menu = menu.item(
-            PopupMenuItem::new("🔐   Copy 2FA Code").on_click(move |_, _, cx| {
+            PopupMenuItem::new("\u{1003a0}   Copy 2FA Code").on_click(move |_, _, cx| {
                 app_totp.update(cx, |app, cx| {
                     app.copy_profile_totp(&pid_totp, cx);
                 });
@@ -809,7 +773,7 @@ fn build_profile_popup_menu(
     }
     menu = menu
         .item(
-            PopupMenuItem::new("🔍   Focus Browser Window")
+            PopupMenuItem::new("\u{1002ab}   Focus Browser Window")
                 .disabled(!is_running)
                 .on_click(move |_, _, cx| {
                     app_focus.update(cx, |app, cx| {
@@ -818,7 +782,7 @@ fn build_profile_popup_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("⌨️   Human-Type Clipboard")
+            PopupMenuItem::new("\u{100a7c}   Human-Type Clipboard")
                 .disabled(!is_running)
                 .on_click(move |_, _, cx| {
                     app_type.update(cx, |app, cx| {
@@ -827,7 +791,7 @@ fn build_profile_popup_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("📸   Capture Screenshot")
+            PopupMenuItem::new("\u{100241}   Capture Screenshot")
                 .disabled(!is_running)
                 .on_click(move |_, _, cx| {
                     app_shot.update(cx, |app, cx| {
@@ -836,7 +800,7 @@ fn build_profile_popup_menu(
                 }),
         )
         .item(
-            PopupMenuItem::new("🔄   Rotate Proxy IP")
+            PopupMenuItem::new("\u{1002af}   Rotate Proxy IP")
                 .disabled(!has_rotate_url)
                 .on_click(move |_, _, cx| {
                     app_rot.update(cx, |app, cx| {
@@ -845,7 +809,7 @@ fn build_profile_popup_menu(
                 }),
         );
     menu.item(
-        PopupMenuItem::new("🤖   Cookie Robot (Warm-up)").on_click(move |_, _, cx| {
+        PopupMenuItem::new("\u{1002e6}   Cookie Robot (Warm-up)").on_click(move |_, _, cx| {
             let pid = pid_robot.clone();
             app_robot.update(cx, |app, cx| {
                 app.open_cookie_robot_modal(Some(pid), cx);
@@ -853,7 +817,7 @@ fn build_profile_popup_menu(
         }),
     )
     .item(
-        PopupMenuItem::new("▶️   Agent Flows (Playbooks)").on_click(move |_, window, cx| {
+        PopupMenuItem::new("\u{100284}   Agent Flows (Playbooks)").on_click(move |_, window, cx| {
             let pid = pid_flow.clone();
             app_flow.update(cx, |app, cx| {
                 app.open_agent_flows_modal(Some(pid), window, cx);
@@ -861,7 +825,7 @@ fn build_profile_popup_menu(
         }),
     )
     .item(
-        PopupMenuItem::new(format!("{}   Copy Agent CLI", SfSymbol::TERMINAL)).on_click(
+        PopupMenuItem::new("\u{100a7c}   Copy Agent CLI").on_click(
             move |_, _, cx| {
                 app_agent.update(cx, |app, cx| {
                     app.copy_agent_browser_cli(&pid_agent, cx);
@@ -870,14 +834,14 @@ fn build_profile_popup_menu(
         ),
     )
     .item(
-        PopupMenuItem::new("📌   Copy Pinned-Tab CLI").on_click(move |_, _, cx| {
+        PopupMenuItem::new("\u{100263}   Copy Pinned-Tab CLI").on_click(move |_, _, cx| {
             app_pin.update(cx, |app, cx| {
                 app.copy_pinned_tab_cli(&pid_pin, cx);
             });
         }),
     )
     .item(
-        PopupMenuItem::new(format!("{}   Import cookies", SfSymbol::ARROW_UP_DOC)).on_click(
+        PopupMenuItem::new("\u{10023b}   Import cookies").on_click(
             move |_, window, cx| {
                 app_import_cookies.update(cx, |app, cx| {
                     app.open_edit_cookies_view(&pid_import_cookies, window, cx);
@@ -886,7 +850,7 @@ fn build_profile_popup_menu(
         ),
     )
     .item(
-        PopupMenuItem::new(format!("{}   Export cookies", SfSymbol::ARROW_DOWN_DOC)).on_click(
+        PopupMenuItem::new("\u{10023d}   Export cookies").on_click(
             move |_, _, cx| {
                 app_cookies.update(cx, |app, cx| {
                     app.export_profile_cookies_json(&pid_cookies, cx);
@@ -895,7 +859,7 @@ fn build_profile_popup_menu(
         ),
     )
     .item(
-        PopupMenuItem::new("📦   Export Backup (.zip)")
+        PopupMenuItem::new("\u{10023d}   Export Backup (.zip)")
             .disabled(is_busy)
             .on_click(move |_, _, cx| {
                 app_zip.update(cx, |app, cx| {
@@ -904,7 +868,7 @@ fn build_profile_popup_menu(
             }),
     )
     .item(
-        PopupMenuItem::new("🧹   Clean Disk Cache")
+        PopupMenuItem::new("\u{1002af}   Clean Disk Cache")
             .disabled(is_busy)
             .on_click(move |_, _, cx| {
                 app_clean.update(cx, |app, cx| {
@@ -913,7 +877,7 @@ fn build_profile_popup_menu(
             }),
     )
     .item(
-        PopupMenuItem::new("🧼   Wipe Browser Data")
+        PopupMenuItem::new("\u{100211}   Wipe Browser Data")
             .disabled(is_busy)
             .on_click(move |_, _, cx| {
                 let pid = pid_wipe.clone();
@@ -923,7 +887,7 @@ fn build_profile_popup_menu(
             }),
     )
     .item(
-        PopupMenuItem::new(format!("{}   Clone (1-click)", SfSymbol::PLUS_SQUARE_ON_SQUARE))
+        PopupMenuItem::new("\u{100add}   Clone (1-click)")
             .on_click(move |_, window, cx| {
                 app_clone.update(cx, |app, cx| {
                     app.clone_profile(&pid_clone, window, cx);
@@ -931,14 +895,14 @@ fn build_profile_popup_menu(
             }),
     )
     .item(
-        PopupMenuItem::new("📑   Clone Multiple...").on_click(move |_, window, cx| {
+        PopupMenuItem::new("\u{100add}   Clone Multiple...").on_click(move |_, window, cx| {
             app_bclone.update(cx, |app, cx| {
                 app.open_clone_modal(&pid_bclone, window, cx);
             });
         }),
     )
     .item(
-        PopupMenuItem::new(format!("{}   Copy ID", SfSymbol::DOC_ON_DOC)).on_click(
+        PopupMenuItem::new("\u{100241}   Copy ID").on_click(
             move |_, _, cx| {
                 app_copy_id.update(cx, |app, cx| {
                     app.copy_profile_id(&pid_copy_id, cx);
@@ -1054,64 +1018,30 @@ fn render_profile_row(
                 .py_2p5()
                 .gap_2()
                 .items_center()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |app, _, window, cx| {
-                        app.show_detail_drawer = true;
-                        app.select_profile(&select_id, window, cx);
+                // Col 0: Checkbox (sibling outside row-select listener so clicking checkbox never selects row)
+                .child(BonTheme::checkbox(
+                    format!("prof-chk-spring-{profile_id}"),
+                    is_checked,
+                    if is_checked { SfSymbol::CHECKMARK } else { "" },
+                    BonTheme::bg_elevated(),
+                    cx.listener(move |app, _, _, cx| {
+                        app.toggle_check_profile(&check_id, cx);
                     }),
-                )
-                // Col 0: Checkbox
+                ))
                 .child(
-                    div()
-                        .w(px(16.))
-                        .h(px(16.))
-                        .flex_shrink_0()
-                        .rounded(px(4.5))
-                        .flex()
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
                         .items_center()
-                        .justify_center()
-                        .bg(if is_checked {
-                            BonTheme::accent()
-                        } else {
-                            BonTheme::bg_elevated()
-                        })
-                        .border_1()
-                        .border_color(if is_checked {
-                            BonTheme::accent()
-                        } else {
-                            BonTheme::border()
-                        })
-                        .hover(|s| s.border_color(BonTheme::accent()))
-                        .text_xs()
-                        .font_bold()
-                        .text_color(rgb(0xffffff))
+                        .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |app, _, _, cx| {
-                                cx.stop_propagation();
-                                app.toggle_check_profile(&check_id, cx);
+                            cx.listener(move |app, _, window, cx| {
+                                app.show_detail_drawer = true;
+                                app.select_profile(&select_id, window, cx);
                             }),
                         )
-                        .child(if is_checked { SfSymbol::CHECKMARK } else { "" })
-                        .with_spring(
-                            SharedString::from(format!("prof-chk-spring-{profile_id}")),
-                            SpringAnimation::new(BonTheme::snappy_spring()).to(is_checked),
-                            |this, phase| {
-                                this.bg(phase.interpolate_clamped(
-                                    BonTheme::bg_elevated(),
-                                    BonTheme::accent(),
-                                ))
-                                .border_color(
-                                    phase.interpolate_clamped(
-                                        BonTheme::border(),
-                                        BonTheme::accent(),
-                                    ),
-                                )
-                            },
-                        ),
-                )
                 // Col 1: ID (`3866478`)
                 .children(cols.show_id.then(|| {
                     let pid_id_col = profile_id.clone();
@@ -1258,7 +1188,7 @@ fn render_profile_row(
                                 .child(if has_note {
                                     "2FA".to_string()
                                 } else {
-                                    format!("🔐{code}")
+                                    format!("{} {code}", SfSymbol::LOCK_FILL)
                                 })
                         }))
                         .child(
@@ -1429,6 +1359,7 @@ fn render_profile_row(
                                     },
                                 )
                         }),
+                ),
                 ),
         )
         .context_menu({

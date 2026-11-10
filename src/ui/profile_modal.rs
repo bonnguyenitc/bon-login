@@ -986,7 +986,7 @@ pub fn render_edit_profile_view(
                                                                 .with_variant(BonTheme::outline_blue(cx))
                                                                 .xsmall()
                                                                 .label(format!(
-                                                                    "🔐 {} {} ({rem}s)",
+                                                                    "{} {} {} ({rem}s)", SfSymbol::LOCK_FILL,
                                                                     &code[..3],
                                                                     &code[3..]
                                                                 ))
@@ -2503,7 +2503,7 @@ pub fn render_proxies_view(
                     Button::new("pmgr-batch-rotate")
                         .with_variant(BonTheme::outline_blue(cx))
                         .small()
-                        .label("🔄 Rotate IP")
+                        .label("\u{1002af} Rotate IP")
                         .on_click(cx.listener(|app, _, _, cx| {
                             app.rotate_checked_saved_proxies(cx);
                         })),
@@ -2564,54 +2564,15 @@ pub fn render_proxies_view(
                         .font_semibold()
                         .text_color(BonTheme::text_muted())
                         .child(
-                            div()
-                                .w(px(18.))
-                                .h(px(18.))
-                                .flex_shrink_0()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(if all_filtered_checked || any_filtered_checked {
-                                    BonTheme::accent()
-                                } else {
-                                    BonTheme::bg_panel()
-                                })
-                                .border_1()
-                                .border_color(if all_filtered_checked || any_filtered_checked {
-                                    BonTheme::accent()
-                                } else {
-                                    BonTheme::border()
-                                })
-                                .hover(|s| s.border_color(BonTheme::accent()))
-                                .text_xs()
-                                .font_bold()
-                                .text_color(rgb(0xffffff))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|app, _, _, cx| {
-                                        app.toggle_all_filtered_proxies_checked(cx);
-                                    }),
-                                )
-                                .child(proxy_hdr_mark)
-                                .with_spring(
-                                    "pmgr-hdr-chk-spring",
-                                    SpringAnimation::new(BonTheme::snappy_spring())
-                                        .to(all_filtered_checked || any_filtered_checked),
-                                    |this, phase| {
-                                        this.bg(phase.interpolate_clamped(
-                                            BonTheme::bg_panel(),
-                                            BonTheme::accent(),
-                                        ))
-                                        .border_color(
-                                            phase.interpolate_clamped(
-                                                BonTheme::border(),
-                                                BonTheme::accent(),
-                                            ),
-                                        )
-                                    },
-                                ),
+                            BonTheme::checkbox(
+                                "pmgr-hdr-chk-spring",
+                                all_filtered_checked || any_filtered_checked,
+                                proxy_hdr_mark,
+                                BonTheme::bg_panel(),
+                                cx.listener(|app, _, _, cx| {
+                                    app.toggle_all_filtered_proxies_checked(cx);
+                                }),
+                            ),
                         )
                         .child(div().w(px(28.)).flex_shrink_0().truncate().child("#"))
                         .child(div().flex_1().min_w(px(140.)).truncate().child("Name"))
@@ -2755,53 +2716,15 @@ pub fn render_proxies_view(
                                 })
                                 // Col 1: Checkbox
                                 .child(
-                                    div()
-                                        .w(px(16.))
-                                        .h(px(16.))
-                                        .flex_shrink_0()
-                                        .rounded(px(4.5))
-                                        .cursor_pointer()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(if is_checked {
-                                            BonTheme::accent()
-                                        } else {
-                                            BonTheme::bg_elevated()
-                                        })
-                                        .border_1()
-                                        .border_color(if is_checked {
-                                            BonTheme::accent()
-                                        } else {
-                                            BonTheme::border()
-                                        })
-                                        .hover(|s| s.border_color(BonTheme::accent()))
-                                        .text_xs()
-                                        .font_bold()
-                                        .text_color(rgb(0xffffff))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |app, _, _, cx| {
-                                                cx.stop_propagation();
-                                                app.toggle_proxy_checked(&pid_chk_toggle, cx);
-                                            }),
-                                        )
-                                        .child(if is_checked { SfSymbol::CHECKMARK } else { "" })
-                                        .with_spring(
-                                            SharedString::from(format!("pmgr-row-chk-spring-{pid}")),
-                                            SpringAnimation::new(BonTheme::snappy_spring())
-                                                .to(is_checked),
-                                            |this, phase| {
-                                                this.bg(phase.interpolate_clamped(
-                                                    BonTheme::bg_elevated(),
-                                                    BonTheme::accent(),
-                                                ))
-                                                .border_color(phase.interpolate_clamped(
-                                                    BonTheme::border(),
-                                                    BonTheme::accent(),
-                                                ))
-                                            },
-                                        ),
+                                    BonTheme::checkbox(
+                                        format!("pmgr-row-chk-spring-{pid}"),
+                                        is_checked,
+                                        if is_checked { SfSymbol::CHECKMARK } else { "" },
+                                        BonTheme::bg_elevated(),
+                                        cx.listener(move |app, _, _, cx| {
+                                            app.toggle_proxy_checked(&pid_chk_toggle, cx);
+                                        }),
+                                    ),
                                 )
                                 // Col 2: #
                                 .child(
@@ -3079,7 +3002,7 @@ pub fn render_proxies_view(
                                                 if has_rot_url {
                                                     m = m.item(
                                                         PopupMenuItem::new(
-                                                            "🔄   Rotate Proxy IP",
+                                                            "\u{1002af}   Rotate Proxy IP",
                                                         )
                                                         .on_click(move |_, _, cx| {
                                                             let rid = rot_id.clone();
@@ -4755,12 +4678,12 @@ pub fn render_popup_modal(
                                 .h(px(36.))
                                 .flex_shrink_0()
                                 .rounded_full()
-                                .bg(rgb(0xFEE2E2))
+                                .bg(BonTheme::danger_bg())
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .text_sm()
-                                .text_color(rgb(0xEF4444))
+                                .text_color(BonTheme::danger())
                                 .child(SfSymbol::TRASH),
                         )
                         .child(
@@ -5003,10 +4926,11 @@ pub fn render_popup_modal(
                     .find(|p| &p.id == pid)
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "Profile".to_string());
-                format!("🔖  Bookmarks, Tags, Note & 2FA — {name}")
+                format!("{}  Bookmarks, Tags, Note & 2FA — {name}", SfSymbol::TAG_FILL)
             } else {
                 format!(
-                    "🔖  Batch Bookmarks, Tags & Note ({} selected)",
+                    "{}  Batch Bookmarks, Tags & Note ({} selected)",
+                    SfSymbol::TAG_FILL,
                     app.checked_profile_ids.len()
                 )
             };
@@ -5166,7 +5090,7 @@ pub fn render_popup_modal(
                                         .with_variant(BonTheme::outline_blue(cx))
                                         .xsmall()
                                         .label(format!(
-                                            "🔐 {} {} ({rem}s) • Copy",
+                                            "{} {} {} ({rem}s) • Copy", SfSymbol::LOCK_FILL,
                                             &code[..3],
                                             &code[3..]
                                         ))
@@ -5218,7 +5142,7 @@ pub fn render_popup_modal(
                                                 cx.notify();
                                             }),
                                         )
-                                        .child(format!("🔖 {n} ×"))
+                                        .child(format!("{} {n} ×", SfSymbol::BOOKMARK_FILL))
                                 }))
                         }))
                         .child(
@@ -5296,10 +5220,11 @@ pub fn render_popup_modal(
                     .find(|p| &p.id == pid)
                     .map(|p| p.name.clone())
                     .unwrap_or_else(|| "Profile".to_string());
-                format!("🤖  Cookie Robot (Auto Warm-up) — {name}")
+                format!("{}  Cookie Robot (Auto Warm-up) — {name}", SfSymbol::BOLT_FILL)
             } else {
                 format!(
-                    "🤖  Cookie Robot (Auto Warm-up) — {} profile(s)",
+                    "{}  Cookie Robot (Auto Warm-up) — {} profile(s)",
+                    SfSymbol::BOLT_FILL,
                     app.checked_profile_ids.len()
                 )
             };
@@ -5456,7 +5381,7 @@ pub fn render_popup_modal(
                                 .text_base()
                                 .font_bold()
                                 .text_color(BonTheme::text_primary())
-                                .child("📥  Import Profile Backup (.zip)"),
+                                .child("\u{10023b}  Import Profile Backup (.zip)"),
                         )
                         .child(
                             Button::new("ibz-close")
@@ -5490,7 +5415,7 @@ pub fn render_popup_modal(
                             Button::new("ibz-browse")
                                 .with_variant(BonTheme::outline_blue(cx))
                                 .small()
-                                .label("📂 Browse .zip")
+                                .label("\u{100216} Browse .zip")
                                 .on_click(cx.listener(|app, _, window, cx| {
                                     app.browse_and_import_backup_zip(window, cx);
                                 })),
@@ -5551,7 +5476,7 @@ pub fn render_popup_modal(
                                 .text_base()
                                 .font_bold()
                                 .text_color(BonTheme::text_primary())
-                                .child(format!("📑  Clone Profile — {src_name}")),
+                                .child(format!("{}  Clone Profile — {src_name}", SfSymbol::PLUS_SQUARE_ON_SQUARE)),
                         )
                         .child(
                             Button::new("cln-close")
@@ -5777,7 +5702,7 @@ pub fn render_popup_modal(
                                 .text_base()
                                 .font_bold()
                                 .text_color(BonTheme::text_primary())
-                                .child(format!("▶️  Agent Flow Playbooks — {target_label}")),
+                                .child(format!("{}  Agent Flow Playbooks — {target_label}", SfSymbol::PLAY_FILL)),
                         )
                         .child(
                             Button::new("flw-close")
@@ -6110,7 +6035,7 @@ fn render_modal_bookmarks_section(
                                         .text_xs()
                                         .font_semibold()
                                         .text_color(BonTheme::text_primary())
-                                        .child(format!("🔖  {name}")),
+                                        .child(format!("{}  {name}", SfSymbol::BOOKMARK_FILL)),
                                 )
                                 .child(
                                     div()
@@ -6179,7 +6104,7 @@ fn render_modal_bookmarks_section(
                                 }
                             }),
                         )
-                        .child(format!("🔖 {name}  ×"))
+                        .child(format!("{} {name}  ×", SfSymbol::BOOKMARK_FILL))
                 }))
                 .into_any_element()
         })

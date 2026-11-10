@@ -1,5 +1,5 @@
-use gpui_kit::component::button::{ButtonCustomVariant, ButtonVariant};
-use gpui_kit::{Animation, App, Hsla, SpringConfig, ease_out_quint, rgb, rgba};
+use gpui_kit::component::{button::{ButtonCustomVariant, ButtonVariant}, *};
+use gpui_kit::*;
 use std::time::Duration;
 
 /// macOS Sequoia / Sonoma Dark Mode Material & System Color Palette.
@@ -51,9 +51,14 @@ impl BonTheme {
         rgb(0x151517).into()
     }
 
-    /// macOS Specular Hairline Divider (`rgba(255, 255, 255, 0.08)`)
+    /// macOS Specular Hairline Divider (`rgba(255, 255, 255, 0.09)`)
     pub fn border() -> Hsla {
-        rgba(0xffffff14).into()
+        rgba(0xffffff17).into()
+    }
+
+    /// macOS Control / Checkbox Bezel Border (`rgba(255, 255, 255, 0.22)`)
+    pub fn border_control() -> Hsla {
+        rgba(0xffffff38).into()
     }
 
     /// macOS Active Focus / Specular Highlight Border (`rgba(10, 132, 255, 0.65)`)
@@ -66,14 +71,14 @@ impl BonTheme {
         rgb(0xf5f5f7).into()
     }
 
-    /// macOS Secondary Label (`#98989D`)
+    /// macOS Secondary Label (`#AEAEB2` — `systemGray2` Dark Mode)
     pub fn text_secondary() -> Hsla {
-        rgb(0x98989d).into()
+        rgb(0xaeaeb2).into()
     }
 
-    /// macOS Tertiary / Section Caption Label (`#636366`)
+    /// macOS Tertiary / Section Caption Label (`#8E8E93` — `systemGray` Dark Mode, WCAG AA)
     pub fn text_muted() -> Hsla {
-        rgb(0x636366).into()
+        rgb(0x8e8e93).into()
     }
 
     /// Apple System Blue (`#0A84FF`)
@@ -201,6 +206,48 @@ impl BonTheme {
             )
         }
     }
+
+    /// Shared 18×18 spring-animated checkbox used in Profiles and Proxy Manager tables.
+    pub fn checkbox(
+        id: impl Into<SharedString>,
+        checked: bool,
+        mark: &'static str,
+        resting_bg: Hsla,
+        on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .w(px(18.))
+            .h(px(18.))
+            .flex_shrink_0()
+            .rounded(px(4.5))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if checked { Self::accent() } else { resting_bg })
+            .border_1()
+            .border_color(if checked {
+                Self::accent()
+            } else {
+                Self::border_control()
+            })
+            .hover(|s| s.border_color(Self::accent()))
+            .text_xs()
+            .font_bold()
+            .text_color(rgb(0xffffff))
+            .on_mouse_down(MouseButton::Left, on_toggle)
+            .child(mark)
+            .with_spring(
+                id.into(),
+                SpringAnimation::new(Self::snappy_spring()).to(checked),
+                move |this, phase| {
+                    this.bg(phase.interpolate_clamped(resting_bg, Self::accent()))
+                        .border_color(
+                            phase.interpolate_clamped(Self::border_control(), Self::accent()),
+                        )
+                },
+            )
+    }
 }
 
 /// Apple SF Symbols (`SF Pro` Private Use Area glyphs on macOS).
@@ -245,4 +292,7 @@ impl SfSymbol {
     pub const CLOCK_ARROW_CIRCLEPATH: &'static str = "\u{1008d4}";
     pub const TAG_FILL: &'static str = "\u{1002e2}";
     pub const SIDEBAR_RIGHT: &'static str = "\u{1003db}";
+    pub const LOCK_FILL: &'static str = "\u{1003a0}";
+    pub const MAGNIFYINGGLASS: &'static str = "\u{1002ab}";
+    pub const BOOKMARK_FILL: &'static str = "\u{10025f}";
 }

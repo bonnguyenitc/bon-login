@@ -4897,8 +4897,8 @@ impl Render for BonLoginApp {
                                     .child({
                                         let api_port = self.http_api_port;
                                         let lbl = match api_port {
-                                            Some(p) => format!("🟢 API :{p}"),
-                                            None => "🔌 Local API".to_string(),
+                                            Some(p) => format!("\u{100a7c}  API :{p}"),
+                                            None => "\u{100a7c}  Local API".to_string(),
                                         };
                                         Button::new("top-toggle-http-api")
                                             .with_variant(BonTheme::toggle_pill(
@@ -4916,7 +4916,7 @@ impl Render for BonLoginApp {
                                         Button::new("top-open-flows")
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
-                                            .label(format!("▶️  Flows ({flow_cnt})"))
+                                            .label(format!("{}  Flows ({flow_cnt})", SfSymbol::PLAY_FILL))
                                             .on_click(cx.listener(|app, _, window, cx| {
                                                 app.open_agent_flows_modal(None, window, cx);
                                             }))
@@ -5071,7 +5071,7 @@ impl Render for BonLoginApp {
                                                         Button::new("top-clean-cache-btn")
                                                             .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("🧹  Clean Cache")
+                                                            .label("\u{1002af}  Clean Cache")
                                                             .on_click(cx.listener(
                                                                 |app, _, _, cx| {
                                                                     app.clean_all_or_checked_cache(
@@ -5084,7 +5084,7 @@ impl Render for BonLoginApp {
                                                         Button::new("top-import-csv-btn")
                                                             .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("📊  Import CSV")
+                                                            .label("\u{10023b}  Import CSV")
                                                             .on_click(cx.listener(
                                                                 |app, _, window, cx| {
                                                                     app.pick_and_import_csv_ui(
@@ -5097,7 +5097,7 @@ impl Render for BonLoginApp {
                                                         Button::new("top-export-csv-btn")
                                                             .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("📤  Export CSV")
+                                                            .label("\u{10023d}  Export CSV")
                                                             .on_click(cx.listener(
                                                                 |app, _, _, cx| {
                                                                     app.export_profiles_csv_ui(cx);
@@ -5108,7 +5108,7 @@ impl Render for BonLoginApp {
                                                         Button::new("top-import-json-btn")
                                                             .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("📥  Import JSON")
+                                                            .label("\u{10023b}  Import JSON")
                                                             .on_click(cx.listener(
                                                                 |app, _, window, cx| {
                                                                     app.pick_and_import_json_ui(
@@ -5123,7 +5123,7 @@ impl Render for BonLoginApp {
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("📥  Import .zip")
+                                                            .label("\u{10023b}  Import .zip")
                                                             .on_click(cx.listener(
                                                                 |app, _, _, cx| {
                                                                     app.popup_modal = Some(
@@ -5244,7 +5244,7 @@ impl Render for BonLoginApp {
                                                                     BonTheme::outline_blue(cx),
                                                                 )
                                                                 .small()
-                                                                .label("⚡  Sync Clipboard")
+                                                                .label("\u{1002e6}  Sync Clipboard")
                                                                 .on_click(cx.listener(
                                                                     |app, _, _, cx| {
                                                                         app.sync_clipboard_to_checked_running(cx);
@@ -5259,7 +5259,7 @@ impl Render for BonLoginApp {
                                                                     BonTheme::outline_blue(cx),
                                                                 )
                                                                 .small()
-                                                                .label("🔐  Broadcast 2FA")
+                                                                .label("\u{1003a0}  Broadcast 2FA")
                                                                 .on_click(cx.listener(
                                                                     |app, _, _, cx| {
                                                                         app.broadcast_totp_to_checked_running(cx);
@@ -5329,7 +5329,7 @@ impl Render for BonLoginApp {
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("🔄  Rotate IP")
+                                                            .label("\u{1002af}  Rotate IP")
                                                             .on_click(cx.listener(
                                                                 |app, _, _, cx| {
                                                                     app.rotate_proxies_for_checked(
@@ -5382,7 +5382,7 @@ impl Render for BonLoginApp {
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("🔖  Tags, Bookmarks & Note")
+                                                            .label("\u{1002e2}  Tags, Bookmarks & Note")
                                                             .on_click(cx.listener(
                                                                 |app, _, window, cx| {
                                                                     app.open_quick_meta_modal(
@@ -5397,7 +5397,7 @@ impl Render for BonLoginApp {
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("🤖  Cookie Robot")
+                                                            .label("\u{1002e6}  Cookie Robot")
                                                             .on_click(cx.listener(
                                                                 |app, _, _, cx| {
                                                                     app.open_cookie_robot_modal(
@@ -5412,7 +5412,7 @@ impl Render for BonLoginApp {
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("▶️  Run Flow")
+                                                            .label("\u{100284}  Run Flow")
                                                             .on_click(cx.listener(
                                                                 |app, _, window, cx| {
                                                                     app.open_agent_flows_modal(
@@ -5472,7 +5472,7 @@ impl Render for BonLoginApp {
                                                                         )
                                                                         .item(
                                                                             PopupMenuItem::new(
-                                                                                "📦   Export Backup (.zip)",
+                                                                                "\u{10023d}   Export Backup (.zip)",
                                                                             )
                                                                             .on_click(
                                                                                 move |_, _, cx| {
