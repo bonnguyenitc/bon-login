@@ -293,6 +293,5 @@ impl SfSymbol {
     pub const TAG_FILL: &'static str = "\u{1002e2}";
     pub const SIDEBAR_RIGHT: &'static str = "\u{1003db}";
     pub const LOCK_FILL: &'static str = "\u{1003a0}";
-    pub const MAGNIFYINGGLASS: &'static str = "\u{1002ab}";
     pub const BOOKMARK_FILL: &'static str = "\u{10025f}";
 }
