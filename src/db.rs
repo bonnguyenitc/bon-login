@@ -57,13 +57,6 @@ impl Database {
         Ok(db)
     }
 
-    pub fn open_fast() -> anyhow::Result<Self> {
-        let db_path = APP_DATA_DIR.join("bonlogin.sqlite3");
-        let conn = Connection::open(db_path)?;
-        apply_fast_pragmas(&conn);
-        Ok(Self { conn })
-    }
-
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
         apply_fast_pragmas(&conn);
@@ -87,6 +80,15 @@ impl Database {
     }
 
     fn init_schema(&self) -> anyhow::Result<()> {
+        const SCHEMA_VERSION: i32 = 1;
+        let current_version: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap_or(0);
+        if current_version == SCHEMA_VERSION {
+            return Ok(());
+        }
+
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS profiles (
                 id TEXT PRIMARY KEY,
@@ -166,6 +168,7 @@ impl Database {
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON profiles(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_profiles_active_created ON profiles(deleted_at, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_profiles_group_tag ON profiles(group_tag COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_proxies_created_at ON proxies(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_proxies_group_tag ON proxies(group_tag COLLATE NOCASE);
@@ -308,6 +311,7 @@ impl Database {
                 14,
             ),
         ];
+        self.conn.execute_batch("SAVEPOINT bon_init_exts;")?;
         for &(id, name, icon_label, icon_bg, source_url, order) in default_extensions {
             self.conn.execute(
                 "INSERT OR IGNORE INTO extensions (id, name, icon_label, icon_bg, is_default, enabled, source_url, folder_path, created_at)
@@ -315,7 +319,7 @@ impl Database {
                 params![id, name, icon_label, icon_bg, source_url, order],
             )?;
         }
-
+        self.conn.execute_batch("RELEASE SAVEPOINT bon_init_exts; PRAGMA user_version = 1;")?;
 
         Ok(())
     }
@@ -1391,5 +1395,13 @@ mod tests {
                 .and_then(|x| x.change_ip_url.as_deref()),
             Some("http://rot.local")
         );
+
+        let ver: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 1);
+        db.init_schema().unwrap();
+        assert_eq!(db.list_profiles().unwrap().len(), list_after.len());
     }
 }

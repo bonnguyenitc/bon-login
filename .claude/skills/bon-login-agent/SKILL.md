@@ -27,6 +27,7 @@ bon-login flow show <flow_name>
 bon-login flow save <flow_name> <short_id|name> [--var username="user" --var password="pw"]
 bon-login flow run <flow_name> <short_id|name|--group <g>|--all> [--var username="u2" --var password="p2"] [--from-step <n>]
 bon-login flow heal <flow_name> <step_idx> <short_id|name> <agent-browser cmd...>
+bon-login flow step <flow_name> <step_idx> <optional|required|delete>
 bon-login flow history <short_id|name> [--clear]
 bon-login flow delete <flow_name>
 

@@ -45,20 +45,26 @@ impl Default for ColumnVisibility {
 }
 
 pub fn render_profile_table(
-    profiles: &[Profile],
-    statuses: &std::collections::HashMap<String, ProfileStatus>,
-    selected_profile_id: Option<&str>,
-    selected_disk_usage: &str,
-    checked_profile_ids: &std::collections::HashSet<String>,
-    cols: ColumnVisibility,
-    sort_col: Option<ProfileSortColumn>,
-    sort_asc: bool,
-    show_detail_drawer: bool,
+    app: &BonLoginApp,
+    filtered_indices: std::rc::Rc<[usize]>,
     cx: &mut Context<BonLoginApp>,
 ) -> impl IntoElement {
-    let all_checked =
-        !profiles.is_empty() && profiles.iter().all(|p| checked_profile_ids.contains(&p.id));
-    let any_checked = profiles.iter().any(|p| checked_profile_ids.contains(&p.id));
+    let profiles = &app.profiles;
+    let statuses = &app.statuses;
+    let checked_profile_ids = &app.checked_profile_ids;
+    let cols = app.col_vis;
+    let sort_col = app.sort_col;
+    let sort_asc = app.sort_asc;
+    let show_detail_drawer = app.show_detail_drawer;
+    let selected_profile_id = app.selected_profile_id.as_deref();
+    let selected_disk_usage = app.selected_disk_usage.as_str();
+    let all_checked = !filtered_indices.is_empty()
+        && filtered_indices
+            .iter()
+            .all(|&i| checked_profile_ids.contains(&profiles[i].id));
+    let any_checked = filtered_indices
+        .iter()
+        .any(|&i| checked_profile_ids.contains(&profiles[i].id));
     let header_check_mark = if all_checked {
         SfSymbol::CHECKMARK
     } else if any_checked {
@@ -68,7 +74,11 @@ pub fn render_profile_table(
     };
 
     let selected_profile = selected_profile_id
-        .and_then(|id| profiles.iter().find(|p| p.id == id))
+        .and_then(|id| {
+            filtered_indices
+                .iter()
+                .find_map(|&i| (profiles[i].id == id).then_some(&profiles[i]))
+        })
         .cloned();
     h_flex()
         .w_full()
@@ -200,55 +210,74 @@ pub fn render_profile_table(
                                 ),
                 )
                 // Scrollable Profile Rows Body
-                .child(
+                // Scrollable Virtualized Profile Rows Body
+                .child(if filtered_indices.is_empty() {
                     v_flex()
                         .id("profiles-table-rows")
                         .w_full()
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        // Empty State
-                        .children(profiles.is_empty().then(|| {
-                            v_flex()
-                                .w_full()
-                                .py_16()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
+                        .py_16()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(BonTheme::text_primary())
+                                .child("No profiles found"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
                                 .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(BonTheme::text_primary())
-                                        .child("No profiles found"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(
-                                            "Click '+ Create Profile' on the left menu or '⚡ Quick add' in the top right.",
-                                        ),
-                                )
-                        }))
-                        // Profile Rows
-                        .children(profiles.iter().map(|profile| {
-                            let status = statuses
-                                .get(&profile.id)
-                                .cloned()
-                                .unwrap_or(ProfileStatus::Stopped);
-                            let is_selected = selected_profile_id == Some(profile.id.as_str());
-                            let is_checked = checked_profile_ids.contains(&profile.id);
-                            render_profile_row(
-                                profile,
-                                status,
-                                is_selected,
-                                is_checked,
-                                cols,
-                                cx,
-                            )
-                        })),
-                )
+                                    "Click '+ Create Profile' on the left menu or '⚡ Quick add' in the top right.",
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    let indices_for_list = filtered_indices.clone();
+                    uniform_list(
+                        "profiles-table-rows",
+                        indices_for_list.len(),
+                        cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                            let selected_id = app.selected_profile_id.as_deref();
+                            let cols = app.col_vis;
+                            let mut items = Vec::with_capacity(range.len());
+                            for row_ix in range {
+                                let Some(&prof_ix) = indices_for_list.get(row_ix) else {
+                                    continue;
+                                };
+                                let Some(profile) = app.profiles.get(prof_ix) else {
+                                    continue;
+                                };
+                                let status = app
+                                    .statuses
+                                    .get(&profile.id)
+                                    .cloned()
+                                    .unwrap_or(ProfileStatus::Stopped);
+                                let is_selected = selected_id == Some(profile.id.as_str());
+                                let is_checked = app.checked_profile_ids.contains(&profile.id);
+                                items.push(render_profile_row(
+                                    profile,
+                                    status,
+                                    is_selected,
+                                    is_checked,
+                                    cols,
+                                    cx,
+                                ));
+                            }
+                            items
+                        }),
+                    )
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .into_any_element()
+                })
                 // GenLogin Table Footer (`Profiles: N   < [1] >   25 / page`)
                 .child(
                     h_flex()
@@ -262,7 +291,7 @@ pub fn render_profile_table(
                         .gap_3()
                         .text_xs()
                         .text_color(BonTheme::text_secondary())
-                        .child(format!("Profiles: {}", profiles.len())),
+                        .child(format!("Profiles: {}", filtered_indices.len())),
                 ),
         )
         // Right: GenLogin Collapsible `Detail` Drawer (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
@@ -1465,140 +1494,158 @@ pub fn render_trash_table(
                         .child(div().w(px(140.)).child("Deleted"))
                         .child(div().flex_1().flex().justify_end().child("Actions")),
                 )
-                .child(
+                .child(if trashed.is_empty() {
                     v_flex()
                         .id("trash-table-rows")
                         .w_full()
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        .children(trashed.is_empty().then(|| {
-                            v_flex()
-                                .w_full()
-                                .py_16()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(BonTheme::text_primary())
-                                        .child("Trash is empty"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child("Profiles you delete will appear here so you can restore them anytime."),
-                                )
-                        }))
-                        .children(trashed.iter().map(|p| {
-                            let pid_restore = p.id.clone();
-                            let pid_perm = p.id.clone();
-                            let proxy_str = p
-                                .proxy
-                                .as_ref()
-                                .map(|px| px.display_short())
-                                .unwrap_or_else(|| "Local IP".to_string());
-                            let grp_tags = if !p.tags.is_empty() {
-                                p.tags.join(", ")
-                            } else if !p.group_tag.is_empty() {
-                                p.group_tag.clone()
-                            } else {
-                                "—".to_string()
-                            };
-                            h_flex()
-                                .w_full()
-                                .px_4()
-                                .py_2p5()
-                                .gap_3()
-                                .items_center()
-                                .border_b_1()
-                                .border_color(BonTheme::border())
-                                .hover(|s| s.bg(BonTheme::bg_hover()))
-                                .child(
-                                    div()
-                                        .w(px(80.))
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(p.short_id()),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(180.))
-                                        .truncate()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(BonTheme::text_primary())
-                                        .child(p.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(130.))
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(grp_tags),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(150.))
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(proxy_str),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(140.))
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(BonTheme::warning())
-                                        .child(p.format_deleted_at()),
-                                )
-                                .child(
+                        .py_16()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(BonTheme::text_primary())
+                                .child("Trash is empty"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
+                                .child("Profiles you delete will appear here so you can restore them anytime."),
+                        )
+                        .into_any_element()
+                } else {
+                    uniform_list(
+                        "trash-table-rows",
+                        trashed.len(),
+                        cx.processor(|app, range: std::ops::Range<usize>, _window, cx| {
+                            let mut items = Vec::with_capacity(range.len());
+                            for ix in range {
+                                let Some(p) = app.trashed_profiles.get(ix) else {
+                                    continue;
+                                };
+                                let pid_restore = p.id.clone();
+                                let pid_perm = p.id.clone();
+                                let proxy_str = p
+                                    .proxy
+                                    .as_ref()
+                                    .map(|px| px.display_short())
+                                    .unwrap_or_else(|| "Local IP".to_string());
+                                let grp_tags = if !p.tags.is_empty() {
+                                    p.tags.join(", ")
+                                } else if !p.group_tag.is_empty() {
+                                    p.group_tag.clone()
+                                } else {
+                                    "—".to_string()
+                                };
+                                let short_id = p.short_id();
+                                let name = p.name.clone();
+                                let deleted_label = p.format_deleted_at();
+                                let btn_res_id = SharedString::from(format!("trash-res-{}", p.id));
+                                let btn_perm_id = SharedString::from(format!("trash-perm-{}", p.id));
+                                items.push(
                                     h_flex()
-                                        .flex_1()
-                                        .justify_end()
+                                        .w_full()
+                                        .px_4()
+                                        .py_2p5()
+                                        .gap_3()
                                         .items_center()
-                                        .gap_2()
+                                        .border_b_1()
+                                        .border_color(BonTheme::border())
+                                        .hover(|s| s.bg(BonTheme::bg_hover()))
                                         .child(
-                                            Button::new(SharedString::from(format!(
-                                                "trash-res-{}",
-                                                p.id
-                                            )))
-                                            .with_variant(BonTheme::launch_cta(cx))
-                                            .small()
-                                            .label("↩ Restore")
-                                            .on_click(cx.listener(move |app, _, window, cx| {
-                                                app.restore_trashed_profile(
-                                                    &pid_restore,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
+                                            div()
+                                                .w(px(80.))
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(short_id),
                                         )
                                         .child(
-                                            Button::new(SharedString::from(format!(
-                                                "trash-perm-{}",
-                                                p.id
-                                            )))
-                                            .danger()
-                                            .small()
-                                            .label("Delete Forever")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.request_delete(
-                                                    PendingDeleteAction::PermanentProfile(
-                                                        pid_perm.clone(),
-                                                    ),
-                                                    cx,
-                                                );
-                                            })),
+                                            div()
+                                                .w(px(180.))
+                                                .truncate()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(BonTheme::text_primary())
+                                                .child(name),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(130.))
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(grp_tags),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(150.))
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(proxy_str),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(140.))
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::warning())
+                                                .child(deleted_label),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .justify_end()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    Button::new(btn_res_id)
+                                                        .with_variant(BonTheme::launch_cta(cx))
+                                                        .small()
+                                                        .label("↩ Restore")
+                                                        .on_click(cx.listener(
+                                                            move |app, _, window, cx| {
+                                                                app.restore_trashed_profile(
+                                                                    &pid_restore,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new(btn_perm_id)
+                                                        .danger()
+                                                        .small()
+                                                        .label("Delete Forever")
+                                                        .on_click(cx.listener(
+                                                            move |app, _, _, cx| {
+                                                                app.request_delete(
+                                                                    PendingDeleteAction::PermanentProfile(
+                                                                        pid_perm.clone(),
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
                                         ),
-                                )
-                        })),
-                ),
+                                );
+                            }
+                            items
+                        }),
+                    )
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .into_any_element()
+                }),
         )
 }

@@ -335,6 +335,9 @@ bon-login flow run login_playbook --group "TikTok" \
 
 # 4. Self-heal a broken step if the website layout changes
 bon-login flow heal login_playbook 2 "TikTok US 01" click @e9
+
+# 5. Mark a dismissible banner/popup step as optional (or delete a step)
+bon-login flow step login_playbook 1 optional
 ```
 
 > **Stealth Guardrails:** `bon-login agent` automatically blocks any `agent-browser` command or flag that invokes CDP `Emulation.*` (`set viewport`, `set device`, `set geo`, `set media`, `set headers`, `--user-agent`, `--proxy`), ensuring your C++ fingerprint remains 100% intact.
@@ -349,6 +352,7 @@ Toggle **`🔌 Local API`** in the top header bar or run `bon-login serve [--por
 | :--- | :--- |
 | `GET /health` | Health check (`{"ok": true, "service": "bon-login"}`) |
 | `GET /profiles` | List all profiles, proxy metadata, tags, and live runtime status |
+| `GET /flows` | List all saved Agent Flows, required `{{vars}}`, and DOM steps |
 | `POST /profiles/<id\|name>/launch` | Launch profile via supervisor and return `{pid, cdp_port, ws_url}` |
 | `POST /profiles/<id\|name>/stop` | Gracefully stop running profile and flush cookies |
 | `POST /profiles/<id\|name>/rotate-proxy` | Trigger proxy IP rotation webhook and return new `GeoInfo` |
@@ -356,6 +360,7 @@ Toggle **`🔌 Local API`** in the top header bar or run `bon-login serve [--por
 | `POST /profiles/<id\|name>/type` | Human-type raw request body into the active browser input |
 | `POST /profiles/<id\|name>/totp` | Generate and human-type the profile's 6-digit 2FA TOTP code |
 | `POST /profiles/<id\|name>/screenshot` | Capture a PNG screenshot and return its file path |
+| `POST /profiles/<id\|name>/flow/<flow_name>` | Launch/attach profile and replay saved Agent Flow (JSON `{"vars":{...}}` or `k=v` body) |
 | `POST /arrange` | Tile all running browser windows (optional body `"960,600"`) |
 
 ```bash

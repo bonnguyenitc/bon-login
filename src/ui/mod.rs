@@ -144,6 +144,7 @@ pub struct BonLoginApp {
     pub backup_zip_input: Entity<InputState>,
     pub saved_flows: Vec<crate::launcher::AgentFlow>,
     pub flow_target_id: Option<String>,
+    pub expanded_flow_name: Option<String>,
     pub flow_save_name_input: Entity<InputState>,
     pub flow_vars_input: Entity<InputState>,
     pub clone_target_id: Option<String>,
@@ -279,11 +280,33 @@ impl BonLoginApp {
             InputState::new(window, cx).placeholder("Rotation webhook URL (http://...)")
         });
         let saved_flows = crate::launcher::list_saved_flows();
-        let selected_disk_usage = selected_profile_id
-            .as_deref()
-            .and_then(|id| crate::launcher::profile_user_data_dir(id).ok())
-            .map(|d| crate::launcher::format_bytes(crate::launcher::dir_size_bytes(&d)))
-            .unwrap_or_else(|| "0 B".to_string());
+        let selected_disk_usage = "0 B".to_string();
+        if let Some(init_sel_id) = selected_profile_id.clone() {
+            let target_id = init_sel_id.clone();
+            let init_handle = tokio_handle.clone();
+            cx.spawn(async move |this, cx| {
+                let size_str = init_handle
+                    .spawn_blocking(move || {
+                        crate::launcher::profile_user_data_dir(&target_id)
+                            .ok()
+                            .map(|d| {
+                                crate::launcher::format_bytes(crate::launcher::dir_size_bytes(&d))
+                            })
+                            .unwrap_or_else(|| "0 B".to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|_| "0 B".to_string());
+                let _ = this.update(cx, |app, cx| {
+                    if app.selected_profile_id.as_deref() == Some(init_sel_id.as_str())
+                        && app.selected_disk_usage != size_str
+                    {
+                        app.selected_disk_usage = size_str;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
         let search_sub = cx.subscribe_in(&search_input, window, {
             let search_input = search_input.clone();
             move |this, _, ev: &InputEvent, _window, cx| {
@@ -343,16 +366,18 @@ impl BonLoginApp {
                     .await;
                 let alive = this
                     .update(cx, |app, cx| {
+                        let has_running_status = app
+                            .statuses
+                            .values()
+                            .any(|st| matches!(st, ProfileStatus::Running(_)));
+                        if exited.is_empty() && external_live.is_empty() && !has_running_status {
+                            return;
+                        }
                         let mut changed = false;
                         for id in &exited {
                             app.statuses.insert(id.clone(), ProfileStatus::Stopped);
                             changed = true;
                         }
-                        let in_proc_keys: HashSet<String> = app
-                            .running_processes
-                            .lock()
-                            .map(|m| m.keys().cloned().collect())
-                            .unwrap_or_default();
                         for (pid, info) in &external_live {
                             if !matches!(
                                 app.statuses.get(pid),
@@ -361,23 +386,30 @@ impl BonLoginApp {
                                 app.statuses.get(pid),
                                 Some(ProfileStatus::Running(cur)) if cur == info
                             ) {
-                                app.statuses.insert(pid.clone(), ProfileStatus::Running(info.clone()));
+                                app.statuses
+                                    .insert(pid.clone(), ProfileStatus::Running(info.clone()));
                                 changed = true;
                             }
                         }
-                        let stale_ext: Vec<String> = app
-                            .statuses
-                            .iter()
-                            .filter(|(pid, st)| {
-                                matches!(st, ProfileStatus::Running(_))
-                                    && !in_proc_keys.contains(*pid)
-                                    && !external_live.contains_key(*pid)
-                            })
-                            .map(|(pid, _)| pid.clone())
-                            .collect();
-                        for pid in stale_ext {
-                            app.statuses.insert(pid, ProfileStatus::Stopped);
-                            changed = true;
+                        if has_running_status {
+                            let stale_ext: Vec<String> = {
+                                let proc_guard = app.running_processes.lock().ok();
+                                app.statuses
+                                    .iter()
+                                    .filter(|(pid, st)| {
+                                        matches!(st, ProfileStatus::Running(_))
+                                            && !proc_guard
+                                                .as_ref()
+                                                .is_some_and(|m| m.contains_key(*pid))
+                                            && !external_live.contains_key(*pid)
+                                    })
+                                    .map(|(pid, _)| pid.clone())
+                                    .collect()
+                            };
+                            for pid in stale_ext {
+                                app.statuses.insert(pid, ProfileStatus::Stopped);
+                                changed = true;
+                            }
                         }
                         if changed {
                             cx.notify();
@@ -459,6 +491,7 @@ impl BonLoginApp {
             backup_zip_input,
             saved_flows,
             flow_target_id: None,
+            expanded_flow_name: None,
             flow_save_name_input,
             flow_vars_input,
             clone_target_id: None,
@@ -576,14 +609,15 @@ impl BonLoginApp {
         out
     }
 
-    pub fn filtered_saved_proxies(&self) -> Vec<SavedProxy> {
+    pub fn filtered_proxy_indices(&self) -> Vec<usize> {
         self.saved_proxies
             .iter()
-            .filter(|sp| {
-                self.selected_proxy_group == "All"
-                    || sp.group_tag.eq_ignore_ascii_case(&self.selected_proxy_group)
+            .enumerate()
+            .filter_map(|(i, sp)| {
+                (self.selected_proxy_group == "All"
+                    || sp.group_tag.eq_ignore_ascii_case(&self.selected_proxy_group))
+                .then_some(i)
             })
-            .cloned()
             .collect()
     }
 
@@ -596,9 +630,9 @@ impl BonLoginApp {
 
     pub fn toggle_all_filtered_proxies_checked(&mut self, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
-            .filtered_saved_proxies()
+            .filtered_proxy_indices()
             .into_iter()
-            .map(|p| p.id)
+            .map(|i| self.saved_proxies[i].id.clone())
             .collect();
         let all_checked = !ids.is_empty() && ids.iter().all(|id| self.checked_proxy_ids.contains(id));
         if all_checked {
@@ -882,16 +916,19 @@ impl BonLoginApp {
     }
 
     pub fn check_filtered_saved_proxies(&mut self, cx: &mut Context<Self>) {
+        let filtered = self.filtered_proxy_indices();
         let ids: Vec<String> = if !self.checked_proxy_ids.is_empty() {
-            self.filtered_saved_proxies()
+            filtered
                 .into_iter()
-                .filter(|p| self.checked_proxy_ids.contains(&p.id))
-                .map(|p| p.id)
+                .filter_map(|i| {
+                    let id = &self.saved_proxies[i].id;
+                    self.checked_proxy_ids.contains(id).then(|| id.clone())
+                })
                 .collect()
         } else {
-            self.filtered_saved_proxies()
+            filtered
                 .into_iter()
-                .map(|p| p.id)
+                .map(|i| self.saved_proxies[i].id.clone())
                 .collect()
         };
         for id in ids {
@@ -935,18 +972,19 @@ impl BonLoginApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pool = self.filtered_saved_proxies();
-        if pool.is_empty() {
+        let proxy_indices = self.filtered_proxy_indices();
+        if proxy_indices.is_empty() {
             return;
         }
-        let target_profiles = self.filtered_profiles();
-        if target_profiles.is_empty() {
+        let target_indices = self.filtered_profile_indices();
+        if target_indices.is_empty() {
             return;
         }
         if let Ok(db) = self.db.lock() {
             let _ = db.with_transaction(|db| {
-                for (idx, mut prof) in target_profiles.into_iter().enumerate() {
-                    let chosen = &pool[idx % pool.len()];
+                for (idx, &prof_ix) in target_indices.iter().enumerate() {
+                    let mut prof = self.profiles[prof_ix].clone();
+                    let chosen = &self.saved_proxies[proxy_indices[idx % proxy_indices.len()]];
                     prof.proxy = Some(chosen.config.clone());
                     prof.resolved_geo = chosen.resolved_geo.clone();
                     let _ = db.upsert_profile(&prof);
@@ -1733,13 +1771,13 @@ impl BonLoginApp {
         cx.notify();
     }
 
-    pub fn filtered_profiles(&self) -> Vec<Profile> {
+    pub fn filtered_profile_indices(&self) -> Vec<usize> {
         let group_opt = (self.selected_group != "All").then_some(self.selected_group.as_str());
-        let mut out: Vec<Profile> = self
+        let mut out: Vec<usize> = self
             .profiles
             .iter()
-            .filter(|p| p.matches_filter(&self.search_query, group_opt))
-            .cloned()
+            .enumerate()
+            .filter_map(|(i, p)| p.matches_filter(&self.search_query, group_opt).then_some(i))
             .collect();
         if let Some(col) = self.sort_col {
             let asc = self.sort_asc;
@@ -1756,7 +1794,9 @@ impl BonLoginApp {
                     .map(|b| b.to_ascii_lowercase())
                     .cmp(s2.bytes().map(|b| b.to_ascii_lowercase()))
             };
-            out.sort_by(|a, b| {
+            out.sort_by(|&ia, &ib| {
+                let a = &self.profiles[ia];
+                let b = &self.profiles[ib];
                 let empty_ord = match col {
                     ProfileSortColumn::Tags => {
                         let a_empty = a.tags.is_empty() && a.group_tag.trim().is_empty();
@@ -2182,16 +2222,31 @@ impl BonLoginApp {
             return;
         }
         let pid = prof.id.clone();
+        let pid_done = pid.clone();
         let name = prof.name.clone();
-        let res = crate::launcher::wipe_profile_data(&pid);
         if self.selected_profile_id.as_deref() == Some(profile_id) {
             self.selected_disk_usage = "0 B".to_string();
         }
-        self.banner_message = Some(match res {
-            Ok(()) => format!("Wiped browser data for '{name}' (profile config kept)"),
-            Err(e) => format!("Wipe data failed: {e}"),
-        });
+        self.statuses
+            .insert(pid.clone(), ProfileStatus::Starting("Wiping...".to_string()));
+        self.banner_message = Some(format!("Wiping browser data for '{name}'..."));
         cx.notify();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || crate::launcher::wipe_profile_data(&pid))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
+            let _ = this.update(cx, |app, cx| {
+                app.statuses.insert(pid_done, ProfileStatus::Stopped);
+                app.banner_message = Some(match res {
+                    Ok(()) => format!("Wiped browser data for '{name}' (profile config kept)"),
+                    Err(e) => format!("Wipe data failed: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn reseed_checked_profiles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2542,8 +2597,38 @@ impl BonLoginApp {
         if let Ok(path) = crate::launcher::flow_file_path(flow_name) {
             let _ = std::fs::remove_file(path);
         }
+        if self.expanded_flow_name.as_deref() == Some(flow_name) {
+            self.expanded_flow_name = None;
+        }
         self.saved_flows = crate::launcher::list_saved_flows();
         self.banner_message = Some(format!("Deleted flow '{flow_name}'"));
+        cx.notify();
+    }
+
+    pub fn toggle_expanded_flow_ui(&mut self, flow_name: &str, cx: &mut Context<Self>) {
+        if self.expanded_flow_name.as_deref() == Some(flow_name) {
+            self.expanded_flow_name = None;
+        } else {
+            self.expanded_flow_name = Some(flow_name.to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn mutate_flow_step_ui(
+        &mut self,
+        flow_name: &str,
+        step_idx: usize,
+        action: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match crate::launcher::mutate_flow_step(flow_name, step_idx, action) {
+            Ok(_) => {
+                self.saved_flows = crate::launcher::list_saved_flows();
+            }
+            Err(e) => {
+                self.banner_message = Some(format!("Flow step update failed: {e}"));
+            }
+        }
         cx.notify();
     }
 
@@ -2865,7 +2950,10 @@ impl BonLoginApp {
         if let Ok(db) = self.db.lock() {
             let _ = db.delete_profile(profile_id);
         }
-        let _ = crate::launcher::wipe_profile_data(profile_id);
+        let wipe_id = profile_id.to_string();
+        self.tokio_handle.spawn_blocking(move || {
+            let _ = crate::launcher::wipe_profile_data(&wipe_id);
+        });
         self.statuses.remove(profile_id);
         self.checked_profile_ids.remove(profile_id);
         self.reload_profiles();
@@ -2922,9 +3010,11 @@ impl BonLoginApp {
                 Ok(())
             });
         }
-        for id in &ids {
-            let _ = crate::launcher::wipe_profile_data(id);
-        }
+        self.tokio_handle.spawn_blocking(move || {
+            crate::launcher::parallel_map(&ids, |id| {
+                let _ = crate::launcher::wipe_profile_data(id);
+            });
+        });
         self.reload_profiles();
         self.banner_message = Some(format!("Emptied Trash ({count} profile(s) permanently deleted)"));
         cx.notify();
@@ -3272,13 +3362,13 @@ impl BonLoginApp {
         cx.spawn(async move |this, cx| {
             let total_freed = tokio_handle
                 .spawn_blocking(move || {
-                    let mut freed = 0u64;
-                    for id in &ids {
-                        if let Ok((f, _)) = crate::launcher::clean_profile_cache(id) {
-                            freed = freed.saturating_add(f);
-                        }
-                    }
-                    freed
+                    crate::launcher::parallel_map(&ids, |id| {
+                        crate::launcher::clean_profile_cache(id)
+                            .map(|(f, _)| f)
+                            .unwrap_or(0)
+                    })
+                    .into_iter()
+                    .fold(0u64, u64::saturating_add)
                 })
                 .await
                 .unwrap_or(0);
@@ -3725,9 +3815,9 @@ impl BonLoginApp {
 
     pub fn toggle_check_all_filtered(&mut self, cx: &mut Context<Self>) {
         let filtered_ids: Vec<String> = self
-            .filtered_profiles()
+            .filtered_profile_indices()
             .into_iter()
-            .map(|p| p.id)
+            .map(|i| self.profiles[i].id.clone())
             .collect();
         if filtered_ids.is_empty() {
             return;
@@ -4575,16 +4665,15 @@ impl Render for BonLoginApp {
             }
         }
         let total_count = self.profiles.len();
-        let filtered = self.filtered_profiles();
-        let folder_counts = self.distinct_groups_with_counts();
-        let group_count = folder_counts.len();
-        let proxy_group_counts = self.distinct_proxy_groups_with_counts();
-        let selected_group = self.selected_group.clone();
-        let selected_id = self.selected_profile_id.clone();
         let active_view = self.active_view;
         let sub_tab = self.profile_sub_tab;
         let popup_modal = self.popup_modal;
-        let show_drawer = self.show_detail_drawer;
+        let group_count = if active_view == WorkspaceView::Profiles {
+            self.distinct_groups_with_counts().len()
+        } else {
+            0
+        };
+        let selected_group = self.selected_group.clone();
         let (kernel_dot, kernel_label) = match &self.kernel_info {
             Some(_) => (BonTheme::success(), "Chromium 148 Online".to_string()),
             None => (BonTheme::warning(), "Engine Missing".to_string()),
@@ -5533,18 +5622,11 @@ impl Render for BonLoginApp {
                                             )
                                     }))
                                     // GenLogin Table + Right-Hand `Detail` Drawer
-                                    .child(render_profile_table(
-                                        &filtered,
-                                        &self.statuses,
-                                        selected_id.as_deref(),
-                                        &self.selected_disk_usage,
-                                        &self.checked_profile_ids,
-                                        self.col_vis,
-                                        self.sort_col,
-                                        self.sort_asc,
-                                        show_drawer,
-                                        cx,
-                                    ))
+                                    .child({
+                                        let filtered_indices: std::rc::Rc<[usize]> =
+                                            self.filtered_profile_indices().into();
+                                        render_profile_table(self, filtered_indices, cx)
+                                    })
                                     .with_animation(
                                         "subtab-local-enter",
                                         BonTheme::ui_enter_anim(),
@@ -5562,6 +5644,7 @@ impl Render for BonLoginApp {
                             .into_any_element(),
                         WorkspaceView::EditProfile => {
                             if let Some(modal) = self.modal.as_ref() {
+                                let proxy_group_counts = self.distinct_proxy_groups_with_counts();
                                 render_edit_profile_view(
                                     modal,
                                     &self.saved_groups,

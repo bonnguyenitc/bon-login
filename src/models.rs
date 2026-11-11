@@ -238,7 +238,7 @@ impl GpuSpoofMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProxyProtocol {
     Http,
     Socks5,
@@ -1078,86 +1078,28 @@ fn decode_base32(input: &str) -> Option<Vec<u8>> {
 }
 
 fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
-    let mut key_block = [0u8; 64];
-    if key.len() > 64 {
-        let hashed = sha1_digest(key);
-        key_block[..20].copy_from_slice(&hashed);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
+    unsafe extern "C" {
+        fn CCHmac(
+            algorithm: u32,
+            key: *const core::ffi::c_void,
+            key_length: usize,
+            data: *const core::ffi::c_void,
+            data_length: usize,
+            mac_out: *mut core::ffi::c_void,
+        );
     }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= key_block[i];
-        opad[i] ^= key_block[i];
-    }
-    let mut inner = Vec::with_capacity(64 + message.len());
-    inner.extend_from_slice(&ipad);
-    inner.extend_from_slice(message);
-    let inner_hash = sha1_digest(&inner);
-
-    let mut outer = Vec::with_capacity(64 + 20);
-    outer.extend_from_slice(&opad);
-    outer.extend_from_slice(&inner_hash);
-    sha1_digest(&outer)
-}
-
-fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xEFCDAB89;
-    let mut h2: u32 = 0x98BADCFE;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xC3D2E1F0;
-
-    let bit_len = (data.len() as u64) * 8;
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-                _ => (b ^ c ^ d, 0xCA62C1D6u32),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
+    const K_CC_HMAC_ALG_SHA1: u32 = 0;
     let mut out = [0u8; 20];
-    out[0..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    unsafe {
+        CCHmac(
+            K_CC_HMAC_ALG_SHA1,
+            key.as_ptr().cast(),
+            key.len(),
+            message.as_ptr().cast(),
+            message.len(),
+            out.as_mut_ptr().cast(),
+        );
+    }
     out
 }
 
@@ -1385,5 +1327,14 @@ mod tests {
                 "https://youtube.com"
             ]
         );
+
+        // Case-insensitive ASCII & non-letter 0x20 bitmask boundary checks
+        for pad in [0usize, 1, 14, 15, 16, 17, 31, 32, 33] {
+            let hay = format!("{}TikTokShop-Account", "x".repeat(pad));
+            assert!(contains_ignore_ascii_case(&hay, "tiktokshop"));
+            assert!(!contains_ignore_ascii_case(&hay, "tiktokshopz"));
+        }
+        assert!(!contains_ignore_ascii_case("@@@@@@@@@@@@@@@@@@@@", "`"));
+        assert!(contains_ignore_ascii_case("@@@@@@@@@@@@@@@@@@@`", "`"));
     }
 }

@@ -16,14 +16,22 @@ use crate::db::Database;
 use crate::launcher::RunningProcess;
 use crate::ui::BonLoginApp;
 
-fn main() {
-    let tokio_rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to start Tokio runtime");
-    let tokio_handle = tokio_rt.handle().clone();
+fn stop_all_processes(procs: &Mutex<HashMap<String, RunningProcess>>) {
+    let drained: Vec<Mutex<RunningProcess>> = procs
+        .lock()
+        .map(|mut map| map.drain().map(|(_, p)| Mutex::new(p)).collect())
+        .unwrap_or_default();
+    crate::launcher::parallel_map(&drained, |slot| {
+        if let Ok(mut proc) = slot.lock() {
+            proc.stop_gracefully();
+        }
+    });
+}
 
-    if let Some(res) = crate::launcher::try_run_cli(&tokio_handle) {
+fn main() {
+    if std::env::args_os().nth(1).is_some()
+        && let Some(res) = crate::launcher::try_run_cli()
+    {
         if let Err(e) = res {
             eprintln!(
                 "{}",
@@ -36,6 +44,9 @@ fn main() {
         }
         return;
     }
+
+    let tokio_rt = crate::launcher::build_tokio_runtime();
+    let tokio_handle = tokio_rt.handle().clone();
     let db = Database::open_default().expect("Failed to open bonlogin.sqlite3");
 
     let running_processes: Arc<Mutex<HashMap<String, RunningProcess>>> =
@@ -60,11 +71,7 @@ fn main() {
         cx.on_app_quit(move |_| {
             let procs = quit_procs.clone();
             async move {
-                if let Ok(mut map) = procs.lock() {
-                    for (_, mut proc) in map.drain() {
-                        proc.stop_gracefully();
-                    }
-                }
+                stop_all_processes(&procs);
             }
         })
         .detach();
@@ -97,9 +104,5 @@ fn main() {
         cx.activate(true);
     });
 
-    if let Ok(mut map) = cleanup_processes.lock() {
-        for (_, mut proc) in map.drain() {
-            proc.stop_gracefully();
-        }
-    }
+    stop_all_processes(&cleanup_processes);
 }

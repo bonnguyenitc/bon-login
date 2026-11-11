@@ -101,16 +101,17 @@ async fn read_until_double_crlf(stream: &mut TcpStream) -> Result<(Vec<u8>, Vec<
         if n == 0 {
             bail!("Unexpected EOF while reading HTTP headers");
         }
+        let scan_from = buf.len().saturating_sub(3);
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(idx) = find_double_crlf(&buf) {
-            let header_end = idx + 4;
+        if let Some(rel) = find_double_crlf(&buf[scan_from..]) {
+            let header_end = scan_from + rel + 4;
             let body_prefix = buf.split_off(header_end);
             return Ok((buf, body_prefix));
         }
     }
 }
 
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
@@ -597,5 +598,12 @@ mod tests {
             .unwrap()
             .unwrap_or(0);
         assert_eq!(n, 0, "Expected open client socket to close upon tunnel.stop()");
+
+        for prefix_len in [0usize, 1, 12, 15, 16, 17, 31, 32, 48] {
+            let mut hdr = vec![b'A'; prefix_len];
+            hdr.extend_from_slice(b"\r\nX: 1\r\r\n\r\nBODY");
+            assert_eq!(find_double_crlf(&hdr), Some(prefix_len + 7));
+        }
+        assert_eq!(find_double_crlf(b"\r\n\r"), None);
     }
 }

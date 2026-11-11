@@ -73,72 +73,18 @@ pub fn locate_chromium_kernel() -> Option<KernelInfo> {
             version_label: "Applications/Chromium.app".to_string(),
         });
     }
-
     None
 }
 
-/// Pure-Rust SHA-256 implementation (FIPS 180-4) for computing Chrome 32-char extension IDs (`a-p`) from SPKI DER keys.
+/// Computes SHA-256 via macOS CommonCrypto for Chrome 32-char extension IDs (`a-p`).
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0);
+    unsafe extern "C" {
+        fn CC_SHA256(data: *const core::ffi::c_void, len: u32, md: *mut u8) -> *mut u8;
     }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
-    }
+    let len_u32 = u32::try_from(data.len()).expect("sha256 input exceeds 4 GiB");
     let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    unsafe {
+        let _ = CC_SHA256(data.as_ptr().cast(), len_u32, out.as_mut_ptr());
     }
     out
 }
@@ -605,7 +551,7 @@ pub fn is_placeholder_extension_dir(dir: &Path) -> bool {
 
 /// Discovers enabled unpacked Chrome extensions inside `~/Library/Application Support/com.bonlogin.app/extensions/*`.
 pub fn discover_unpacked_extensions() -> Vec<PathBuf> {
-    if let Ok(db) = crate::db::Database::open_fast()
+    if let Ok(db) = crate::db::Database::open_default()
         && let Ok(exts) = db.list_extensions()
     {
         let mut enabled_paths = Vec::new();
@@ -872,7 +818,44 @@ fn pick_icon_badge(name: &str) -> (String, u32) {
     (label, palette[hash % palette.len()])
 }
 
+fn macos_clonefile(src: &Path, dst: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn clonefile(
+            src: *const std::ffi::c_char,
+            dst: *const std::ffi::c_char,
+            flags: u32,
+        ) -> std::ffi::c_int;
+    }
+    let (Ok(c_src), Ok(c_dst)) = (
+        CString::new(src.as_os_str().as_bytes()),
+        CString::new(dst.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    unsafe { clonefile(c_src.as_ptr(), c_dst.as_ptr(), 0) == 0 }
+}
+
+fn clonefile_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if dst.exists() {
+        let _ = std::fs::remove_file(dst);
+    }
+    if macos_clonefile(src, dst) {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).map(|_| ())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if !dst.exists() {
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if macos_clonefile(src, dst) {
+            return Ok(());
+        }
+    }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -881,7 +864,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &dest_path)?;
         } else {
-            std::fs::copy(entry.path(), dest_path)?;
+            clonefile_or_copy(&entry.path(), &dest_path)?;
         }
     }
     Ok(())
@@ -1212,7 +1195,7 @@ document.getElementById('grab-btn').onclick = async () => {
 
 /// Downloads any enabled remote extensions (Chrome Web Store ID or URL) that are still placeholders on disk.
 pub async fn sync_enabled_remote_extensions() {
-    let enabled_remote: Vec<BrowserExtension> = crate::db::Database::open_fast()
+    let enabled_remote: Vec<BrowserExtension> = crate::db::Database::open_default()
         .ok()
         .and_then(|db| db.list_extensions().ok())
         .unwrap_or_default()
@@ -1229,6 +1212,9 @@ pub async fn sync_enabled_remote_extensions() {
             is_remote && is_placeholder_extension_dir(&dir)
         })
         .collect();
+    if enabled_remote.is_empty() {
+        return;
+    }
 
     let mut set = tokio::task::JoinSet::new();
     for ext in enabled_remote {
@@ -1236,7 +1222,7 @@ pub async fn sync_enabled_remote_extensions() {
             let store_url = ext.source_url.trim().to_string();
             let eid = ext.id;
             let still_enabled = || {
-                crate::db::Database::open_fast()
+                crate::db::Database::open_default()
                     .ok()
                     .and_then(|db| db.list_extensions().ok())
                     .is_some_and(|list| list.iter().any(|e| e.id == eid && e.enabled))
@@ -1248,7 +1234,7 @@ pub async fn sync_enabled_remote_extensions() {
             if let Ok(downloaded) =
                 download_extension_from_url_cancellable(&store_url, Some(&eid), &cancelled).await
             {
-                if let Ok(db) = crate::db::Database::open_fast() {
+                if let Ok(db) = crate::db::Database::open_default() {
                     if db
                         .list_extensions()
                         .ok()
@@ -1279,37 +1265,51 @@ pub fn remove_extension_files(ext_id: &str) {
     }
 }
 
-/// Removes macOS Gatekeeper quarantine attributes (`com.apple.quarantine`) from the `.app` bundle once per session.
+/// Removes macOS Gatekeeper quarantine attributes (`com.apple.quarantine`) when present on the `.app` bundle.
 pub fn unquarantine_macos_app(binary_path: &Path) {
-    #[cfg(target_os = "macos")]
-    {
-        use std::collections::HashSet;
-        use std::sync::{LazyLock, Mutex};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
 
-        static UNQUARANTINED: LazyLock<Mutex<HashSet<PathBuf>>> =
-            LazyLock::new(|| Mutex::new(HashSet::new()));
-        let target = binary_path
-            .ancestors()
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
-            .unwrap_or(binary_path)
-            .to_path_buf();
-
-        if let Ok(mut set) = UNQUARANTINED.lock()
-            && !set.insert(target.clone())
-        {
-            return;
+    fn has_quarantine_xattr(p: &Path) -> bool {
+        unsafe extern "C" {
+            fn getxattr(
+                path: *const std::ffi::c_char,
+                name: *const std::ffi::c_char,
+                value: *mut std::ffi::c_void,
+                size: usize,
+                position: u32,
+                options: std::ffi::c_int,
+            ) -> isize;
         }
-        let _ = Command::new("xattr")
-            .args(["-cr", &target.to_string_lossy()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let Ok(c_path) = CString::new(p.as_os_str().as_bytes()) else {
+            return true;
+        };
+        unsafe {
+            getxattr(
+                c_path.as_ptr(),
+                c"com.apple.quarantine".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            ) >= 0
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = binary_path;
+
+    let target = binary_path
+        .ancestors()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        .unwrap_or(binary_path);
+
+    if !has_quarantine_xattr(target) && !has_quarantine_xattr(binary_path) {
+        return;
     }
+    let _ = Command::new("xattr")
+        .args(["-cr", &target.to_string_lossy()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 pub const ADRYFISH_MACOS_DMG_URL: &str = "https://github.com/adryfish/fingerprint-chromium/releases/download/148.0.7778.215/ungoogled-chromium_148.0.7778.215-1.1_macos.dmg";
 pub const ADRYFISH_MACOS_VERSION_DIR: &str = "chromium-148.0.7778.215";
@@ -1423,11 +1423,31 @@ fn launch_error_file_path(profile_id: &str) -> PathBuf {
         .join("bon_launch_error.txt")
 }
 
+fn unix_pid_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+fn unix_send_signal(pid: u32, sig: i32) {
+    if pid > 0 && pid <= i32::MAX as u32 {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe {
+            let _ = kill(pid as i32, sig);
+        }
+    }
+}
+
 /// Checks whether a profile currently has a live Chromium instance with an open window.
 pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
     let prof_dir = app_support_dir().join("profiles").join(profile_id);
     let rt_path = prof_dir.join("bon_runtime.json");
-    let active_port_path = prof_dir.join("DevToolsActivePort");
 
     let Ok(raw) = std::fs::read_to_string(&rt_path) else {
         return None;
@@ -1436,17 +1456,10 @@ pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
         return None;
     };
 
-    let pid_alive = info.pid > 0
-        && Command::new("kill")
-            .args(["-0", &info.pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+    let pid_alive = info.pid > 0 && unix_pid_alive(info.pid);
     if info.pid > 0 && !pid_alive {
         let _ = std::fs::remove_file(&rt_path);
-        let _ = std::fs::remove_file(&active_port_path);
+        let _ = std::fs::remove_file(prof_dir.join("DevToolsActivePort"));
         return None;
     }
 
@@ -1456,7 +1469,7 @@ pub fn probe_live_runtime(profile_id: &str) -> Option<RuntimeInfo> {
         None if pid_alive => Some(info),
         None => {
             let _ = std::fs::remove_file(&rt_path);
-            let _ = std::fs::remove_file(&active_port_path);
+            let _ = std::fs::remove_file(prof_dir.join("DevToolsActivePort"));
             None
         }
     }
@@ -1478,15 +1491,7 @@ fn flush_prelaunch_state_if_needed(short_id: &str, cdp_port: u16, ws_url: &str) 
 fn singleton_lock_pid(user_data_dir: &Path) -> Option<u32> {
     let target = std::fs::read_link(user_data_dir.join("SingletonLock")).ok()?;
     let pid: u32 = target.to_string_lossy().rsplit('-').next()?.parse().ok()?;
-    (pid > 0
-        && Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success()))
-    .then_some(pid)
+    unix_pid_alive(pid).then_some(pid)
 }
 
 fn cleanup_stale_singleton_locks(user_data_dir: &Path) {
@@ -1499,6 +1504,24 @@ fn cleanup_stale_singleton_locks(user_data_dir: &Path) {
 }
 
 /// Gracefully stops a profile launched by another process (CLI daemon or previous session).
+fn close_agent_browser_session_async(short_id: &str) {
+    if short_id.is_empty() {
+        return;
+    }
+    let session = format!("bon_{short_id}");
+    if let Ok(mut child) = agent_browser_cmd_for_short_id(short_id)
+        .args(["--session", &session, "close"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
     let prof_dir = app_support_dir().join("profiles").join(profile_id);
     let rt_path = prof_dir.join("bon_runtime.json");
@@ -1524,32 +1547,17 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
         if info.pid > 0 {
             #[cfg(unix)]
             {
-                let pid_s = info.pid.to_string();
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid_s])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                for _ in 0..40 {
-                    let alive = Command::new("kill")
-                        .args(["-0", &pid_s])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success());
-                    if !alive {
+                unix_send_signal(info.pid, 15);
+                for i in 0..45 {
+                    if !unix_pid_alive(info.pid) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    let wait_ms = if i < 10 { 15 } else { 50 };
+                    std::thread::sleep(Duration::from_millis(wait_ms));
                 }
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid_s])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                if unix_pid_alive(info.pid) {
+                    unix_send_signal(info.pid, 9);
+                }
             }
             stopped_any = true;
         } else if let Some(list_body) = cdp_http_get_body(info.cdp_port, "/json/list")
@@ -1566,14 +1574,8 @@ pub fn stop_external_runtime(profile_id: &str, short_id: &str) -> bool {
 
     let removed_files =
         std::fs::remove_file(&rt_path).is_ok() || std::fs::remove_file(&active_port_path).is_ok();
-    if (stopped_any || removed_files) && !short_id.is_empty() {
-        let session = format!("bon_{short_id}");
-        let _ = agent_browser_cmd_for_short_id(short_id)
-            .args(["--session", &session, "close"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if stopped_any || removed_files {
+        close_agent_browser_session_async(short_id);
     }
     stopped_any || removed_files
 }
@@ -1610,7 +1612,7 @@ pub fn wipe_profile_data(profile_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn dir_size_bytes(path: &Path) -> u64 {
+fn dir_size_bytes_seq(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
@@ -1623,7 +1625,7 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
             continue;
         }
         if ft.is_dir() {
-            total = total.saturating_add(dir_size_bytes(&entry.path()));
+            total = total.saturating_add(dir_size_bytes_seq(&entry.path()));
         } else if ft.is_file()
             && let Ok(meta) = entry.metadata()
         {
@@ -1631,6 +1633,66 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
         }
     }
     total
+}
+
+pub fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(items.len());
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<R>>> =
+        (0..items.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= items.len() {
+                        break;
+                    }
+                    let val = f(&items[i]);
+                    if let Ok(mut guard) = slots[i].lock() {
+                        *guard = Some(val);
+                    }
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .filter_map(|m| m.into_inner().ok().flatten())
+        .collect()
+}
+
+pub fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    let mut subdirs = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            subdirs.push(entry.path());
+        } else if ft.is_file()
+            && let Ok(meta) = entry.metadata()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    let sub_sum = parallel_map(&subdirs, |d| dir_size_bytes_seq(d))
+        .into_iter()
+        .fold(0u64, u64::saturating_add);
+    total.saturating_add(sub_sum)
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -2406,9 +2468,15 @@ pub fn save_prelaunch_cookies(short_id: &str, raw: &str) -> Result<()> {
     Ok(())
 }
 pub fn copy_prelaunch_cookies(src_short_id: &str, dst_short_id: &str) {
-    let raw = read_prelaunch_cookies(src_short_id);
-    if !raw.trim().is_empty() {
-        let _ = save_prelaunch_cookies(dst_short_id, &raw);
+    if src_short_id.is_empty() || dst_short_id.is_empty() {
+        return;
+    }
+    let states = app_support_dir().join("states");
+    let src = states.join(format!("bon_{src_short_id}_prelaunch.json"));
+    if src.is_file() {
+        let _ = std::fs::create_dir_all(&states);
+        let dst = states.join(format!("bon_{dst_short_id}_prelaunch.json"));
+        let _ = clonefile_or_copy(&src, &dst);
     }
 }
 
@@ -2595,14 +2663,18 @@ pub fn parse_devtools_active_port(contents: &str) -> Result<(u16, String)> {
 /// Queries CDP `/json/list` over loopback to check whether any browser tab/window (`page` or `app`) is still open.
 /// On macOS, clicking the red close button closes the window while leaving the Chromium process idle in the Dock.
 pub fn cdp_has_open_window(cdp_port: u16) -> Option<bool> {
+    #[derive(serde::Deserialize)]
+    struct CdpTargetType<'a> {
+        #[serde(borrow, rename = "type", default)]
+        kind: std::borrow::Cow<'a, str>,
+    }
     let body = cdp_http_get_body(cdp_port, "/json/list")?;
-    let items: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
-    let arr = items.as_array()?;
-    Some(arr.iter().any(|item| {
-        item.get("type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| matches!(t, "page" | "app" | "webview"))
-    }))
+    let items: Vec<CdpTargetType<'_>> = serde_json::from_str(body.trim()).ok()?;
+    Some(
+        items
+            .iter()
+            .any(|item| matches!(item.kind.as_ref(), "page" | "app" | "webview")),
+    )
 }
 
 pub struct RunningProcess {
@@ -2648,21 +2720,14 @@ impl RunningProcess {
         if self.is_process_running() {
             flush_prelaunch_state_if_needed(&self.short_id, self.info.cdp_port, &self.info.ws_url);
             #[cfg(unix)]
-            {
-                let pid = self.child.id().to_string();
-                let _ = Command::new("kill")
-                    .args(["-TERM", &pid])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
+            unix_send_signal(self.child.id(), 15);
 
-            for _ in 0..40 {
+            for i in 0..45 {
                 if let Ok(Some(_)) = self.child.try_wait() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                let wait_ms = if i < 10 { 15 } else { 50 };
+                std::thread::sleep(Duration::from_millis(wait_ms));
             }
         }
 
@@ -2683,15 +2748,7 @@ impl RunningProcess {
             );
         }
 
-        if !self.short_id.is_empty() {
-            let session = format!("bon_{}", self.short_id);
-            let _ = agent_browser_cmd_for_short_id(&self.short_id)
-                .args(["--session", &session, "close"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
+        close_agent_browser_session_async(&self.short_id);
     }
 }
 
@@ -2703,21 +2760,32 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         )
     })?;
 
-    let (mut tunnel, newly_resolved_geo) = if let Some(proxy_cfg) = &profile.proxy {
-        let mut tun = crate::proxy_tunnel::LocalProxyTunnel::start(proxy_cfg.clone()).await?;
-        let port = tun.local_port();
-        match crate::geoip::resolve_geo_via_port(Some(port)).await {
-            Ok(geo) => (Some(tun), Some(geo)),
-            Err(e) => {
-                tun.stop();
-                return Err(anyhow!("Proxy check failed (Fail-Closed): {e}"));
-            }
-        }
-    } else if profile.custom_timezone.is_none() && profile.resolved_geo.is_none() {
-        (None, crate::geoip::resolve_geo_via_port(None).await.ok())
-    } else {
-        (None, None)
+    let kernel_path_for_prep = kernel.path.clone();
+    let prep_fut = async move {
+        tokio::task::spawn_blocking(move || unquarantine_macos_app(&kernel_path_for_prep))
+            .await
+            .ok();
+        sync_enabled_remote_extensions().await;
     };
+    let geo_fut = async {
+        if let Some(proxy_cfg) = &profile.proxy {
+            let mut tun = crate::proxy_tunnel::LocalProxyTunnel::start(proxy_cfg.clone()).await?;
+            let port = tun.local_port();
+            match crate::geoip::resolve_geo_via_port(Some(port)).await {
+                Ok(geo) => Ok::<_, anyhow::Error>((Some(tun), Some(geo))),
+                Err(e) => {
+                    tun.stop();
+                    Err(anyhow!("Proxy check failed (Fail-Closed): {e}"))
+                }
+            }
+        } else if profile.custom_timezone.is_none() && profile.resolved_geo.is_none() {
+            Ok((None, crate::geoip::resolve_geo_via_port(None).await.ok()))
+        } else {
+            Ok((None, None))
+        }
+    };
+    let (geo_res, ()) = tokio::join!(geo_fut, prep_fut);
+    let (mut tunnel, newly_resolved_geo) = geo_res?;
 
     let local_proxy_port = tunnel.as_ref().map(|t| t.local_port());
     let user_data_dir = match profile_user_data_dir(&profile.id) {
@@ -2737,8 +2805,6 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     cleanup_stale_singleton_locks(&user_data_dir);
     let _ = profile_download_dir(&profile.short_id());
     ensure_profile_bookmarks(profile, &user_data_dir);
-    unquarantine_macos_app(&kernel.path);
-    sync_enabled_remote_extensions().await;
     let args = build_chromium_args(
         profile,
         local_proxy_port,
@@ -2791,7 +2857,7 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
     let pid = child_guard.child.as_ref().map(Child::id).unwrap_or(0);
     let mut cdp_endpoint: Option<(u16, String)> = None;
 
-    for _ in 0..200 {
+    for i in 0..218 {
         if let Ok(contents) = std::fs::read_to_string(&active_port_file)
             && let Ok(parsed) = parse_devtools_active_port(&contents)
         {
@@ -2808,7 +2874,8 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
             bail!("Chromium exited early with status {status} before opening DevToolsActivePort");
         }
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let poll_ms = if i < 30 { 10 } else { 25 };
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
 
     let (cdp_port, ws_url) = match cdp_endpoint {
@@ -2830,14 +2897,16 @@ pub async fn launch_profile(profile: &Profile) -> Result<(RunningProcess, Option
         local_proxy_port,
     };
     let mut saw_window = false;
-    for _ in 0..120 {
+    for i in 0..135 {
         if cdp_has_open_window(cdp_port) == Some(true) {
             saw_window = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let poll_ms = if i < 25 { 10 } else { 25 };
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
     let short_id = profile.short_id();
+    clear_flow_session_cache(&short_id);
     let prelaunch_cookies = read_prelaunch_cookies(&short_id);
     if !prelaunch_cookies.trim().is_empty() {
         let sid = short_id.clone();
@@ -2928,9 +2997,10 @@ fn cdp_http_get_body(cdp_port: u16, path: &str) -> Option<String> {
         if n == 0 {
             return None;
         }
+        let scan_from = buf.len().saturating_sub(3);
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
+        if let Some(rel) = crate::proxy_tunnel::find_double_crlf(&buf[scan_from..]) {
+            break scan_from + rel + 4;
         }
         if buf.len() > 65536 {
             return None;
@@ -3663,7 +3733,7 @@ pub fn ensure_agent_browser_connected(short_id: &str, ws_url: &str) -> Result<St
                 "--session",
                 &session,
                 "--input-mode",
-                "instant",
+                "human",
                 "connect",
                 ws_url,
             ])
@@ -4139,7 +4209,7 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
         if ft.is_dir() {
             copy_dir_filtered(&src_path, &dst_path)?;
         } else if ft.is_file() {
-            let _ = std::fs::copy(&src_path, &dst_path);
+            let _ = clonefile_or_copy(&src_path, &dst_path);
         }
     }
     Ok(())
@@ -4147,6 +4217,13 @@ fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
 
 /// Exports a full profile archive (`.zip`) containing `profile_metadata.json`, `prelaunch_cookies.json`,
 /// and its essential `user_data` directory (Cookies, LocalStorage, IndexedDB, Extension storage) into `~/Downloads/`.
+struct StageDirGuard(PathBuf);
+impl Drop for StageDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub fn export_profile_archive_zip(profile: &Profile) -> Result<PathBuf> {
     let backups_dir = crate::db::user_downloads_dir();
     std::fs::create_dir_all(&backups_dir)?;
@@ -4161,9 +4238,12 @@ pub fn export_profile_archive_zip(profile: &Profile) -> Result<PathBuf> {
     let _ = std::fs::remove_file(&zip_path);
 
     let nonce = rand::random::<u32>();
-    let stage_dir = std::env::temp_dir().join(format!("bonlogin_pack_{short_id}_{nonce}"));
+    let stage_dir = app_support_dir()
+        .join("backups")
+        .join(format!(".stage_pack_{short_id}_{nonce}"));
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir)?;
+    let _stage_guard = StageDirGuard(stage_dir.clone());
 
     let meta_json = serde_json::to_string_pretty(profile)?;
     std::fs::write(stage_dir.join("profile_metadata.json"), meta_json)?;
@@ -4183,7 +4263,6 @@ pub fn export_profile_archive_zip(profile: &Profile) -> Result<PathBuf> {
         .args(["-r", "-q", &zip_path.to_string_lossy(), "."])
         .status()
         .context("Failed to execute /usr/bin/zip")?;
-    let _ = std::fs::remove_dir_all(&stage_dir);
 
     if !status.success() {
         bail!("Failed to create profile backup archive (.zip)");
@@ -4201,9 +4280,12 @@ pub fn import_profile_archive_zip(
         bail!("Backup archive not found: {}", zip_path.display());
     }
     let nonce = rand::random::<u32>();
-    let stage_dir = std::env::temp_dir().join(format!("bonlogin_unpack_{nonce}"));
+    let stage_dir = app_support_dir()
+        .join("backups")
+        .join(format!(".stage_unpack_{nonce}"));
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir)?;
+    let _stage_guard = StageDirGuard(stage_dir.clone());
 
     let status = Command::new("/usr/bin/unzip")
         .args([
@@ -4216,13 +4298,11 @@ pub fn import_profile_archive_zip(
         .status()
         .context("Failed to execute /usr/bin/unzip")?;
     if !status.success() {
-        let _ = std::fs::remove_dir_all(&stage_dir);
         bail!("Invalid or corrupted .zip archive");
     }
 
     let meta_path = stage_dir.join("profile_metadata.json");
     if !meta_path.is_file() {
-        let _ = std::fs::remove_dir_all(&stage_dir);
         bail!("Archive does not contain profile_metadata.json");
     }
     let meta_raw = std::fs::read_to_string(&meta_path)?;
@@ -4251,7 +4331,6 @@ pub fn import_profile_archive_zip(
         let _ = copy_dir_filtered(&user_data_stage, &dst_dir);
     }
 
-    let _ = std::fs::remove_dir_all(&stage_dir);
     Ok(profile)
 }
 
@@ -4558,7 +4637,7 @@ fn profile_summary_json(p: &Profile) -> serde_json::Value {
         "pid": live.as_ref().map(|r| r.pid),
         "cdp_port": live.as_ref().map(|r| r.cdp_port),
         "ws_url": live.as_ref().map(|r| r.ws_url.clone()),
-        "download_dir": profile_download_dir(&sid),
+        "download_dir": app_support_dir().join("downloads").join(format!("bon_{sid}")),
         "cli": format!("agent-browser --session {session} snapshot -i -c"),
     })
 }
@@ -4659,6 +4738,22 @@ pub async fn rotate_and_check_proxy_live(cfg: &ProxyConfig) -> Result<(String, G
     Ok((rotate_msg, geo))
 }
 
+pub fn arrange_running_windows(profiles: &[Profile], win_w: i32, win_h: i32) -> (usize, usize) {
+    let running: Vec<RuntimeInfo> = parallel_map(profiles, |p| probe_live_runtime(&p.id))
+        .into_iter()
+        .flatten()
+        .collect();
+    let bounds = compute_tile_bounds(0, 0, 1920, 1080, win_w, win_h, running.len());
+    let pairs: Vec<_> = running.iter().zip(bounds.iter()).collect();
+    let arranged = parallel_map(&pairs, |(rt, (l, t, w, h))| {
+        cdp_set_window_bounds(rt.cdp_port, &rt.ws_url, *l, *t, *w, *h).is_ok()
+    })
+    .into_iter()
+    .filter(|&ok| ok)
+    .count();
+    (arranged, running.len())
+}
+
 fn print_cli_help() {
     println!(
         "BonLogin — Full CLI & Agent-Browser Control Plane\n\n\
@@ -4682,6 +4777,7 @@ fn print_cli_help() {
            bon-login flow save <flow_name> <id|name> [--var k=literal]   Save profile's recent agent steps as reusable flow\n  \
            bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v] [--from-step <n>]\n  \
            bon-login flow heal <flow_name> <step_idx> <id|name> <ab args...>  Self-heal broken step & update flow\n  \
+           bon-login flow step <flow_name> <step_idx> <optional|required|delete>\n  \
            bon-login flow history <id|name> [--clear]                    Inspect or clear auto-recorded profile steps\n  \
            bon-login flow delete <flow_name>                             Delete a saved flow\n\n\
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
@@ -4732,7 +4828,29 @@ fn print_cli_help() {
     );
 }
 
-pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> {
+pub fn build_tokio_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+            }
+            // QOS_CLASS_USER_INITIATED (0x19) schedules interactive workers on Apple Silicon P-cores
+            unsafe {
+                let _ = pthread_set_qos_class_self_np(0x19, 0);
+            }
+        })
+        .build()
+        .expect("Failed to start Tokio runtime")
+}
+
+fn cli_tokio_handle() -> &'static tokio::runtime::Handle {
+    static CLI_RT: std::sync::LazyLock<tokio::runtime::Runtime> =
+        std::sync::LazyLock::new(build_tokio_runtime);
+    CLI_RT.handle()
+}
+
+pub fn try_run_cli() -> Option<Result<()>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first()?.as_str();
 
@@ -4747,14 +4865,22 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
                 let profile = find_profile_by_query(&profiles, profile_id)?.clone();
                 let err_file = launch_error_file_path(&profile.id);
                 let _ = std::fs::remove_file(&err_file);
-                match tokio_handle.block_on(launch_profile(&profile)) {
+                match cli_tokio_handle().block_on(launch_profile(&profile)) {
                     Ok((mut running, maybe_geo)) => {
                         if let Some(geo) = &maybe_geo {
                             let _ = db.update_resolved_geo(&profile.id, Some(geo));
                         }
                         let _ = db.touch_last_launched(&profile.id);
-                        while running.is_alive() {
-                            std::thread::sleep(Duration::from_millis(800));
+                        let mut tick = 0u8;
+                        loop {
+                            if !running.is_process_running() {
+                                break;
+                            }
+                            if tick.is_multiple_of(16) && !running.is_alive() {
+                                break;
+                            }
+                            tick = tick.wrapping_add(1);
+                            std::thread::sleep(Duration::from_millis(50));
                         }
                         running.stop_gracefully();
                         Ok(())
@@ -4810,14 +4936,14 @@ pub fn try_run_cli(tokio_handle: &tokio::runtime::Handle) -> Option<Result<()>> 
             "totp" | "2fa" => run_totp_cli(&args[1..]),
             "screenshot" | "shot" => run_screenshot_cli(&args[1..]),
             "broadcast" | "multi" => run_broadcast_cli(&args[1..]),
-            "serve" | "server" => tokio_handle.block_on(run_serve_cli(&args[1..])),
+            "serve" | "server" => cli_tokio_handle().block_on(run_serve_cli(&args[1..])),
             "agent" | "ab" => run_agent_cli(&args[1..]),
             "flow" | "flows" => run_flow_subcommand(&args[1..]),
-            "profile" | "profiles" => run_profile_subcommand(tokio_handle, &args[1..]),
-            "proxy" | "proxies" => run_proxy_subcommand(tokio_handle, &args[1..]),
+            "profile" | "profiles" => run_profile_subcommand(&args[1..]),
+            "proxy" | "proxies" => run_proxy_subcommand(&args[1..]),
             "group" | "groups" => run_group_subcommand(&args[1..]),
             "tag" | "tags" => run_tag_subcommand(&args[1..]),
-            "ext" | "extension" | "extensions" => run_ext_subcommand(tokio_handle, &args[1..]),
+            "ext" | "extension" | "extensions" => run_ext_subcommand(&args[1..]),
             "kernel" => run_kernel_subcommand(&args[1..]),
             "--help" | "-h" | "help" => {
                 print_cli_help();
@@ -4847,11 +4973,11 @@ fn run_profile_list_cli(args: &[String]) -> Result<()> {
     }
     let db = crate::db::Database::open_default()?;
     let profiles = db.list_profiles()?;
-    let items: Vec<serde_json::Value> = profiles
+    let matched: Vec<&Profile> = profiles
         .iter()
         .filter(|p| p.matches_filter(&search_query, group_filter.as_deref()))
-        .map(profile_summary_json)
         .collect();
+    let items: Vec<serde_json::Value> = parallel_map(&matched, |p| profile_summary_json(p));
     println!("{}", serde_json::to_string_pretty(&items)?);
     Ok(())
 }
@@ -4924,13 +5050,14 @@ fn run_stop_cli(args: &[String]) -> Result<()> {
     let (targets, _) = select_profiles_by_target(&profiles, args).map_err(|_| {
         anyhow!("Usage: bon-login stop <short_id|name|--group <g>|--all>")
     })?;
-    let mut stopped = Vec::new();
-    for p in &targets {
-        let did_stop = stop_external_runtime(&p.id, &p.short_id());
-        if did_stop || !is_all {
-            stopped.push(p.short_id());
-        }
-    }
+    let stopped: Vec<String> = parallel_map(&targets, |p| {
+        let sid = p.short_id();
+        let did_stop = stop_external_runtime(&p.id, &sid);
+        (did_stop || !is_all).then_some(sid)
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -4972,10 +5099,7 @@ fn select_profiles_by_target(
     Ok((out, 1))
 }
 
-fn run_profile_subcommand(
-    tokio_handle: &tokio::runtime::Handle,
-    args: &[String],
-) -> Result<()> {
+fn run_profile_subcommand(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     let rest = if args.is_empty() { &[] } else { &args[1..] };
     let db = crate::db::Database::open_default()?;
@@ -5089,21 +5213,24 @@ fn run_profile_subcommand(
             let src = find_profile_by_query(&profiles, target)?;
             let src_sid = src.short_id();
             let mut created = Vec::new();
-            for i in 1..=count {
-                let mut c = src.cloned_with_new_seed();
-                if let Some(prefix) = &custom_name {
-                    c.name = if count == 1 {
-                        prefix.clone()
-                    } else {
-                        format!("{prefix}-{i:02}")
-                    };
-                } else if count > 1 {
-                    c.name = format!("{} (Copy {i})", src.name);
+            db.with_transaction(|db| {
+                for i in 1..=count {
+                    let mut c = src.cloned_with_new_seed();
+                    if let Some(prefix) = &custom_name {
+                        c.name = if count == 1 {
+                            prefix.clone()
+                        } else {
+                            format!("{prefix}-{i:02}")
+                        };
+                    } else if count > 1 {
+                        c.name = format!("{} (Copy {i})", src.name);
+                    }
+                    copy_prelaunch_cookies(&src_sid, &c.short_id());
+                    db.upsert_profile(&c)?;
+                    created.push(profile_summary_json(&c));
                 }
-                copy_prelaunch_cookies(&src_sid, &c.short_id());
-                db.upsert_profile(&c)?;
-                created.push(profile_summary_json(&c));
-            }
+                Ok(())
+            })?;
             println!("{}", serde_json::to_string_pretty(&created)?);
             Ok(())
         }
@@ -5200,9 +5327,9 @@ fn run_profile_subcommand(
             let mut out = Vec::new();
             for p in targets {
                 let res = if let Some(cfg) = &p.proxy {
-                    tokio_handle.block_on(check_proxy_config_live(cfg))
+                    cli_tokio_handle().block_on(check_proxy_config_live(cfg))
                 } else {
-                    tokio_handle.block_on(crate::geoip::resolve_geo_via_port(None))
+                    cli_tokio_handle().block_on(crate::geoip::resolve_geo_via_port(None))
                 };
                 match res {
                     Ok(geo) => {
@@ -5252,7 +5379,7 @@ fn run_profile_subcommand(
                     }));
                     continue;
                 };
-                match tokio_handle.block_on(rotate_and_check_proxy_live(cfg)) {
+                match cli_tokio_handle().block_on(rotate_and_check_proxy_live(cfg)) {
                     Ok((rot_msg, geo)) => {
                         let _ = db.sync_geo_for_proxy_endpoint(cfg, &geo);
                         out.push(serde_json::json!({
@@ -5736,10 +5863,7 @@ fn select_proxies_by_target(
     Ok((out, 1))
 }
 
-fn run_proxy_subcommand(
-    tokio_handle: &tokio::runtime::Handle,
-    args: &[String],
-) -> Result<()> {
+fn run_proxy_subcommand(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     let rest = if args.is_empty() { &[] } else { &args[1..] };
     let db = crate::db::Database::open_default()?;
@@ -5809,21 +5933,24 @@ fn run_proxy_subcommand(
             };
             let mut existing_count = db.list_proxies()?.len();
             let mut added = Vec::new();
-            for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                if let Some((cfg, inline_name)) =
-                    ProxyConfig::parse_with_optional_name(line, default_proto)?
-                {
-                    existing_count += 1;
-                    let name = explicit_name
-                        .clone()
-                        .or(inline_name)
-                        .unwrap_or_else(|| format!("Proxy #{existing_count:02}"));
-                    let mut sp = SavedProxy::new(name, tag.clone(), cfg);
-                    sp.expired_at = expire_ts;
-                    db.upsert_proxy(&sp)?;
-                    added.push(saved_proxy_summary_json(&sp));
+            db.with_transaction(|db| {
+                for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if let Some((cfg, inline_name)) =
+                        ProxyConfig::parse_with_optional_name(line, default_proto)?
+                    {
+                        existing_count += 1;
+                        let name = explicit_name
+                            .clone()
+                            .or(inline_name)
+                            .unwrap_or_else(|| format!("Proxy #{existing_count:02}"));
+                        let mut sp = SavedProxy::new(name, tag.clone(), cfg);
+                        sp.expired_at = expire_ts;
+                        db.upsert_proxy(&sp)?;
+                        added.push(saved_proxy_summary_json(&sp));
+                    }
                 }
-            }
+                Ok(())
+            })?;
             println!("{}", serde_json::to_string_pretty(&added)?);
             Ok(())
         }
@@ -5880,36 +6007,39 @@ fn run_proxy_subcommand(
             let count = targets.len();
             let mut updated = Vec::new();
             let all_profiles = db.list_profiles().unwrap_or_default();
-            for (i, mut sp) in targets.drain(..).enumerate() {
-                if let Some(n) = &new_name {
-                    sp.name = if count == 1 {
-                        n.clone()
-                    } else {
-                        format!("{n}-{:02}", i + 1)
-                    };
-                }
-                if let Some(t) = &new_tag {
-                    sp.group_tag = t.clone();
-                }
-                if let Some(exp) = new_expire {
-                    sp.expired_at = exp;
-                }
-                if let Some(rot) = &new_rotate_url {
-                    sp.config.change_ip_url = rot.clone();
-                    for mut prof in all_profiles.iter().cloned() {
-                        if let Some(cfg) = prof.proxy.as_mut()
-                            && cfg.protocol == sp.config.protocol
-                            && cfg.host == sp.config.host
-                            && cfg.port == sp.config.port
-                        {
-                            cfg.change_ip_url = rot.clone();
-                            let _ = db.upsert_profile(&prof);
+            db.with_transaction(|db| {
+                for (i, mut sp) in targets.drain(..).enumerate() {
+                    if let Some(n) = &new_name {
+                        sp.name = if count == 1 {
+                            n.clone()
+                        } else {
+                            format!("{n}-{:02}", i + 1)
+                        };
+                    }
+                    if let Some(t) = &new_tag {
+                        sp.group_tag = t.clone();
+                    }
+                    if let Some(exp) = new_expire {
+                        sp.expired_at = exp;
+                    }
+                    if let Some(rot) = &new_rotate_url {
+                        sp.config.change_ip_url = rot.clone();
+                        for mut prof in all_profiles.iter().cloned() {
+                            if let Some(cfg) = prof.proxy.as_mut()
+                                && cfg.protocol == sp.config.protocol
+                                && cfg.host == sp.config.host
+                                && cfg.port == sp.config.port
+                            {
+                                cfg.change_ip_url = rot.clone();
+                                let _ = db.upsert_profile(&prof);
+                            }
                         }
                     }
+                    db.upsert_proxy(&sp)?;
+                    updated.push(saved_proxy_summary_json(&sp));
                 }
-                db.upsert_proxy(&sp)?;
-                updated.push(saved_proxy_summary_json(&sp));
-            }
+                Ok(())
+            })?;
             println!("{}", serde_json::to_string_pretty(&updated)?);
             Ok(())
         }
@@ -5950,7 +6080,7 @@ fn run_proxy_subcommand(
             let (targets, _) = select_proxies_by_target(&proxies, rest)?;
             let mut results = Vec::new();
             for sp in targets {
-                match tokio_handle.block_on(check_proxy_config_live(&sp.config)) {
+                match cli_tokio_handle().block_on(check_proxy_config_live(&sp.config)) {
                     Ok(geo) => {
                         let _ = db.sync_geo_for_proxy_endpoint(&sp.config, &geo);
                         results.push(serde_json::json!({
@@ -5983,7 +6113,7 @@ fn run_proxy_subcommand(
             let mut results = Vec::new();
             let mut any_failed = false;
             for sp in targets {
-                match tokio_handle.block_on(rotate_and_check_proxy_live(&sp.config)) {
+                match cli_tokio_handle().block_on(rotate_and_check_proxy_live(&sp.config)) {
                     Ok((rot_msg, geo)) => {
                         let _ = db.sync_geo_for_proxy_endpoint(&sp.config, &geo);
                         results.push(serde_json::json!({
@@ -6247,10 +6377,7 @@ fn run_tag_subcommand(args: &[String]) -> Result<()> {
     }
 }
 
-fn run_ext_subcommand(
-    tokio_handle: &tokio::runtime::Handle,
-    args: &[String],
-) -> Result<()> {
+fn run_ext_subcommand(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     let rest = if args.is_empty() { &[] } else { &args[1..] };
     let db = crate::db::Database::open_default()?;
@@ -6297,7 +6424,7 @@ fn run_ext_subcommand(
                     let dir = ensure_extension_unpacked(&ext)?;
                     if is_placeholder_extension_dir(&dir) && !ext.source_url.trim().is_empty() {
                         let downloaded =
-                            tokio_handle.block_on(download_extension_from_url(&ext.source_url))?;
+                            cli_tokio_handle().block_on(download_extension_from_url(&ext.source_url))?;
                         ext.folder_path = downloaded.folder_path;
                     }
                 }
@@ -6327,7 +6454,7 @@ fn run_ext_subcommand(
             let ext = if Path::new(src).exists() {
                 install_extension_from_file(Path::new(src))?
             } else {
-                tokio_handle.block_on(download_extension_from_url(src))?
+                cli_tokio_handle().block_on(download_extension_from_url(src))?
             };
             db.upsert_extension(&ext)?;
             let rt = resolve_extension_runtime_info(&ext);
@@ -6474,23 +6601,13 @@ fn run_arrange_cli(args: &[String]) -> Result<()> {
         parse_window_size(raw_size).ok_or_else(|| anyhow!("Invalid --size '{raw_size}' (use W,H)"))?;
     let db = crate::db::Database::open_default()?;
     let profiles = db.list_profiles()?;
-    let running: Vec<(String, RuntimeInfo)> = profiles
-        .into_iter()
-        .filter_map(|p| probe_live_runtime(&p.id).map(|rt| (p.short_id(), rt)))
-        .collect();
-    let bounds = compute_tile_bounds(0, 0, 1920, 1080, win_w, win_h, running.len());
-    let mut arranged = 0usize;
-    for ((_, rt), (l, t, w, h)) in running.iter().zip(bounds.iter()) {
-        if cdp_set_window_bounds(rt.cdp_port, &rt.ws_url, *l, *t, *w, *h).is_ok() {
-            arranged += 1;
-        }
-    }
+    let (arranged, total_running) = arrange_running_windows(&profiles, win_w, win_h);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "ok": true,
             "arranged": arranged,
-            "total_running": running.len(),
+            "total_running": total_running,
             "window_size": [win_w, win_h],
         }))?
     );
@@ -6669,28 +6786,110 @@ pub fn handle_control_http_request(
                 serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
             ),
         },
+        ("GET", "/flows") => {
+            let items: Vec<serde_json::Value> = list_saved_flows()
+                .into_iter()
+                .map(|flow| {
+                    let vars = extract_flow_vars(&flow);
+                    serde_json::json!({
+                        "name": flow.name,
+                        "domain": flow.domain,
+                        "steps_count": flow.steps.len(),
+                        "vars": vars,
+                        "updated_at": flow.updated_at,
+                        "steps": flow.steps,
+                    })
+                })
+                .collect();
+            (
+                200,
+                serde_json::json!({"ok": true, "flows": items}).to_string(),
+            )
+        }
         ("POST", "/arrange") => {
             let (w, h) = parse_window_size(body).unwrap_or((960, 600));
             let profiles = db.list_profiles().unwrap_or_default();
-            let running: Vec<RuntimeInfo> = profiles
-                .into_iter()
-                .filter_map(|p| probe_live_runtime(&p.id))
-                .collect();
-            let bounds = compute_tile_bounds(0, 0, 1920, 1080, w, h, running.len());
-            let mut arranged = 0usize;
-            for (rt, (l, t, bw, bh)) in running.iter().zip(bounds.iter()) {
-                if cdp_set_window_bounds(rt.cdp_port, &rt.ws_url, *l, *t, *bw, *bh).is_ok() {
-                    arranged += 1;
-                }
-            }
+            let (arranged, total) = arrange_running_windows(&profiles, w, h);
             (
                 200,
-                serde_json::json!({"ok": true, "arranged": arranged, "total": running.len()})
-                    .to_string(),
+                serde_json::json!({"ok": true, "arranged": arranged, "total": total}).to_string(),
             )
         }
         ("POST", p_path) if p_path.starts_with("/profiles/") => {
             let rest = &p_path["/profiles/".len()..];
+            if let Some((target, flow_raw)) = rest
+                .split_once("/flow/")
+                .or_else(|| rest.split_once("/flows/"))
+            {
+                let target_decoded = percent_decode(target);
+                let flow_decoded = percent_decode(flow_raw);
+                let profiles = db.list_profiles().unwrap_or_default();
+                let profile = match find_profile_by_query(&profiles, &target_decoded) {
+                    Ok(p) => p.clone(),
+                    Err(e) => {
+                        return (
+                            404,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        );
+                    }
+                };
+                let clean_flow = match sanitize_flow_name(&flow_decoded) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return (
+                            400,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        );
+                    }
+                };
+                let Ok(fl_path) = flow_file_path(&clean_flow) else {
+                    return (
+                        400,
+                        serde_json::json!({"ok": false, "error": "Invalid flow name"}).to_string(),
+                    );
+                };
+                if !fl_path.is_file() {
+                    return (
+                        404,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("Flow '{clean_flow}' not found"),
+                        })
+                        .to_string(),
+                    );
+                }
+                let info = match ensure_profile_launched_via_supervisor(&db, &profile) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        return (
+                            500,
+                            serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                        );
+                    }
+                };
+                let vars = parse_flow_vars_body(body);
+                return match run_flow_on_live_session(
+                    &clean_flow,
+                    &profile,
+                    &info.ws_url,
+                    &vars,
+                ) {
+                    Ok(steps) => (
+                        200,
+                        serde_json::json!({
+                            "ok": true,
+                            "flow": clean_flow,
+                            "short_id": profile.short_id(),
+                            "executed_steps": steps,
+                        })
+                        .to_string(),
+                    ),
+                    Err(e) => (
+                        500,
+                        serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                    ),
+                };
+            }
             let Some((target, action)) = rest.rsplit_once('/') else {
                 return (
                     404,
@@ -6698,7 +6897,7 @@ pub fn handle_control_http_request(
                         .to_string(),
                 );
             };
-            let target_decoded = target.replace("%20", " ");
+            let target_decoded = percent_decode(target);
             let profiles = db.list_profiles().unwrap_or_default();
             let profile = match find_profile_by_query(&profiles, &target_decoded) {
                 Ok(p) => p.clone(),
@@ -7437,6 +7636,7 @@ pub fn match_ref_dom_attrs_from_nodes(
 fn fetch_refs_dom_attrs(
     short_id: &str,
     session: &str,
+    ws_url: &str,
     refs: &[String],
     snap_map: &std::collections::HashMap<String, SnapshotRefMeta>,
 ) -> std::collections::HashMap<String, RefDomAttrs> {
@@ -7455,7 +7655,16 @@ fn fetch_refs_dom_attrs(
         type: el.getAttribute('type') || ''
     })))"#;
     let Ok(out) = agent_browser_cmd_for_short_id(short_id)
-        .args(["--session", session, "eval", js])
+        .args([
+            "--session",
+            session,
+            "--cdp",
+            ws_url,
+            "--input-mode",
+            "human",
+            "eval",
+            js,
+        ])
         .output()
     else {
         return std::collections::HashMap::new();
@@ -7666,6 +7875,7 @@ pub fn build_flow_step_from_cmd(
 fn prepare_recorded_steps(
     short_id: &str,
     session: &str,
+    ws_url: &str,
     ab_args: &[String],
 ) -> Vec<FlowStep> {
     let cmds = unpack_agent_commands(ab_args);
@@ -7684,7 +7894,7 @@ fn prepare_recorded_steps(
     let dom_attrs = if refs_to_query.is_empty() {
         std::collections::HashMap::new()
     } else {
-        fetch_refs_dom_attrs(short_id, session, &refs_to_query, &snap_map)
+        fetch_refs_dom_attrs(short_id, session, ws_url, &refs_to_query, &snap_map)
     };
     cmds.iter()
         .filter_map(|c| build_flow_step_from_cmd(c, &snap_map, &dom_attrs))
@@ -7715,6 +7925,8 @@ pub fn load_flow_from_path(path: &Path, default_name: &str) -> AgentFlow {
         })
 }
 
+static FLOW_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn save_flow_to_path(path: &Path, flow: &mut AgentFlow) -> Result<()> {
     flow.updated_at = unix_now();
     if flow.domain.is_empty()
@@ -7727,14 +7939,37 @@ pub fn save_flow_to_path(path: &Path, flow: &mut AgentFlow) -> Result<()> {
         flow.domain = extract_domain_from_url(first_url);
     }
     let json = serde_json::to_string_pretty(flow)?;
-    std::fs::write(path, json)?;
+    let tmp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::write(&tmp_path, json)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     Ok(())
+}
+
+fn promote_flow_step_locator(path: &Path, default_name: &str, step_idx: usize, winning_loc: &str) {
+    let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut fresh = load_flow_from_path(path, default_name);
+    if let Some(st) = fresh.steps.get_mut(step_idx)
+        && let Some(pos) = st.locators.iter().position(|l| l == winning_loc)
+        && pos > 0
+    {
+        let winner = st.locators.remove(pos);
+        st.locators.insert(0, winner);
+        let _ = save_flow_to_path(path, &mut fresh);
+    }
 }
 
 fn append_steps_to_flow_path(path: &Path, name: &str, new_steps: &[FlowStep]) {
     if new_steps.is_empty() {
         return;
     }
+    let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut flow = load_flow_from_path(path, name);
     for step in new_steps {
         if flow.steps.last() != Some(step) {
@@ -7786,22 +8021,27 @@ pub fn parameterize_flow_steps(
     sorted.sort_by_key(|(_, lit)| std::cmp::Reverse(lit.len()));
     for (var_name, literal) in sorted {
         let placeholder = format!("{{{{{var_name}}}}}");
-        let replace_field = |target: &mut String| {
+        let is_secret_var = matches!(
+            var_name.to_ascii_lowercase().as_str(),
+            "pass" | "password" | "pwd" | "secret" | "otp" | "totp" | "pin" | "code"
+        );
+        let replace_field = |target: &mut String, is_open_url: bool| {
             if *target == *literal {
                 *target = placeholder.clone();
-            } else if literal.len() >= 4 && target.contains(literal.as_str()) {
+            } else if literal.len() >= 4
+                && (!is_open_url || (!is_secret_var && !literal.contains('@')))
+                && target.contains(literal.as_str())
+            {
                 *target = target.replace(literal, &placeholder);
             }
         };
         for step in steps.iter_mut() {
-            if step.op == "open" {
-                continue;
-            }
+            let is_open = step.op == "open";
             if let Some(val) = &mut step.value {
-                replace_field(val);
+                replace_field(val, is_open);
             }
             for extra in &mut step.extra_args {
-                replace_field(extra);
+                replace_field(extra, is_open);
             }
         }
     }
@@ -7838,7 +8078,7 @@ fn run_agent_browser_with_reconnect(
     validate_stealth_agent_args(args)?;
     let run_once = || {
         agent_browser_cmd_for_short_id(short_id)
-            .args(["--session", session, "--input-mode", "instant"])
+            .args(["--session", session, "--cdp", ws_url, "--input-mode", "human"])
             .args(args)
             .output()
             .context("Failed to execute agent-browser")
@@ -7886,7 +8126,7 @@ fn run_agent_cli(args: &[String]) -> Result<()> {
     let info = ensure_profile_launched_via_supervisor(&db, &profile)?;
     let session = format!("bon_{short_id}");
 
-    let prepared_steps = prepare_recorded_steps(&short_id, &session, rest);
+    let prepared_steps = prepare_recorded_steps(&short_id, &session, &info.ws_url, rest);
     let out = run_agent_browser_with_reconnect(&short_id, &session, &info.ws_url, rest)?;
 
     if out.status.success() {
@@ -7929,83 +8169,84 @@ pub fn build_locator_candidate_commands(
     value: Option<&str>,
     extra_args: &[String],
 ) -> Vec<Vec<String>> {
+    let find_supported = extra_args.is_empty() && matches!(op, "click" | "fill" | "check" | "hover");
+
     if let Some(rest) = locator.strip_prefix("role:") {
+        if !find_supported {
+            return Vec::new();
+        }
         let (role, name) = rest.split_once(':').unwrap_or((rest, ""));
-        let find_action = match op {
-            "click" | "fill" | "check" | "hover" => Some(op),
-            "type" => Some("fill"),
-            _ => None,
-        };
-        if let Some(act) = find_action {
-            let mut candidates = Vec::new();
-            if !name.is_empty() {
-                let mut exact_cmd = vec![
-                    "find".to_string(),
-                    "role".to_string(),
-                    role.to_string(),
-                    act.to_string(),
-                    "--name".to_string(),
-                    name.to_string(),
-                    "--exact".to_string(),
-                ];
-                if let Some(v) = value {
-                    exact_cmd.push(v.to_string());
-                }
-                candidates.push(exact_cmd);
-
-                let mut sub_cmd = vec![
-                    "find".to_string(),
-                    "role".to_string(),
-                    role.to_string(),
-                    act.to_string(),
-                    "--name".to_string(),
-                    name.to_string(),
-                ];
-                if let Some(v) = value {
-                    sub_cmd.push(v.to_string());
-                }
-                candidates.push(sub_cmd);
-            } else {
-                let mut role_only = vec![
-                    "find".to_string(),
-                    "role".to_string(),
-                    role.to_string(),
-                    act.to_string(),
-                ];
-                if let Some(v) = value {
-                    role_only.push(v.to_string());
-                }
-                candidates.push(role_only);
+        let mut candidates = Vec::new();
+        if !name.is_empty() {
+            let mut exact_cmd = vec![
+                "find".to_string(),
+                "role".to_string(),
+                role.to_string(),
+                op.to_string(),
+                "--name".to_string(),
+                name.to_string(),
+                "--exact".to_string(),
+            ];
+            if let Some(v) = value {
+                exact_cmd.push(v.to_string());
             }
-            return candidates;
+            candidates.push(exact_cmd);
+
+            let mut sub_cmd = vec![
+                "find".to_string(),
+                "role".to_string(),
+                role.to_string(),
+                op.to_string(),
+                "--name".to_string(),
+                name.to_string(),
+            ];
+            if let Some(v) = value {
+                sub_cmd.push(v.to_string());
+            }
+            candidates.push(sub_cmd);
+        } else {
+            let mut role_only = vec![
+                "find".to_string(),
+                "role".to_string(),
+                role.to_string(),
+                op.to_string(),
+            ];
+            if let Some(v) = value {
+                role_only.push(v.to_string());
+            }
+            candidates.push(role_only);
         }
-        return Vec::new();
+        return candidates;
     }
 
-    if let Some(text) = locator.strip_prefix("text:") {
-        let mut cmd = vec![
+    if let Some((kind, target_val)) = locator
+        .strip_prefix("text:")
+        .map(|t| ("text", t))
+        .or_else(|| locator.strip_prefix("label:").map(|l| ("label", l)))
+    {
+        if !find_supported {
+            return Vec::new();
+        }
+        let mut exact_cmd = vec![
             "find".to_string(),
-            "text".to_string(),
-            text.to_string(),
+            kind.to_string(),
+            target_val.to_string(),
+            op.to_string(),
+            "--exact".to_string(),
+        ];
+        if let Some(v) = value {
+            exact_cmd.push(v.to_string());
+        }
+        let mut sub_cmd = vec![
+            "find".to_string(),
+            kind.to_string(),
+            target_val.to_string(),
             op.to_string(),
         ];
         if let Some(v) = value {
-            cmd.push(v.to_string());
+            sub_cmd.push(v.to_string());
         }
-        return vec![cmd];
-    }
-
-    if let Some(label) = locator.strip_prefix("label:") {
-        let mut cmd = vec![
-            "find".to_string(),
-            "label".to_string(),
-            label.to_string(),
-            op.to_string(),
-        ];
-        if let Some(v) = value {
-            cmd.push(v.to_string());
-        }
-        return vec![cmd];
+        return vec![exact_cmd, sub_cmd];
     }
 
     let mut cmd = vec![op.to_string(), locator.to_string()];
@@ -8014,6 +8255,55 @@ pub fn build_locator_candidate_commands(
     }
     cmd.extend_from_slice(extra_args);
     vec![cmd]
+}
+
+pub fn match_semantic_locator_in_snapshot(
+    loc: &str,
+    snap_map: &std::collections::HashMap<String, SnapshotRefMeta>,
+) -> Option<String> {
+    let mut sorted: Vec<(&String, &SnapshotRefMeta)> = snap_map.iter().collect();
+    sorted.sort_by_key(|(k, _)| k.trim_start_matches('e').parse::<u32>().unwrap_or(0));
+
+    if let Some(rest) = loc.strip_prefix("role:") {
+        let (role, name) = rest.split_once(':').unwrap_or((rest, ""));
+        if let Some((k, _)) = sorted.iter().find(|(_, m)| {
+            m.role.eq_ignore_ascii_case(role)
+                && (name.is_empty() || m.name.eq_ignore_ascii_case(name))
+        }) {
+            return Some((*k).clone());
+        }
+        if !name.is_empty() {
+            let needle = name.to_ascii_lowercase();
+            if let Some((k, _)) = sorted.iter().find(|(_, m)| {
+                m.role.eq_ignore_ascii_case(role) && m.name.to_ascii_lowercase().contains(&needle)
+            }) {
+                return Some((*k).clone());
+            }
+        }
+        return None;
+    }
+
+    if let Some(target_val) = loc
+        .strip_prefix("text:")
+        .or_else(|| loc.strip_prefix("label:"))
+    {
+        if let Some((k, _)) = sorted
+            .iter()
+            .find(|(_, m)| m.name.eq_ignore_ascii_case(target_val))
+        {
+            return Some((*k).clone());
+        }
+        if !target_val.is_empty() {
+            let needle = target_val.to_ascii_lowercase();
+            if let Some((k, _)) = sorted
+                .iter()
+                .find(|(_, m)| m.name.to_ascii_lowercase().contains(&needle))
+            {
+                return Some((*k).clone());
+            }
+        }
+    }
+    None
 }
 
 pub fn execute_single_flow_step(
@@ -8058,9 +8348,8 @@ pub fn execute_single_flow_step(
             build_locator_candidate_commands(&step.op, &loc, sub_value.as_deref(), &sub_extra);
 
         if candidates.is_empty()
-            && let Some(rest) = loc.strip_prefix("role:")
+            && (loc.starts_with("role:") || loc.starts_with("text:") || loc.starts_with("label:"))
         {
-            let (role, name) = rest.split_once(':').unwrap_or((rest, ""));
             match run_ab(&[
                 "snapshot".to_string(),
                 "-i".to_string(),
@@ -8069,10 +8358,7 @@ pub fn execute_single_flow_step(
             ]) {
                 Ok(snap_out) => {
                     let snap_map = parse_snapshot_refs(&String::from_utf8_lossy(&snap_out.stdout));
-                    if let Some((ref_key, _)) = snap_map.iter().find(|(_, m)| {
-                        m.role.eq_ignore_ascii_case(role)
-                            && (name.is_empty() || m.name.eq_ignore_ascii_case(name))
-                    }) {
+                    if let Some(ref_key) = match_semantic_locator_in_snapshot(&loc, &snap_map) {
                         let mut cmd = vec![step.op.clone(), format!("@{ref_key}")];
                         if let Some(v) = &sub_value {
                             cmd.push(v.clone());
@@ -8193,6 +8479,81 @@ pub fn parse_flow_vars_text(raw: &str) -> std::collections::HashMap<String, Stri
     map
 }
 
+pub fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn parse_flow_vars_body(raw: &str) -> std::collections::HashMap<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(obj) = val
+            .get("vars")
+            .and_then(|v| v.as_object())
+            .or_else(|| val.as_object())
+    {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in obj {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => continue,
+                other => other.to_string(),
+            };
+            map.insert(k.clone(), s);
+        }
+        return map;
+    }
+    parse_flow_vars_text(raw)
+}
+
+pub fn mutate_flow_step(flow_raw: &str, step_idx: usize, action: &str) -> Result<AgentFlow> {
+    let clean_name = sanitize_flow_name(flow_raw)?;
+    let path = flow_file_path(&clean_name)?;
+    let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !path.is_file() {
+        bail!("Flow '{}' not found at {}", clean_name, path.display());
+    }
+    let mut flow = load_flow_from_path(&path, &clean_name);
+    if step_idx >= flow.steps.len() {
+        bail!(
+            "step_index {step_idx} out of range (flow '{}' has {} steps)",
+            clean_name,
+            flow.steps.len()
+        );
+    }
+    match action {
+        "optional" => flow.steps[step_idx].optional = true,
+        "required" => flow.steps[step_idx].optional = false,
+        "toggle" => flow.steps[step_idx].optional = !flow.steps[step_idx].optional,
+        "delete" | "rm" | "remove" => {
+            flow.steps.remove(step_idx);
+        }
+        other => bail!(
+            "Unknown step action '{other}' (expected optional, required, toggle, or delete)"
+        ),
+    }
+    save_flow_to_path(&path, &mut flow)?;
+    Ok(flow)
+}
+
 pub fn run_flow_on_live_session(
     flow_name: &str,
     profile: &Profile,
@@ -8204,7 +8565,7 @@ pub fn run_flow_on_live_session(
     if !path.is_file() {
         bail!("Flow '{}' not found", clean_name);
     }
-    let mut flow = load_flow_from_path(&path, &clean_name);
+    let flow = load_flow_from_path(&path, &clean_name);
     if flow.steps.is_empty() {
         bail!("Flow '{}' has 0 steps", clean_name);
     }
@@ -8217,16 +8578,13 @@ pub fn run_flow_on_live_session(
         .or_insert_with(|| short_id.clone());
     vars.entry("profile.notes".to_string())
         .or_insert_with(|| profile.notes.clone());
-    let mut flow_dirty = false;
     let mut executed = 0usize;
     for step_idx in 0..flow.steps.len() {
         let step = flow.steps[step_idx].clone();
         match execute_single_flow_step(&short_id, &session, ws_url, &step, &vars) {
-            Ok((winning_loc_idx, _)) => {
-                if winning_loc_idx > 0 && winning_loc_idx < flow.steps[step_idx].locators.len() {
-                    let winner = flow.steps[step_idx].locators.remove(winning_loc_idx);
-                    flow.steps[step_idx].locators.insert(0, winner);
-                    flow_dirty = true;
+            Ok((winning_loc_idx, matched_loc)) => {
+                if winning_loc_idx > 0 {
+                    promote_flow_step_locator(&path, &clean_name, step_idx, &matched_loc);
                 }
                 executed += 1;
             }
@@ -8234,15 +8592,9 @@ pub fn run_flow_on_live_session(
                 if step.optional {
                     continue;
                 }
-                if flow_dirty {
-                    let _ = save_flow_to_path(&path, &mut flow);
-                }
                 bail!("Step #{} ({}) failed: {e}", step_idx + 1, step.op);
             }
         }
-    }
-    if flow_dirty {
-        let _ = save_flow_to_path(&path, &mut flow);
     }
     Ok(executed)
 }
@@ -8402,7 +8754,7 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             if !path.is_file() {
                 bail!("Flow '{}' not found at {}", flow_name, path.display());
             }
-            let mut flow = load_flow_from_path(&path, &flow_name);
+            let flow = load_flow_from_path(&path, &flow_name);
             if flow.steps.is_empty() {
                 bail!("Flow '{}' has 0 steps", flow_name);
             }
@@ -8434,7 +8786,6 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             }
 
             let mut profile_results = Vec::new();
-            let mut flow_dirty = false;
             let mut any_failed = false;
 
             for profile in &targets {
@@ -8458,13 +8809,13 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                     match execute_single_flow_step(&short_id, &session, &info.ws_url, &step, &vars)
                     {
                         Ok((winning_loc_idx, matched_locator)) => {
-                            if winning_loc_idx > 0
-                                && winning_loc_idx < flow.steps[step_idx].locators.len()
-                            {
-                                let winner =
-                                    flow.steps[step_idx].locators.remove(winning_loc_idx);
-                                flow.steps[step_idx].locators.insert(0, winner);
-                                flow_dirty = true;
+                            if winning_loc_idx > 0 {
+                                promote_flow_step_locator(
+                                    &path,
+                                    &flow_name,
+                                    step_idx,
+                                    &matched_locator,
+                                );
                             }
                             executed.push(serde_json::json!({
                                 "step": step_idx,
@@ -8484,7 +8835,17 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                             }
                             any_failed = true;
                             let snap_out = agent_browser_cmd_for_short_id(&short_id)
-                                .args(["--session", &session, "snapshot", "-i", "-c"])
+                                .args([
+                                    "--session",
+                                    &session,
+                                    "--cdp",
+                                    &info.ws_url,
+                                    "--input-mode",
+                                    "human",
+                                    "snapshot",
+                                    "-i",
+                                    "-c",
+                                ])
                                 .output()
                                 .ok();
                             let snap_txt = snap_out
@@ -8538,10 +8899,6 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                 }
             }
 
-            if flow_dirty {
-                let _ = save_flow_to_path(&path, &mut flow);
-            }
-
             let out_json = if profile_results.len() == 1 {
                 profile_results.remove(0)
             } else {
@@ -8575,12 +8932,12 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             if !path.is_file() {
                 bail!("Flow '{}' not found at {}", flow_name, path.display());
             }
-            let mut flow = load_flow_from_path(&path, &flow_name);
-            if step_idx >= flow.steps.len() {
+            let init_flow = load_flow_from_path(&path, &flow_name);
+            if step_idx >= init_flow.steps.len() {
                 bail!(
                     "step_index {step_idx} out of range (flow '{}' has {} steps)",
                     flow_name,
-                    flow.steps.len()
+                    init_flow.steps.len()
                 );
             }
 
@@ -8591,7 +8948,8 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             let info = ensure_profile_launched_via_supervisor(&db, profile)?;
             let session = format!("bon_{short_id}");
 
-            let mut healed_steps = prepare_recorded_steps(&short_id, &session, &ab_args);
+            let mut healed_steps =
+                prepare_recorded_steps(&short_id, &session, &info.ws_url, &ab_args);
             let healed_step = healed_steps.pop().ok_or_else(|| {
                 anyhow!("Command did not produce a recordable DOM step for healing")
             })?;
@@ -8605,16 +8963,27 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                 );
             }
 
-            let mut updated_step = healed_step;
-            // Preserve parameterized {{var}} value from original step if the op still takes a value
-            if let Some(orig_val) = &flow.steps[step_idx].value
-                && orig_val.contains("{{")
-                && updated_step.value.is_some()
-            {
-                updated_step.value = Some(orig_val.clone());
-            }
-            flow.steps[step_idx] = updated_step.clone();
-            save_flow_to_path(&path, &mut flow)?;
+            let updated_step = {
+                let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let mut flow = load_flow_from_path(&path, &flow_name);
+                if step_idx >= flow.steps.len() {
+                    bail!(
+                        "step_index {step_idx} out of range (flow '{}' now has {} steps)",
+                        flow_name,
+                        flow.steps.len()
+                    );
+                }
+                let mut next_step = healed_step;
+                if let Some(orig_val) = &flow.steps[step_idx].value
+                    && orig_val.contains("{{")
+                    && next_step.value.is_some()
+                {
+                    next_step.value = Some(orig_val.clone());
+                }
+                flow.steps[step_idx] = next_step.clone();
+                save_flow_to_path(&path, &mut flow)?;
+                next_step
+            };
 
             println!(
                 "{}",
@@ -8627,6 +8996,27 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                         "bon-login flow run {flow_name} {short_id} --from-step {}",
                         step_idx + 1
                     ),
+                }))?
+            );
+            Ok(())
+        }
+        "step" => {
+            if rest.len() < 3 {
+                bail!(
+                    "Usage: bon-login flow step <flow_name> <step_index> <optional|required|toggle|delete>"
+                );
+            }
+            let step_idx: usize = rest[1]
+                .parse()
+                .context("step_index must be a non-negative integer")?;
+            let updated = mutate_flow_step(&rest[0], step_idx, &rest[2])?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "flow": updated.name,
+                    "steps_count": updated.steps.len(),
+                    "steps": updated.steps,
                 }))?
             );
             Ok(())
@@ -8651,7 +9041,7 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => bail!(
-            "Unknown flow subcommand '{other}' (expected list, show, save, run, heal, history, delete)"
+            "Unknown flow subcommand '{other}' (expected list, show, save, run, heal, step, history, delete)"
         ),
     }
 }
@@ -8854,7 +9244,7 @@ mod tests {
             return;
         };
 
-        let prev_enabled = crate::db::Database::open_fast()
+        let prev_enabled = crate::db::Database::open_default()
             .ok()
             .and_then(|db| db.list_extensions().ok())
             .and_then(|exts| {
@@ -8863,7 +9253,7 @@ mod tests {
                     .map(|e| e.enabled)
             })
             .unwrap_or(false);
-        if let Ok(db) = crate::db::Database::open_fast() {
+        if let Ok(db) = crate::db::Database::open_default() {
             let _ = db.set_extension_enabled("cookie-token-grabber", true);
         }
 
@@ -8931,6 +9321,7 @@ mod tests {
         let recorded = prepare_recorded_steps(
             &short_id,
             &format!("bon_{short_id}"),
+            &running.info.ws_url,
             &["click".to_string(), grab_ref],
         );
         assert_eq!(recorded.len(), 1);
@@ -8965,7 +9356,7 @@ mod tests {
         running.stop_gracefully();
         assert!(!running.is_alive());
 
-        if let Ok(db) = crate::db::Database::open_fast() {
+        if let Ok(db) = crate::db::Database::open_default() {
             let _ = db.set_extension_enabled("cookie-token-grabber", prev_enabled);
         }
         let _ = wipe_profile_data(&profile.id);
@@ -9332,6 +9723,50 @@ mod tests {
                 "bob@example.com"
             ]
         );
+        // `type` must NOT be silently coerced to `fill`; falls back to snapshot ref resolution
+        assert!(
+            build_locator_candidate_commands("type", "role:textbox:Email", Some("abc"), &[])
+                .is_empty()
+        );
+        assert!(
+            build_locator_candidate_commands("wait", "text:Continue", None, &[]).is_empty()
+        );
+        assert!(
+            build_locator_candidate_commands(
+                "click",
+                "role:button:Continue",
+                None,
+                &["--new-tab".to_string()]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            match_semantic_locator_in_snapshot("role:textbox:Email", &snap_map).as_deref(),
+            Some("e2")
+        );
+        assert_eq!(
+            match_semantic_locator_in_snapshot("text:Continue", &snap_map).as_deref(),
+            Some("e4")
+        );
+        // `open` parameterizes non-secret URL/tenant vars while ignoring password collisions
+        let mut open_steps = vec![FlowStep {
+            op: "open".to_string(),
+            locators: Vec::new(),
+            value: Some("https://acme-shop.example.com/login".to_string()),
+            extra_args: Vec::new(),
+            optional: false,
+        }];
+        parameterize_flow_steps(
+            &mut open_steps,
+            &[
+                ("password".to_string(), "login".to_string()),
+                ("tenant".to_string(), "acme-shop".to_string()),
+            ],
+        );
+        assert_eq!(
+            open_steps[0].value.as_deref(),
+            Some("https://{{tenant}}.example.com/login")
+        );
     }
 
     #[test]
@@ -9631,7 +10066,71 @@ mod tests {
         .unwrap();
         assert_eq!(saved_fl.steps[0].value.as_deref(), Some("{{email}}"));
         assert!(list_saved_flows().iter().any(|f| f.name == "ui_test_flow_tmp"));
+        let mutated = mutate_flow_step("ui_test_flow_tmp", 0, "optional").unwrap();
+        assert!(mutated.steps[0].optional);
+        let parsed_json_vars =
+            parse_flow_vars_body(r#"{"vars":{"email":"json@test.com","count":3}}"#);
+        assert_eq!(
+            parsed_json_vars.get("email").map(String::as_str),
+            Some("json@test.com")
+        );
+        assert_eq!(parsed_json_vars.get("count").map(String::as_str), Some("3"));
+        let h_flows = rt.handle().clone();
+        let (code_fl, body_fl) = rt
+            .block_on(rt.spawn_blocking(move || {
+                handle_control_http_request("GET", "/flows", "", &h_flows)
+            }))
+            .unwrap();
+        assert_eq!(code_fl, 200);
+        assert!(body_fl.contains("\"ui_test_flow_tmp\""));
+        assert_eq!(percent_decode("US%20Resi%20%2301"), "US Resi #01");
+        let h_fl404 = rt.handle().clone();
+        let (code_fl404, body_fl404) = rt
+            .block_on(rt.spawn_blocking(move || {
+                handle_control_http_request(
+                    "POST",
+                    "/profiles/Missing%20%2399/flow/ui_test_flow_tmp",
+                    "{}",
+                    &h_fl404,
+                )
+            }))
+            .unwrap();
+        assert_eq!(code_fl404, 404);
+        assert!(body_fl404.contains("Missing #99"));
+        if let Some(first_prof) = crate::db::Database::open_default()
+            .ok()
+            .and_then(|d| d.list_profiles().ok())
+            .and_then(|v| v.into_iter().next())
+        {
+            let h_mfl = rt.handle().clone();
+            let p_id = first_prof.short_id();
+            let (c_mfl, b_mfl) = rt
+                .block_on(rt.spawn_blocking(move || {
+                    handle_control_http_request(
+                        "POST",
+                        &format!("/profiles/{p_id}/flow/nonexistent_flow_404_check"),
+                        "{}",
+                        &h_mfl,
+                    )
+                }))
+                .unwrap();
+            assert_eq!(c_mfl, 404);
+            assert!(b_mfl.contains("Flow 'nonexistent_flow_404_check' not found"));
+        }
         let _ = std::fs::remove_file(flow_file_path("ui_test_flow_tmp").unwrap());
         clear_flow_session_cache(&hist_prof.short_id());
+        assert!(unix_pid_alive(std::process::id()));
+        assert!(!unix_pid_alive(0));
+        assert!(!unix_pid_alive(u32::MAX));
+        let hw_tmp = app_support_dir().join("backups").join(".hw_test_tmp");
+        let _ = std::fs::remove_dir_all(&hw_tmp);
+        std::fs::create_dir_all(hw_tmp.join("sub_a")).unwrap();
+        std::fs::create_dir_all(hw_tmp.join("sub_b")).unwrap();
+        std::fs::create_dir_all(hw_tmp.join("sub_c")).unwrap();
+        std::fs::write(hw_tmp.join("sub_a/f1.bin"), vec![7u8; 1024]).unwrap();
+        std::fs::write(hw_tmp.join("sub_b/f2.bin"), vec![9u8; 2048]).unwrap();
+        clonefile_or_copy(&hw_tmp.join("sub_a/f1.bin"), &hw_tmp.join("sub_c/f3.bin")).unwrap();
+        assert_eq!(dir_size_bytes(&hw_tmp), 4096);
+        let _ = std::fs::remove_dir_all(&hw_tmp);
     }
 }

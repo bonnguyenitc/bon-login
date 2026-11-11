@@ -59,6 +59,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
 </dict>
 </plist>
 EOF

@@ -2310,15 +2310,16 @@ pub fn render_proxies_view(
     let total_proxies = app.saved_proxies.len();
     let proxy_groups = app.distinct_proxy_groups_with_counts();
     let selected_pgrp = app.selected_proxy_group.clone();
-    let filtered_proxies = app.filtered_saved_proxies();
+    let filtered_indices: std::rc::Rc<[usize]> = app.filtered_proxy_indices().into();
+    let filtered_len = filtered_indices.len();
     let checked_count = app.checked_proxy_ids.len();
-    let all_filtered_checked = !filtered_proxies.is_empty()
-        && filtered_proxies
+    let all_filtered_checked = !filtered_indices.is_empty()
+        && filtered_indices
             .iter()
-            .all(|sp| app.checked_proxy_ids.contains(&sp.id));
-    let any_filtered_checked = filtered_proxies
+            .all(|&i| app.checked_proxy_ids.contains(&app.saved_proxies[i].id));
+    let any_filtered_checked = filtered_indices
         .iter()
-        .any(|sp| app.checked_proxy_ids.contains(&sp.id));
+        .any(|&i| app.checked_proxy_ids.contains(&app.saved_proxies[i].id));
     let proxy_hdr_mark = if all_filtered_checked {
         SfSymbol::CHECKMARK
     } else if any_filtered_checked {
@@ -2329,8 +2330,18 @@ pub fn render_proxies_view(
     let tag_dropdown_label = if selected_pgrp == "All" {
         format!("All Tag ({total_proxies})")
     } else {
-        format!("#{selected_pgrp} ({})", filtered_proxies.len())
+        format!("#{selected_pgrp} ({filtered_len})")
     };
+    let mut used_map: std::collections::HashMap<(ProxyProtocol, String, u16), usize> =
+        std::collections::HashMap::new();
+    for p in &app.profiles {
+        if let Some(cfg) = &p.proxy {
+            *used_map
+                .entry((cfg.protocol, cfg.host.clone(), cfg.port))
+                .or_insert(0) += 1;
+        }
+    }
+    let used_counts = std::rc::Rc::new(used_map);
 
     let app_for_tag_menu = cx.entity();
     let groups_for_menu = proxy_groups.clone();
@@ -2444,7 +2455,7 @@ pub fn render_proxies_view(
                             Button::new("pmgr-distribute-profiles")
                                 .with_variant(BonTheme::row_action(cx))
                                 .small()
-                                .disabled(filtered_proxies.is_empty())
+                                .disabled(filtered_indices.is_empty())
                                 .label("Assign to profiles")
                                 .on_click(cx.listener(|app, _, window, cx| {
                                     app.assign_filtered_proxies_to_profiles(window, cx);
@@ -2454,7 +2465,7 @@ pub fn render_proxies_view(
                             Button::new("pmgr-check-all-top")
                                 .with_variant(BonTheme::outline_blue(cx))
                                 .small()
-                                .disabled(filtered_proxies.is_empty())
+                                .disabled(filtered_indices.is_empty())
                                 .label(if checked_count > 0 {
                                     format!("Check proxy ({checked_count})")
                                 } else {
@@ -2592,446 +2603,492 @@ pub fn render_proxies_view(
                         ),
                 )
                 // Rows Body
-                .child(
+                .child(if filtered_indices.is_empty() {
                     v_flex()
                         .id("proxies-table-rows")
                         .w_full()
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        .children(filtered_proxies.is_empty().then(|| {
-                            v_flex()
-                                .w_full()
-                                .py_16()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
+                        .py_16()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(BonTheme::text_primary())
+                                .child("No proxies found"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
                                 .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .text_color(BonTheme::text_primary())
-                                        .child("No proxies found"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(
-                                            "Click '+ Add proxy' at the top-left to import your HTTP or SOCKS5 proxies.",
-                                        ),
-                                )
-                        }))
-                        .children(filtered_proxies.iter().enumerate().map(|(idx, sp)| {
-                            let row_num = idx + 1;
-                            let pid = sp.id.clone();
-                            let pid_chk_toggle = sp.id.clone();
-                            let pid_check = sp.id.clone();
-                            let is_checked = app.checked_proxy_ids.contains(&sp.id);
-                            let is_checking = app.checking_proxy_ids.contains(&sp.id);
+                                    "Click '+ Add proxy' at the top-left to import your HTTP or SOCKS5 proxies.",
+                                ),
+                        )
+                        .into_any_element()
+                } else {
+                    let indices_for_list = filtered_indices.clone();
+                    let counts_for_list = used_counts.clone();
+                    uniform_list(
+                        "proxies-table-rows",
+                        indices_for_list.len(),
+                        cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                            let app_entity = cx.entity();
+                            let mut items = Vec::with_capacity(range.len());
+                            for row_ix in range {
+                                let Some(&sp_ix) = indices_for_list.get(row_ix) else {
+                                    continue;
+                                };
+                                let Some(sp) = app.saved_proxies.get(sp_ix) else {
+                                    continue;
+                                };
+                                let row_num = row_ix + 1;
+                                let pid = sp.id.clone();
+                                let pid_chk_toggle = sp.id.clone();
+                                let pid_check = sp.id.clone();
+                                let is_checked = app.checked_proxy_ids.contains(&sp.id);
+                                let is_checking = app.checking_proxy_ids.contains(&sp.id);
+                                let used_count = counts_for_list
+                                    .get(&(
+                                        sp.config.protocol,
+                                        sp.config.host.clone(),
+                                        sp.config.port,
+                                    ))
+                                    .copied()
+                                    .unwrap_or(0);
 
-                            let used_count = app
-                                .profiles
-                                .iter()
-                                .filter(|p| {
-                                    p.proxy.as_ref().is_some_and(|cfg| {
-                                        cfg.protocol == sp.config.protocol
-                                            && cfg.host == sp.config.host
-                                            && cfg.port == sp.config.port
-                                    })
-                                })
-                                .count();
+                                let flag = sp
+                                    .resolved_geo
+                                    .as_ref()
+                                    .map(|g| crate::models::GeoInfo::country_flag(&g.country_code))
+                                    .unwrap_or(SfSymbol::GLOBE);
 
-                            let flag = sp
-                                .resolved_geo
-                                .as_ref()
-                                .map(|g| crate::models::GeoInfo::country_flag(&g.country_code))
-                                .unwrap_or(SfSymbol::GLOBE);
-
-                            let geo_str = if let Some(g) = &sp.resolved_geo {
-                                let short_tz =
-                                    g.timezone.rsplit('/').next().unwrap_or(&g.timezone);
-                                format!("{} ({}) • {short_tz}", g.compact_ip(), g.country_code)
-                            } else if let Some(err) = &sp.last_error {
-                                err.clone()
-                            } else {
-                                "-".to_string()
-                            };
-
-                            let (badge_bg, badge_fg, status_text) = if is_checking {
-                                (
-                                    BonTheme::info_bg(),
-                                    BonTheme::info(),
-                                    "CHECKING...".to_string(),
-                                )
-                            } else if let Some(g) = &sp.resolved_geo {
-                                let ms = g.latency_ms.unwrap_or(0);
-                                (
-                                    BonTheme::success_bg(),
-                                    BonTheme::success(),
-                                    if ms > 0 {
-                                        format!("LIVE • {ms}ms")
-                                    } else {
-                                        "LIVE".to_string()
-                                    },
-                                )
-                            } else if sp.last_error.is_some() {
-                                (
-                                    BonTheme::danger_bg(),
-                                    BonTheme::danger(),
-                                    "DEAD".to_string(),
-                                )
-                            } else {
-                                (
-                                    BonTheme::bg_elevated(),
-                                    BonTheme::text_muted(),
-                                    "-".to_string(),
-                                )
-                            };
-
-                            let app_row_menu = cx.entity();
-                            let pid_menu_copy = sp.config.to_editable_string();
-                            let pid_menu_assign = sp.id.clone();
-                            let pid_menu_del = sp.id.clone();
-                            let has_rot_url = sp.config.change_ip_url.is_some();
-                            h_flex()
-                                .w_full()
-                                .px_3()
-                                .py_2p5()
-                                .gap_2()
-                                .items_center()
-                                .border_b_1()
-                                .border_color(BonTheme::border())
-                                .bg(if is_checked {
-                                    BonTheme::bg_selected()
+                                let geo_str = if let Some(g) = &sp.resolved_geo {
+                                    let short_tz =
+                                        g.timezone.rsplit('/').next().unwrap_or(&g.timezone);
+                                    format!("{} ({}) • {short_tz}", g.compact_ip(), g.country_code)
+                                } else if let Some(err) = &sp.last_error {
+                                    err.clone()
                                 } else {
-                                    BonTheme::bg_panel()
-                                })
-                                .hover(|s| {
-                                    if is_checked {
-                                        s.bg(rgba(0x0a84ff3d))
-                                    } else {
-                                        s.bg(BonTheme::bg_hover())
-                                    }
-                                })
-                                // Col 1: Checkbox
-                                .child(
-                                    BonTheme::checkbox(
-                                        format!("pmgr-row-chk-spring-{pid}"),
-                                        is_checked,
-                                        if is_checked { SfSymbol::CHECKMARK } else { "" },
+                                    "-".to_string()
+                                };
+
+                                let (badge_bg, badge_fg, status_text) = if is_checking {
+                                    (
+                                        BonTheme::info_bg(),
+                                        BonTheme::info(),
+                                        "CHECKING...".to_string(),
+                                    )
+                                } else if let Some(g) = &sp.resolved_geo {
+                                    let ms = g.latency_ms.unwrap_or(0);
+                                    (
+                                        BonTheme::success_bg(),
+                                        BonTheme::success(),
+                                        if ms > 0 {
+                                            format!("LIVE • {ms}ms")
+                                        } else {
+                                            "LIVE".to_string()
+                                        },
+                                    )
+                                } else if sp.last_error.is_some() {
+                                    (
+                                        BonTheme::danger_bg(),
+                                        BonTheme::danger(),
+                                        "DEAD".to_string(),
+                                    )
+                                } else {
+                                    (
                                         BonTheme::bg_elevated(),
-                                        cx.listener(move |app, _, _, cx| {
-                                            app.toggle_proxy_checked(&pid_chk_toggle, cx);
-                                        }),
-                                    ),
-                                )
-                                // Col 2: #
-                                .child(
-                                    div()
-                                        .w(px(28.))
-                                        .flex_shrink_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(format!("{row_num}")),
-                                )
-                                // Col 3: Name (Top: Proxy Name, Bottom: Flag + IP:Port + Country)
-                                .child(
-                                    v_flex()
-                                        .w_0()
-                                        .flex_1()
-                                        .min_w(px(140.))
-                                        .overflow_hidden()
-                                        .gap_0p5()
+                                        BonTheme::text_muted(),
+                                        "-".to_string(),
+                                    )
+                                };
+
+                                let app_row_menu = app_entity.clone();
+                                let pid_menu_copy = sp.config.to_editable_string();
+                                let pid_menu_assign = sp.id.clone();
+                                let pid_menu_del = sp.id.clone();
+                                let has_rot_url = sp.config.change_ip_url.is_some();
+                                let name_str = sp.name.clone();
+                                let sub_str = if geo_str != "-" && sp.resolved_geo.is_some() {
+                                    format!("{} • {}", sp.config.display_short(), geo_str)
+                                } else {
+                                    sp.config.display_short()
+                                };
+                                let tag_opt = (!sp.group_tag.trim().is_empty())
+                                    .then(|| format!("#{}", sp.group_tag));
+                                let proto_str = sp.config.protocol.as_str().to_uppercase();
+                                let started_str = sp.format_started_at();
+                                let exp_color = if sp.is_expired() {
+                                    BonTheme::danger()
+                                } else if sp.is_expiring_soon() {
+                                    BonTheme::warning()
+                                } else if sp.expired_at.is_some() {
+                                    BonTheme::text_primary()
+                                } else {
+                                    BonTheme::text_muted()
+                                };
+                                let exp_str = sp.format_expired_at();
+                                items.push(
+                                    h_flex()
+                                        .w_full()
+                                        .px_3()
+                                        .py_2p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .border_b_1()
+                                        .border_color(BonTheme::border())
+                                        .bg(if is_checked {
+                                            BonTheme::bg_selected()
+                                        } else {
+                                            BonTheme::bg_panel()
+                                        })
+                                        .hover(|s| {
+                                            if is_checked {
+                                                s.bg(rgba(0x0a84ff3d))
+                                            } else {
+                                                s.bg(BonTheme::bg_hover())
+                                            }
+                                        })
+                                        .child(BonTheme::checkbox(
+                                            format!("pmgr-row-chk-spring-{pid}"),
+                                            is_checked,
+                                            if is_checked { SfSymbol::CHECKMARK } else { "" },
+                                            BonTheme::bg_elevated(),
+                                            cx.listener(move |app, _, _, cx| {
+                                                app.toggle_proxy_checked(&pid_chk_toggle, cx);
+                                            }),
+                                        ))
                                         .child(
                                             div()
-                                                .w_full()
-                                                .min_w_0()
+                                                .w(px(28.))
+                                                .flex_shrink_0()
                                                 .truncate()
-                                                .text_sm()
-                                                .font_semibold()
-                                                .text_color(BonTheme::text_primary())
-                                                .child(sp.name.clone()),
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(format!("{row_num}")),
                                         )
                                         .child(
-                                            h_flex()
-                                                .w_full()
-                                                .min_w_0()
+                                            v_flex()
+                                                .w_0()
+                                                .flex_1()
+                                                .min_w(px(140.))
                                                 .overflow_hidden()
-                                                .gap_1p5()
-                                                .items_center()
-                                                .child(div().flex_shrink_0().text_xs().child(flag))
+                                                .gap_0p5()
                                                 .child(
                                                     div()
-                                                        .w_0()
-                                                        .flex_1()
+                                                        .w_full()
                                                         .min_w_0()
                                                         .truncate()
-                                                        .text_xs()
-                                                        .text_color(BonTheme::text_secondary())
-                                                        .child(if geo_str != "-" && sp.resolved_geo.is_some() {
-                                                            format!("{} • {}", sp.config.display_short(), geo_str)
-                                                        } else {
-                                                            sp.config.display_short()
-                                                        }),
-                                                ),
-                                        ),
-                                )
-                                // Col 4: Tag
-                                .child(
-                                    div().w(px(80.)).flex_shrink_0().overflow_hidden().children(
-                                        (!sp.group_tag.trim().is_empty()).then(|| {
-                                            h_flex().w_full().min_w_0().overflow_hidden().child(
-                                                div()
-                                                    .max_w_full()
-                                                    .truncate()
-                                                    .px_1p5()
-                                                    .py_0p5()
-                                                    .rounded_sm()
-                                                    .bg(BonTheme::accent_subtle())
-                                                    .text_xs()
-                                                    .text_color(BonTheme::accent())
-                                                    .child(format!("#{}", sp.group_tag)),
-                                            )
-                                        }),
-                                    ),
-                                )
-                                // Col 5: Protocol support (`HTTP` / `SOCKS5`)
-                                .child(
-                                    div()
-                                        .w(px(108.))
-                                        .flex_shrink_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(BonTheme::text_primary())
-                                        .child(sp.config.protocol.as_str().to_uppercase()),
-                                )
-                                // Col 6: Started at (`DD/MM/YYYY`)
-                                .child(
-                                    div()
-                                        .w(px(84.))
-                                        .flex_shrink_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(BonTheme::text_secondary())
-                                        .child(sp.format_started_at()),
-                                )
-                                // Col 7: Expired at (`DD/MM/YYYY (Nd)` or `Expired`)
-                                .child(
-                                    div()
-                                        .w(px(116.))
-                                        .flex_shrink_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(if sp.is_expired() {
-                                            BonTheme::danger()
-                                        } else if sp.is_expiring_soon() {
-                                            BonTheme::warning()
-                                        } else if sp.expired_at.is_some() {
-                                            BonTheme::text_primary()
-                                        } else {
-                                            BonTheme::text_muted()
-                                        })
-                                        .child(sp.format_expired_at()),
-                                )
-                                // Col 8: Status Badge
-                                .child(
-                                    div().w(px(96.)).flex_shrink_0().overflow_hidden().child({
-                                        let badge = div()
-                                            .truncate()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .bg(badge_bg)
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(badge_fg)
-                                            .child(status_text);
-                                        h_flex().child(if is_checking {
-                                            badge
-                                                .with_animation(
-                                                    SharedString::from(format!(
-                                                        "proxy-chk-pulse-{pid}"
-                                                    )),
-                                                    Animation::new(Duration::from_millis(1100))
-                                                        .repeat()
-                                                        .with_easing(pulsating_between(0.4, 1.0)),
-                                                    |this, alpha| this.opacity(alpha),
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .text_color(BonTheme::text_primary())
+                                                        .child(name_str),
                                                 )
-                                                .into_any_element()
-                                        } else {
-                                            badge.into_any_element()
-                                        })
-                                    }),
-                                )
-                                // Col 9: Profiles count
-                                .child(
-                                    div()
-                                        .w(px(72.))
-                                        .flex_shrink_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(if used_count > 0 {
-                                            BonTheme::accent()
-                                        } else {
-                                            BonTheme::text_muted()
-                                        })
-                                        .child(format!("{used_count} profile(s)")),
-                                )
-                                // Col 10: Row Actions (`[Check]` + `[⋯]`)
-                                .child(
-                                    h_flex()
-                                        .w(px(92.))
-                                        .flex_shrink_0()
-                                        .justify_end()
-                                        .items_center()
-                                        .gap_1p5()
+                                                .child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .text_xs()
+                                                                .child(flag),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w_0()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    BonTheme::text_secondary(),
+                                                                )
+                                                                .child(sub_str),
+                                                        ),
+                                                ),
+                                        )
                                         .child(
-                                            Button::new(SharedString::from(format!("p-chk-{pid}")))
-                                                .with_variant(BonTheme::outline_blue(cx))
-                                                .small()
-                                                .disabled(is_checking)
-                                                .label(if is_checking { "..." } else { "Check" })
-                                                .on_click(cx.listener(move |app, _, _, cx| {
-                                                    app.check_saved_proxy(&pid_check, cx);
+                                            div()
+                                                .w(px(80.))
+                                                .flex_shrink_0()
+                                                .overflow_hidden()
+                                                .children(tag_opt.map(|tag_lbl| {
+                                                    h_flex()
+                                                        .w_full()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .child(
+                                                            div()
+                                                                .max_w_full()
+                                                                .truncate()
+                                                                .px_1p5()
+                                                                .py_0p5()
+                                                                .rounded_sm()
+                                                                .bg(BonTheme::accent_subtle())
+                                                                .text_xs()
+                                                                .text_color(BonTheme::accent())
+                                                                .child(tag_lbl),
+                                                        )
                                                 })),
                                         )
                                         .child(
-                                            Button::new(SharedString::from(format!(
-                                                "p-more-{pid}"
-                                            )))
-                                            .ghost()
-                                            .small()
-                                            .label(SfSymbol::ELLIPSIS)
-                                            .dropdown_menu(move |menu, _, _| {
-                                                let copy_val = pid_menu_copy.clone();
-                                                let app_c = app_row_menu.clone();
-                                                let edit_id = pid_menu_del.clone();
-                                                let app_ed = app_row_menu.clone();
-                                                let assign_id = pid_menu_assign.clone();
-                                                let app_a = app_row_menu.clone();
-                                                let ext_id = pid_menu_del.clone();
-                                                let app_ext = app_row_menu.clone();
-                                                let clr_id = pid_menu_del.clone();
-                                                let app_clr = app_row_menu.clone();
-                                                let del_id = pid_menu_del.clone();
-                                                let rot_id = pid_menu_del.clone();
-                                                let app_r = app_row_menu.clone();
-                                                let app_d = app_row_menu.clone();
-                                                let mut m = menu.item(
-                                                    PopupMenuItem::new(format!(
-                                                        "{}   Edit proxy / Rotate URL",
-                                                        SfSymbol::PENCIL
-                                                    ))
-                                                    .on_click(move |_, window, cx| {
-                                                        let eid = edit_id.clone();
-                                                        app_ed.update(cx, |app, cx| {
-                                                            app.open_edit_proxy_modal(
-                                                                &eid, window, cx,
+                                            div()
+                                                .w(px(108.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(BonTheme::text_primary())
+                                                .child(proto_str),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(84.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(started_str),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(116.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(exp_color)
+                                                .child(exp_str),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(96.))
+                                                .flex_shrink_0()
+                                                .overflow_hidden()
+                                                .child({
+                                                    let badge = div()
+                                                        .truncate()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_sm()
+                                                        .bg(badge_bg)
+                                                        .text_xs()
+                                                        .font_semibold()
+                                                        .text_color(badge_fg)
+                                                        .child(status_text);
+                                                    h_flex().child(if is_checking {
+                                                        badge
+                                                            .with_animation(
+                                                                SharedString::from(format!(
+                                                                    "proxy-chk-pulse-{pid}"
+                                                                )),
+                                                                Animation::new(
+                                                                    Duration::from_millis(1100),
+                                                                )
+                                                                .repeat()
+                                                                .with_easing(pulsating_between(
+                                                                    0.4, 1.0,
+                                                                )),
+                                                                |this, alpha| this.opacity(alpha),
+                                                            )
+                                                            .into_any_element()
+                                                    } else {
+                                                        badge.into_any_element()
+                                                    })
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(72.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(if used_count > 0 {
+                                                    BonTheme::accent()
+                                                } else {
+                                                    BonTheme::text_muted()
+                                                })
+                                                .child(format!("{used_count} profile(s)")),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .w(px(92.))
+                                                .flex_shrink_0()
+                                                .justify_end()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "p-chk-{pid}"
+                                                    )))
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .small()
+                                                    .disabled(is_checking)
+                                                    .label(if is_checking { "..." } else { "Check" })
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.check_saved_proxy(&pid_check, cx);
+                                                    })),
+                                                )
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "p-more-{pid}"
+                                                    )))
+                                                    .ghost()
+                                                    .small()
+                                                    .label(SfSymbol::ELLIPSIS)
+                                                    .dropdown_menu(move |menu, _, _| {
+                                                        let copy_val = pid_menu_copy.clone();
+                                                        let app_c = app_row_menu.clone();
+                                                        let edit_id = pid_menu_del.clone();
+                                                        let app_ed = app_row_menu.clone();
+                                                        let assign_id = pid_menu_assign.clone();
+                                                        let app_a = app_row_menu.clone();
+                                                        let ext_id = pid_menu_del.clone();
+                                                        let app_ext = app_row_menu.clone();
+                                                        let clr_id = pid_menu_del.clone();
+                                                        let app_clr = app_row_menu.clone();
+                                                        let del_id = pid_menu_del.clone();
+                                                        let rot_id = pid_menu_del.clone();
+                                                        let app_r = app_row_menu.clone();
+                                                        let app_d = app_row_menu.clone();
+                                                        let mut m = menu
+                                                            .item(
+                                                                PopupMenuItem::new(format!(
+                                                                    "{}   Edit proxy / Rotate URL",
+                                                                    SfSymbol::PENCIL
+                                                                ))
+                                                                .on_click(move |_, window, cx| {
+                                                                    let eid = edit_id.clone();
+                                                                    app_ed.update(cx, |app, cx| {
+                                                                        app.open_edit_proxy_modal(
+                                                                            &eid, window, cx,
+                                                                        );
+                                                                    });
+                                                                }),
+                                                            )
+                                                            .item(
+                                                                PopupMenuItem::new(format!(
+                                                                    "{}   Copy proxy",
+                                                                    SfSymbol::DOC_ON_DOC
+                                                                ))
+                                                                .on_click(move |_, _, cx| {
+                                                                    let v = copy_val.clone();
+                                                                    app_c.update(cx, |app, cx| {
+                                                                        cx.write_to_clipboard(
+                                                                            ClipboardItem::new_string(
+                                                                                v,
+                                                                            ),
+                                                                        );
+                                                                        app.banner_message = Some(
+                                                                            "Copied proxy to clipboard"
+                                                                                .to_string(),
+                                                                        );
+                                                                        cx.notify();
+                                                                    });
+                                                                }),
+                                                            )
+                                                            .item(
+                                                                PopupMenuItem::new(format!(
+                                                                    "{}   Assign to selected profile",
+                                                                    SfSymbol::LINK
+                                                                ))
+                                                                .on_click(move |_, window, cx| {
+                                                                    let aid = assign_id.clone();
+                                                                    app_a.update(cx, |app, cx| {
+                                                                        app.apply_saved_proxy_to_selected_profile(
+                                                                            &aid, window, cx,
+                                                                        );
+                                                                    });
+                                                                }),
+                                                            )
+                                                            .item(
+                                                                PopupMenuItem::new(format!(
+                                                                    "{}   Extend +30 days",
+                                                                    SfSymbol::CALENDAR
+                                                                ))
+                                                                .on_click(move |_, _, cx| {
+                                                                    let eid = ext_id.clone();
+                                                                    app_ext.update(
+                                                                        cx,
+                                                                        |app, cx| {
+                                                                            app.extend_saved_proxy_days(
+                                                                                &eid, 30, cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                            )
+                                                            .item(
+                                                                PopupMenuItem::new(format!(
+                                                                    "{}   Clear expiration",
+                                                                    SfSymbol::CLOCK_ARROW_CIRCLEPATH
+                                                                ))
+                                                                .on_click(move |_, _, cx| {
+                                                                    let cid = clr_id.clone();
+                                                                    app_clr.update(
+                                                                        cx,
+                                                                        |app, cx| {
+                                                                            app.extend_saved_proxy_days(
+                                                                                &cid, 0, cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
                                                             );
-                                                        });
-                                                    }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new(format!(
-                                                        "{}   Copy proxy",
-                                                        SfSymbol::DOC_ON_DOC
-                                                    ))
-                                                    .on_click(
-                                                        move |_, _, cx| {
-                                                            let v = copy_val.clone();
-                                                            app_c.update(cx, |app, cx| {
-                                                                cx.write_to_clipboard(
-                                                                    ClipboardItem::new_string(v),
-                                                                );
-                                                                app.banner_message = Some(
-                                                                    "Copied proxy to clipboard"
-                                                                        .to_string(),
-                                                                );
-                                                                cx.notify();
-                                                            });
-                                                        },
-                                                    ),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new(format!(
-                                                        "{}   Assign to selected profile",
-                                                        SfSymbol::LINK
-                                                    ))
-                                                    .on_click(move |_, window, cx| {
-                                                        let aid = assign_id.clone();
-                                                        app_a.update(cx, |app, cx| {
-                                                            app.apply_saved_proxy_to_selected_profile(
-                                                                &aid, window, cx,
+                                                        if has_rot_url {
+                                                            m = m.item(
+                                                                PopupMenuItem::new(
+                                                                    "\u{1002af}   Rotate Proxy IP",
+                                                                )
+                                                                .on_click(move |_, _, cx| {
+                                                                    let rid = rot_id.clone();
+                                                                    app_r.update(cx, |app, cx| {
+                                                                        app.rotate_saved_proxy_ip(
+                                                                            &rid, cx,
+                                                                        );
+                                                                    });
+                                                                }),
                                                             );
-                                                        });
-                                                    }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new(format!(
-                                                        "{}   Extend +30 days",
-                                                        SfSymbol::CALENDAR
-                                                    ))
-                                                        .on_click(move |_, _, cx| {
-                                                            let eid = ext_id.clone();
-                                                            app_ext.update(cx, |app, cx| {
-                                                                app.extend_saved_proxy_days(
-                                                                    &eid, 30, cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                )
-                                                .item(
-                                                    PopupMenuItem::new(format!(
-                                                        "{}   Clear expiration",
-                                                        SfSymbol::CLOCK_ARROW_CIRCLEPATH
-                                                    ))
-                                                        .on_click(move |_, _, cx| {
-                                                            let cid = clr_id.clone();
-                                                            app_clr.update(cx, |app, cx| {
-                                                                app.extend_saved_proxy_days(
-                                                                    &cid, 0, cx,
-                                                                );
-                                                            });
-                                                        }),
-                                                )
-                                                ;
-                                                if has_rot_url {
-                                                    m = m.item(
-                                                        PopupMenuItem::new(
-                                                            "\u{1002af}   Rotate Proxy IP",
+                                                        }
+                                                        m.separator().item(
+                                                            PopupMenuItem::new(format!(
+                                                                "{}   Delete proxy",
+                                                                SfSymbol::TRASH
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                let did = del_id.clone();
+                                                                app_d.update(cx, |app, cx| {
+                                                                    app.request_delete(
+                                                                        PendingDeleteAction::Proxy(
+                                                                            did,
+                                                                        ),
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }),
                                                         )
-                                                        .on_click(move |_, _, cx| {
-                                                            let rid = rot_id.clone();
-                                                            app_r.update(cx, |app, cx| {
-                                                                app.rotate_saved_proxy_ip(&rid, cx);
-                                                            });
-                                                        }),
-                                                    );
-                                                }
-                                                m.separator().item(
-                                                    PopupMenuItem::new(format!(
-                                                        "{}   Delete proxy",
-                                                        SfSymbol::TRASH
-                                                    ))
-                                                    .on_click(move |_, _, cx| {
-                                                        let did = del_id.clone();
-                                                        app_d.update(cx, |app, cx| {
-                                                            app.request_delete(
-                                                                PendingDeleteAction::Proxy(did),
-                                                                cx,
-                                                            );
-                                                        });
                                                     }),
-                                                )
-                                            }),
+                                                ),
                                         ),
-                                )
-                        })),
-                )
+                                );
+                            }
+                            items
+                        }),
+                    )
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .into_any_element()
+                })
                 // Table Footer (`Proxies: N   < [ 1 ] / 1 >`)
                 .child(
                     h_flex()
@@ -3046,7 +3103,7 @@ pub fn render_proxies_view(
                         .border_color(BonTheme::border())
                         .text_xs()
                         .text_color(BonTheme::text_secondary())
-                        .child(format!("Proxies: {}", filtered_proxies.len()))
+                        .child(format!("Proxies: {filtered_len}"))
                         .child(
                             h_flex()
                                 .gap_1()
@@ -5784,7 +5841,7 @@ pub fn render_popup_modal(
                     v_flex()
                         .id("saved-flows-list")
                         .w_full()
-                        .max_h(px(230.))
+                        .max_h(px(300.))
                         .gap_2()
                         .overflow_y_scroll()
                         .children(flows.is_empty().then(|| {
@@ -5798,68 +5855,206 @@ pub fn render_popup_modal(
                                 .child("No saved flows yet. Run `bon-login agent <id> ...` and click '+ Save Flow' above.")
                         }))
                         .children(flows.into_iter().map(|fl| {
+                            let is_expanded =
+                                app.expanded_flow_name.as_deref() == Some(fl.name.as_str());
+                            let fn_exp = fl.name.clone();
                             let fn_run = fl.name.clone();
                             let fn_del = fl.name.clone();
+                            let fn_for_steps = fl.name.clone();
                             let vars = crate::launcher::extract_flow_vars(&fl);
                             let meta = if vars.is_empty() {
-                                format!("{} steps • {}", fl.steps.len(), if fl.domain.is_empty() { "any domain" } else { &fl.domain })
+                                format!(
+                                    "{} steps • {}",
+                                    fl.steps.len(),
+                                    if fl.domain.is_empty() {
+                                        "any domain"
+                                    } else {
+                                        &fl.domain
+                                    }
+                                )
                             } else {
-                                format!("{} steps • vars: {{{{{}}}}}", fl.steps.len(), vars.join("}}, {{"))
+                                format!(
+                                    "{} steps • vars: {{{{{}}}}}",
+                                    fl.steps.len(),
+                                    vars.join("}}, {{")
+                                )
                             };
-                            h_flex()
+                            let steps_list = fl.steps.clone();
+                            v_flex()
                                 .w_full()
                                 .px_3()
                                 .py_2()
+                                .gap_2()
                                 .rounded_md()
                                 .bg(BonTheme::bg_panel())
                                 .border_1()
-                                .border_color(BonTheme::border())
-                                .justify_between()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .text_xs()
-                                                .font_bold()
-                                                .text_color(BonTheme::text_primary())
-                                                .child(fl.name),
-                                        )
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(BonTheme::text_secondary())
-                                                .child(meta),
-                                        ),
-                                )
+                                .border_color(if is_expanded {
+                                    BonTheme::border_active()
+                                } else {
+                                    BonTheme::border()
+                                })
                                 .child(
                                     h_flex()
-                                        .gap_1p5()
+                                        .w_full()
+                                        .justify_between()
                                         .items_center()
+                                        .gap_2()
                                         .child(
-                                            Button::new(SharedString::from(format!("flw-run-{fn_run}")))
-                                                .with_variant(BonTheme::launch_cta(cx))
-                                                .small()
-                                                .label("▶ Run")
-                                                .on_click(cx.listener(move |app, _, _, cx| {
-                                                    app.run_saved_flow_ui(&fn_run, cx);
-                                                })),
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |app, _, _, cx| {
+                                                        app.toggle_expanded_flow_ui(&fn_exp, cx);
+                                                    }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .font_bold()
+                                                        .text_color(BonTheme::text_primary())
+                                                        .child(format!(
+                                                            "{} {}",
+                                                            if is_expanded { "▾" } else { "▸" },
+                                                            fl.name
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .text_color(BonTheme::text_secondary())
+                                                        .child(meta),
+                                                ),
                                         )
                                         .child(
-                                            Button::new(SharedString::from(format!("flw-del-{fn_del}")))
-                                                .ghost()
-                                                .small()
-                                                .label(SfSymbol::TRASH)
-                                                .on_click(cx.listener(move |app, _, _, cx| {
-                                                    app.delete_saved_flow_ui(&fn_del, cx);
-                                                })),
+                                            h_flex()
+                                                .gap_1p5()
+                                                .items_center()
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "flw-run-{fn_run}"
+                                                    )))
+                                                    .with_variant(BonTheme::launch_cta(cx))
+                                                    .small()
+                                                    .label("▶ Run")
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.run_saved_flow_ui(&fn_run, cx);
+                                                    })),
+                                                )
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "flw-del-{fn_del}"
+                                                    )))
+                                                    .ghost()
+                                                    .small()
+                                                    .label(SfSymbol::TRASH)
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.delete_saved_flow_ui(&fn_del, cx);
+                                                    })),
+                                                ),
                                         ),
                                 )
+                                .children(is_expanded.then(|| {
+                                    v_flex()
+                                        .w_full()
+                                        .pt_1p5()
+                                        .gap_1()
+                                        .border_t_1()
+                                        .border_color(BonTheme::border())
+                                        .children(steps_list.into_iter().enumerate().map(
+                                            |(s_idx, st)| {
+                                                let fn_opt = fn_for_steps.clone();
+                                                let fn_rm = fn_for_steps.clone();
+                                                let loc_preview =
+                                                    st.locators.first().cloned().unwrap_or_default();
+                                                let val_preview = st
+                                                    .value
+                                                    .as_deref()
+                                                    .map(|v| format!(" \"{v}\""))
+                                                    .unwrap_or_default();
+                                                let summary = format!(
+                                                    "#{s_idx}  {}  {loc_preview}{val_preview}",
+                                                    st.op
+                                                );
+                                                let is_opt = st.optional;
+                                                h_flex()
+                                                    .w_full()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .gap_1p5()
+                                                    .rounded_sm()
+                                                    .bg(BonTheme::bg_elevated())
+                                                    .justify_between()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .text_size(px(11.))
+                                                            .text_color(if is_opt {
+                                                                BonTheme::text_secondary()
+                                                            } else {
+                                                                BonTheme::text_primary()
+                                                            })
+                                                            .child(summary),
+                                                    )
+                                                    .child(
+                                                        h_flex()
+                                                            .gap_1()
+                                                            .items_center()
+                                                            .child(
+                                                                Button::new(SharedString::from(
+                                                                    format!(
+                                                                        "flw-opt-{fn_opt}-{s_idx}"
+                                                                    ),
+                                                                ))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .label(if is_opt {
+                                                                    "Optional"
+                                                                } else {
+                                                                    "Required"
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |app, _, _, cx| {
+                                                                        app.mutate_flow_step_ui(
+                                                                            &fn_opt,
+                                                                            s_idx,
+                                                                            "toggle",
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                            )
+                                                            .child(
+                                                                Button::new(SharedString::from(
+                                                                    format!(
+                                                                        "flw-sdel-{fn_rm}-{s_idx}"
+                                                                    ),
+                                                                ))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .label(SfSymbol::XMARK)
+                                                                .on_click(cx.listener(
+                                                                    move |app, _, _, cx| {
+                                                                        app.mutate_flow_step_ui(
+                                                                            &fn_rm,
+                                                                            s_idx,
+                                                                            "delete",
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                            ),
+                                                    )
+                                            },
+                                        ))
+                                }))
                         })),
                 )
         }
