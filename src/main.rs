@@ -1,36 +1,23 @@
-pub mod db;
-pub mod geoip;
-pub mod launcher;
-pub mod models;
-pub mod proxy_tunnel;
-pub mod ui;
-
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+mod control;
+mod db;
+mod extensions;
+mod flows;
+mod geoip;
+mod launcher;
+mod models;
+mod proxy_tunnel;
+mod ui;
 
 use gpui_kit::assets::Assets;
 use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::*;
 
 use crate::db::Database;
-use crate::launcher::RunningProcess;
+use crate::launcher::RuntimeSupervisor;
 use crate::ui::BonLoginApp;
-
-fn stop_all_processes(procs: &Mutex<HashMap<String, RunningProcess>>) {
-    let drained: Vec<Mutex<RunningProcess>> = procs
-        .lock()
-        .map(|mut map| map.drain().map(|(_, p)| Mutex::new(p)).collect())
-        .unwrap_or_default();
-    crate::launcher::parallel_map(&drained, |slot| {
-        if let Ok(mut proc) = slot.lock() {
-            proc.stop_gracefully();
-        }
-    });
-}
-
 fn main() {
     if std::env::args_os().nth(1).is_some()
-        && let Some(res) = crate::launcher::try_run_cli()
+        && let Some(res) = crate::control::try_run_cli()
     {
         if let Err(e) = res {
             eprintln!(
@@ -45,14 +32,12 @@ fn main() {
         return;
     }
 
-    let tokio_rt = crate::launcher::build_tokio_runtime();
+    let tokio_rt = crate::control::build_tokio_runtime();
     let tokio_handle = tokio_rt.handle().clone();
     let db = Database::open_default().expect("Failed to open bonlogin.sqlite3");
 
-    let running_processes: Arc<Mutex<HashMap<String, RunningProcess>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let cleanup_processes = running_processes.clone();
-
+    let supervisor = RuntimeSupervisor::new_in(db.root_dir());
+    let cleanup_supervisor = supervisor.clone();
     let app = gpui_kit::application().with_assets(Assets);
 
     app.run(move |cx| {
@@ -67,11 +52,11 @@ fn main() {
         });
         cx.activate(true);
 
-        let quit_procs = running_processes.clone();
+        let quit_sup = supervisor.clone();
         cx.on_app_quit(move |_| {
-            let procs = quit_procs.clone();
+            let sup = quit_sup.clone();
             async move {
-                stop_all_processes(&procs);
+                sup.stop_all();
             }
         })
         .detach();
@@ -94,15 +79,15 @@ fn main() {
             ..Default::default()
         };
 
-        let procs = running_processes.clone();
+        let sup = supervisor.clone();
         let handle = tokio_handle.clone();
         gpui_kit::open_window(window_options, cx, move |window, cx| {
             window.activate_window();
-            cx.new(|cx| BonLoginApp::new(db, handle, procs, window, cx))
+            cx.new(|cx| BonLoginApp::new(db, handle, sup, window, cx))
         })
         .expect("Failed to open BonLogin window");
         cx.activate(true);
     });
 
-    stop_all_processes(&cleanup_processes);
+    cleanup_supervisor.stop_all();
 }

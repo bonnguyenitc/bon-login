@@ -3,33 +3,101 @@ use crate::models::{
     ProxyProtocol, SavedProxy, unix_now,
 };
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-static APP_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-    let dir = dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Library/Application Support")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("com.bonlogin.app");
-    for sub in ["profiles", "kernels", "states", "screenshots", "extensions", "backups"] {
+const WORKSPACE_SUBDIRS: &[&str] = &[
+    "profiles",
+    "kernels",
+    "states",
+    "screenshots",
+    "extensions",
+    "backups",
+    "flows",
+    "downloads",
+];
+
+pub fn ensure_workspace_subdirs(dir: &Path) {
+    for sub in WORKSPACE_SUBDIRS {
         let _ = std::fs::create_dir_all(dir.join(sub));
     }
+}
+
+pub fn system_app_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Library/Application Support")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("com.bonlogin.app")
+}
+
+static APP_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    if let Ok(custom) = std::env::var("BONLOGIN_DATA_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let dir = PathBuf::from(trimmed);
+            ensure_workspace_subdirs(&dir);
+            return dir;
+        }
+    }
+    #[cfg(test)]
+    let dir = {
+        extern "C" fn cleanup_test_dir() {
+            let p = std::env::temp_dir().join(format!("bonlogin-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(p);
+        }
+        unsafe extern "C" {
+            fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
+        }
+        unsafe {
+            let _ = atexit(cleanup_test_dir);
+        }
+        std::env::temp_dir().join(format!("bonlogin-test-{}", std::process::id()))
+    };
+    #[cfg(not(test))]
+    let dir = system_app_data_dir();
+    ensure_workspace_subdirs(&dir);
     dir
 });
 
-pub fn app_data_dir() -> anyhow::Result<PathBuf> {
-    Ok(APP_DATA_DIR.clone())
+pub fn default_workspace_root() -> PathBuf {
+    APP_DATA_DIR.clone()
 }
 
-pub fn user_downloads_dir() -> PathBuf {
+pub fn app_data_dir() -> anyhow::Result<PathBuf> {
+    Ok(default_workspace_root())
+}
+
+pub fn export_dir_for_root(root_dir: &Path) -> PathBuf {
     #[cfg(test)]
-    let dir = APP_DATA_DIR.join("backups");
+    let dir = root_dir.join("backups");
     #[cfg(not(test))]
-    let dir = dirs::download_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
-        .unwrap_or_else(|| APP_DATA_DIR.join("backups"));
+    let dir = if root_dir == system_app_data_dir() {
+        dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .unwrap_or_else(|| APP_DATA_DIR.join("backups"))
+    } else {
+        root_dir.join("backups")
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+pub fn read_saved_cookies_in(root_dir: &Path, short_id: &str) -> Option<String> {
+    if short_id.is_empty() {
+        return None;
+    }
+    let states_dir = root_dir.join("states");
+    let pre_path = states_dir.join(format!("bon_{short_id}_prelaunch.json"));
+    if let Ok(s) = std::fs::read_to_string(&pre_path)
+        && !s.trim().is_empty()
+    {
+        return Some(s);
+    }
+    let state_path = states_dir.join(format!("bon_{short_id}_state.json"));
+    std::fs::read_to_string(&state_path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn apply_fast_pragmas(conn: &Connection) {
@@ -45,24 +113,291 @@ fn apply_fast_pragmas(conn: &Connection) {
 
 pub struct Database {
     conn: Connection,
+    root_dir: PathBuf,
+    temp_owned: bool,
 }
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if self.temp_owned && self.root_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.root_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+pub type Workspace = Database;
 
 impl Database {
     pub fn open_default() -> anyhow::Result<Self> {
-        let db_path = app_data_dir()?.join("bonlogin.sqlite3");
+        Self::open_at(app_data_dir()?)
+    }
+
+    pub fn open_at(root_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let root_dir = root_dir.into();
+        ensure_workspace_subdirs(&root_dir);
+        let db_path = root_dir.join("bonlogin.sqlite3");
         let conn = Connection::open(db_path)?;
         apply_fast_pragmas(&conn);
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            root_dir,
+            temp_owned: false,
+        };
         db.init_schema()?;
         Ok(db)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
+        let root_dir = std::env::temp_dir().join(format!(
+            "bonlogin-mem-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
         let conn = Connection::open_in_memory()?;
         apply_fast_pragmas(&conn);
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            root_dir,
+            temp_owned: true,
+        };
         db.init_schema()?;
         Ok(db)
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+
+    pub fn profile_user_data_dir(&self, profile_id: &str) -> anyhow::Result<PathBuf> {
+        crate::launcher::profile_user_data_dir_in(&self.root_dir, profile_id)
+    }
+
+    pub fn profile_download_dir(&self, short_id: &str) -> PathBuf {
+        crate::launcher::profile_download_dir_in(&self.root_dir, short_id)
+    }
+
+    pub fn states_dir(&self) -> PathBuf {
+        self.root_dir.join("states")
+    }
+
+
+    pub fn backups_dir(&self) -> PathBuf {
+        let d = if self.temp_owned {
+            self.root_dir.join("backups")
+        } else {
+            export_dir_for_root(&self.root_dir)
+        };
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    pub fn read_prelaunch_cookies(&self, short_id: &str) -> String {
+        crate::launcher::read_prelaunch_cookies_in(&self.root_dir, short_id)
+    }
+
+    pub fn read_saved_cookies(&self, short_id: &str) -> Option<String> {
+        read_saved_cookies_in(&self.root_dir, short_id)
+    }
+
+    pub fn save_prelaunch_cookies(&self, short_id: &str, raw: &str) -> anyhow::Result<()> {
+        crate::launcher::save_prelaunch_cookies_in(&self.root_dir, short_id, raw)
+    }
+
+    pub fn read_bookmarks(&self, profile: &Profile) -> Vec<(String, String)> {
+        crate::launcher::read_profile_bookmarks_in(&self.root_dir, profile)
+    }
+
+    pub fn write_bookmarks_checked(
+        &self,
+        profile: &Profile,
+        items: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        crate::launcher::write_profile_bookmarks_checked_in(&self.root_dir, profile, items)
+    }
+
+    pub fn save_profile_bundle(
+        &self,
+        profile: &Profile,
+        cookies_raw: Option<&str>,
+        bookmarks: Option<&[(String, String)]>,
+    ) -> anyhow::Result<Option<crate::launcher::NormalizedCookieBundle>> {
+        let normalized_cookies = match cookies_raw {
+            None => None,
+            Some(raw) if raw.trim().is_empty() => None,
+            Some(raw) => Some(crate::launcher::parse_and_normalize_cookies(
+                raw,
+                Some(&profile.startup_url),
+            )?),
+        };
+
+        let is_live = self.probe_live_runtime(&profile.id).is_some();
+        if let Some(bms) = bookmarks {
+            let existing = self.read_bookmarks(profile);
+            if is_live && bms != existing.as_slice() {
+                anyhow::bail!(
+                    "Stop running browser '{}' before editing disk Bookmarks so Chromium does not overwrite them on exit",
+                    profile.name
+                );
+            }
+        }
+
+        self.upsert_profile(profile)?;
+        if cookies_raw.is_some() {
+            let payload_to_save = normalized_cookies
+                .as_ref()
+                .map(|b| b.to_state_json_pretty())
+                .unwrap_or_default();
+            self.save_prelaunch_cookies(&profile.short_id(), &payload_to_save)?;
+        }
+        if let Some(bms) = bookmarks
+            && !is_live
+        {
+            let user_data_dir = self.profile_user_data_dir(&profile.id)?;
+            crate::launcher::write_profile_bookmarks_items(&user_data_dir, bms);
+        }
+        Ok(normalized_cookies)
+    }
+
+    pub fn probe_live_runtime(&self, profile_id: &str) -> Option<crate::models::RuntimeInfo> {
+        crate::launcher::probe_live_runtime_in(&self.root_dir, profile_id)
+    }
+
+    pub fn stop_external_runtime(&self, profile_id: &str, short_id: &str) -> bool {
+        crate::launcher::stop_external_runtime_in(&self.root_dir, profile_id, short_id)
+    }
+
+    pub fn clean_profile_cache(&self, profile_id: &str) -> anyhow::Result<(u64, u64)> {
+        crate::launcher::clean_profile_cache_in(&self.root_dir, profile_id)
+    }
+
+    pub fn wipe_profile_data(&self, profile_id: &str) -> anyhow::Result<()> {
+        crate::launcher::wipe_profile_data_in(&self.root_dir, profile_id)
+    }
+
+    pub fn export_profile_archive_zip(&self, profile: &Profile) -> anyhow::Result<PathBuf> {
+        crate::launcher::export_profile_archive_zip_in(
+            &self.root_dir,
+            &self.backups_dir(),
+            profile,
+        )
+    }
+
+    pub fn import_profile_archive_zip(&self, zip_path: &Path) -> anyhow::Result<Profile> {
+        let existing_ids: HashSet<String> = self
+            .list_profiles()?
+            .into_iter()
+            .chain(self.list_trashed_profiles()?)
+            .map(|p| p.id)
+            .collect();
+        let restored = crate::launcher::import_profile_archive_zip_in(
+            &self.root_dir,
+            zip_path,
+            &existing_ids,
+        )?;
+        self.upsert_profile(&restored)?;
+        Ok(restored)
+    }
+
+    pub fn flow_file_path(&self, name: &str) -> anyhow::Result<PathBuf> {
+        crate::flows::flow_file_path_in(&self.root_dir, name)
+    }
+
+    pub fn history_flow_path(&self, short_id: &str) -> PathBuf {
+        crate::flows::history_flow_path_in(&self.root_dir, short_id)
+    }
+
+    pub fn clear_flow_session_cache(&self, short_id: &str) {
+        crate::flows::clear_flow_session_cache_in(&self.root_dir, short_id);
+    }
+
+    pub fn list_flows(&self) -> Vec<crate::flows::AgentFlow> {
+        crate::flows::list_saved_flows_in(&self.root_dir)
+    }
+
+    pub fn mutate_flow_step(
+        &self,
+        flow_raw: &str,
+        step_idx: usize,
+        action: &str,
+    ) -> anyhow::Result<crate::flows::AgentFlow> {
+        crate::flows::mutate_flow_step_in(&self.root_dir, flow_raw, step_idx, action)
+    }
+
+    pub fn save_history_as_flow(
+        &self,
+        flow_raw: &str,
+        profile: &Profile,
+        var_pairs: &[(String, String)],
+    ) -> anyhow::Result<crate::flows::AgentFlow> {
+        crate::flows::save_profile_history_as_flow_in(&self.root_dir, flow_raw, profile, var_pairs)
+    }
+
+    pub fn delete_flow(&self, flow_raw: &str) -> anyhow::Result<bool> {
+        let path = self.flow_file_path(flow_raw)?;
+        let existed = path.is_file();
+        if existed {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(existed)
+    }
+
+
+    pub fn clone_profiles(
+        &self,
+        src: &Profile,
+        count: usize,
+        custom_prefix: Option<&str>,
+    ) -> anyhow::Result<Vec<Profile>> {
+        let count = count.max(1);
+        let src_sid = src.short_id();
+        let prefix_opt = custom_prefix.map(str::trim).filter(|s| !s.is_empty());
+        let mut created = Vec::with_capacity(count);
+        self.with_transaction(|db| {
+            for i in 1..=count {
+                let mut c = src.cloned_with_new_seed();
+                if let Some(prefix) = prefix_opt {
+                    c.name = if count == 1 {
+                        prefix.to_string()
+                    } else {
+                        format!("{prefix}-{i:02}")
+                    };
+                } else if count > 1 {
+                    c.name = format!("{} (Copy {i})", src.name);
+                }
+                db.upsert_profile(&c)?;
+                created.push(c);
+            }
+            Ok(())
+        })?;
+        let states = self.states_dir();
+        let src_cookie = states.join(format!("bon_{src_sid}_prelaunch.json"));
+        let fallback_cookie = states.join(format!("bon_{src_sid}_state.json"));
+        let cookie_src = if src_cookie.is_file() {
+            Some(src_cookie)
+        } else if fallback_cookie.is_file() {
+            Some(fallback_cookie)
+        } else {
+            None
+        };
+        if let Some(cs) = cookie_src {
+            let _ = std::fs::create_dir_all(&states);
+            for c in &created {
+                let dst = states.join(format!("bon_{}_prelaunch.json", c.short_id()));
+                let _ = crate::extensions::clonefile_or_copy(&cs, &dst);
+            }
+        }
+        let src_bms = self.read_bookmarks(src);
+        if !src_bms.is_empty() {
+            for c in &created {
+                if let Ok(user_data_dir) = self.profile_user_data_dir(&c.id) {
+                    crate::launcher::write_profile_bookmarks_items(&user_data_dir, &src_bms);
+                }
+            }
+        }
+        Ok(created)
     }
 
     pub fn with_transaction<T>(&self, f: impl FnOnce(&Self) -> anyhow::Result<T>) -> anyhow::Result<T> {
@@ -681,7 +1016,7 @@ impl Database {
         let json = serde_json::to_string_pretty(&profiles)?;
         let path = custom_out
             .map(PathBuf::from)
-            .unwrap_or_else(|| user_downloads_dir().join("bonlogin_profiles_backup.json"));
+            .unwrap_or_else(|| self.backups_dir().join("bonlogin_profiles_backup.json"));
         std::fs::write(&path, &json)?;
         Ok((path, json))
     }
@@ -689,7 +1024,7 @@ impl Database {
     /// Imports profiles from a JSON array string (generating new UUIDs if an ID already exists).
     pub fn import_profiles_json(&self, raw_json: &str) -> anyhow::Result<usize> {
         let parsed: Vec<Profile> = serde_json::from_str(raw_json.trim())?;
-        let existing_ids: std::collections::HashSet<String> = self
+        let mut existing_ids: std::collections::HashSet<String> = self
             .list_profiles()?
             .into_iter()
             .chain(self.list_trashed_profiles()?)
@@ -698,8 +1033,9 @@ impl Database {
         self.with_transaction(|db| {
             let mut count = 0;
             for mut p in parsed {
-                if existing_ids.contains(&p.id) {
+                if uuid::Uuid::parse_str(&p.id).is_err() || !existing_ids.insert(p.id.clone()) {
                     p.id = uuid::Uuid::new_v4().to_string();
+                    existing_ids.insert(p.id.clone());
                 }
                 db.upsert_profile(&p)?;
                 count += 1;
@@ -752,7 +1088,7 @@ impl Database {
         let csv = lines.join("\n");
         let path = custom_out
             .map(PathBuf::from)
-            .unwrap_or_else(|| user_downloads_dir().join("bonlogin_profiles.csv"));
+            .unwrap_or_else(|| self.backups_dir().join("bonlogin_profiles.csv"));
         std::fs::write(&path, &csv)?;
         Ok((path, csv))
     }
@@ -927,59 +1263,75 @@ impl Database {
             None => (None, None, None, None, None, None),
         };
 
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO proxies (
-                id, name, group_tag, protocol, host, port, username, password,
-                geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                geo_latency_ms, last_error, created_at, expired_at, change_ip_url
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                group_tag = excluded.group_tag,
-                protocol = excluded.protocol,
-                host = excluded.host,
-                port = excluded.port,
-                username = excluded.username,
-                password = excluded.password,
-                geo_ip = excluded.geo_ip,
-                geo_country = excluded.geo_country,
-                geo_timezone = excluded.geo_timezone,
-                geo_locale = excluded.geo_locale,
-                geo_accept_lang = excluded.geo_accept_lang,
-                geo_latency_ms = excluded.geo_latency_ms,
-                last_error = excluded.last_error,
-                expired_at = excluded.expired_at,
-                change_ip_url = excluded.change_ip_url",
-        )?;
-        stmt.execute(params![
-                proxy.id,
-                proxy.name,
-                proxy.group_tag,
-                proxy.config.protocol.as_str(),
-                proxy.config.host,
-                proxy.config.port,
-                proxy.config.username.as_deref(),
-                proxy.config.password.as_deref(),
-                geo_ip,
-                geo_country,
-                geo_tz,
-                geo_loc,
-                geo_lang,
-                geo_ms,
-                proxy.last_error.as_deref(),
-                proxy.created_at,
-                proxy.expired_at,
-                proxy.config.change_ip_url.as_deref(),
-            ],
-        )?;
-        if !proxy.group_tag.trim().is_empty() {
-            let _ = self.insert_tag(proxy.group_tag.trim());
-        }
-        Ok(())
+        self.with_transaction(|db| {
+            db.conn
+                .prepare_cached(
+                    "INSERT INTO proxies (
+                        id, name, group_tag, protocol, host, port, username, password,
+                        geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
+                        geo_latency_ms, last_error, created_at, expired_at, change_ip_url
+                    ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                        ?9, ?10, ?11, ?12, ?13,
+                        ?14, ?15, ?16, ?17, ?18
+                    )
+                    ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        group_tag = excluded.group_tag,
+                        protocol = excluded.protocol,
+                        host = excluded.host,
+                        port = excluded.port,
+                        username = excluded.username,
+                        password = excluded.password,
+                        geo_ip = excluded.geo_ip,
+                        geo_country = excluded.geo_country,
+                        geo_timezone = excluded.geo_timezone,
+                        geo_locale = excluded.geo_locale,
+                        geo_accept_lang = excluded.geo_accept_lang,
+                        geo_latency_ms = excluded.geo_latency_ms,
+                        last_error = excluded.last_error,
+                        expired_at = excluded.expired_at,
+                        change_ip_url = excluded.change_ip_url",
+                )?
+                .execute(params![
+                    proxy.id,
+                    proxy.name,
+                    proxy.group_tag,
+                    proxy.config.protocol.as_str(),
+                    proxy.config.host,
+                    proxy.config.port,
+                    proxy.config.username.as_deref(),
+                    proxy.config.password.as_deref(),
+                    geo_ip,
+                    geo_country,
+                    geo_tz,
+                    geo_loc,
+                    geo_lang,
+                    geo_ms,
+                    proxy.last_error.as_deref(),
+                    proxy.created_at,
+                    proxy.expired_at,
+                    proxy.config.change_ip_url.as_deref(),
+                ])?;
+            db.conn
+                .prepare_cached(
+                    "UPDATE profiles
+                     SET proxy_change_ip_url = ?1
+                     WHERE proxy_protocol = ?2 AND proxy_host = ?3 AND proxy_port = ?4
+                       AND proxy_username IS ?5",
+                )?
+                .execute(params![
+                    proxy.config.change_ip_url.as_deref(),
+                    proxy.config.protocol.as_str(),
+                    proxy.config.host,
+                    proxy.config.port,
+                    proxy.config.username.as_deref(),
+                ])?;
+            if !proxy.group_tag.trim().is_empty() {
+                let _ = db.insert_tag(proxy.group_tag.trim());
+            }
+            Ok(())
+        })
     }
 
     pub fn update_saved_proxy_check(
@@ -1009,20 +1361,21 @@ impl Database {
         Ok(())
     }
 
-    /// Updates cached GeoIP across all saved proxies and profiles matching `(protocol, host, port)`.
+    /// Updates cached GeoIP across all saved proxies and profiles matching `(protocol, host, port, username)`.
     pub fn sync_geo_for_proxy_endpoint(
         &self,
         cfg: &ProxyConfig,
         geo: &GeoInfo,
     ) -> anyhow::Result<()> {
         let proto = cfg.protocol.as_str();
+        let user = cfg.username.as_deref();
         self.with_transaction(|db| {
             db.conn
                 .prepare_cached(
                     "UPDATE proxies
                      SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
                          geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = NULL
-                     WHERE protocol = ?7 AND host = ?8 AND port = ?9",
+                     WHERE protocol = ?7 AND host = ?8 AND port = ?9 AND username IS ?10",
                 )?
                 .execute(params![
                     geo.ip,
@@ -1033,14 +1386,16 @@ impl Database {
                     geo.latency_ms,
                     proto,
                     cfg.host,
-                    cfg.port
+                    cfg.port,
+                    user
                 ])?;
             db.conn
                 .prepare_cached(
                     "UPDATE profiles
                      SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
                          geo_accept_lang = ?5, geo_latency_ms = ?6
-                     WHERE proxy_protocol = ?7 AND proxy_host = ?8 AND proxy_port = ?9",
+                     WHERE proxy_protocol = ?7 AND proxy_host = ?8 AND proxy_port = ?9
+                       AND proxy_username IS ?10",
                 )?
                 .execute(params![
                     geo.ip,
@@ -1051,7 +1406,8 @@ impl Database {
                     geo.latency_ms,
                     proto,
                     cfg.host,
-                    cfg.port
+                    cfg.port,
+                    user
                 ])?;
             Ok(())
         })
@@ -1357,7 +1713,7 @@ mod tests {
         fake_crx.extend_from_slice(&4u32.to_le_bytes());
         fake_crx.extend_from_slice(b"ABCD");
         fake_crx.extend_from_slice(b"PK\x03\x04ZIPDATA");
-        let stripped = crate::launcher::strip_crx_header(&fake_crx).unwrap();
+        let stripped = crate::extensions::strip_crx_header(&fake_crx).unwrap();
         assert_eq!(stripped, b"PK\x03\x04ZIPDATA");
 
         // Test savepoint transaction rollback on error and commit on success
@@ -1403,5 +1759,124 @@ mod tests {
         assert_eq!(ver, 1);
         db.init_schema().unwrap();
         assert_eq!(db.list_profiles().unwrap().len(), list_after.len());
+    }
+
+    #[test]
+    fn test_workspace_isolation_cookie_precedence_and_proxy_username_sync() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "bonlogin-ws-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let ws = Workspace::open_at(&tmp_root).unwrap();
+        assert_eq!(ws.root_dir(), tmp_root.as_path());
+
+        // 1. Canonical cookie precedence: prelaunch.json wins over older state.json
+        let sid = "ckprec01";
+        std::fs::write(
+            ws.states_dir().join(format!("bon_{sid}_state.json")),
+            r#"{"cookies":[{"name":"old","value":"1"}]}"#,
+        )
+        .unwrap();
+        assert!(ws.read_saved_cookies(sid).unwrap().contains("\"old\""));
+        std::fs::write(
+            ws.states_dir().join(format!("bon_{sid}_prelaunch.json")),
+            r#"{"cookies":[{"name":"fresh","value":"2"}]}"#,
+        )
+        .unwrap();
+        assert!(ws.read_saved_cookies(sid).unwrap().contains("\"fresh\""));
+
+        // 2. Residential gateway sharing (protocol, host, port) across US vs JP usernames
+        let mut p_us = Profile::new_default("Resi US", PlatformType::MacOS);
+        p_us.proxy = Some(ProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "gw.resi.example".to_string(),
+            port: 22225,
+            username: Some("acct-country-us".to_string()),
+            password: Some("pw".to_string()),
+            change_ip_url: None,
+        });
+        let mut p_jp = Profile::new_default("Resi JP", PlatformType::MacOS);
+        p_jp.proxy = Some(ProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "gw.resi.example".to_string(),
+            port: 22225,
+            username: Some("acct-country-jp".to_string()),
+            password: Some("pw".to_string()),
+            change_ip_url: None,
+        });
+        ws.upsert_profile(&p_us).unwrap();
+        ws.upsert_profile(&p_jp).unwrap();
+
+        let sp_us = SavedProxy::new(
+            "US Sticky",
+            "Resi",
+            ProxyConfig {
+                change_ip_url: Some("https://rotate.example/us".to_string()),
+                ..p_us.proxy.clone().unwrap()
+            },
+        );
+        ws.upsert_proxy(&sp_us).unwrap();
+        let us_geo = GeoInfo {
+            ip: "198.51.100.1".to_string(),
+            country_code: "US".to_string(),
+            timezone: "America/New_York".to_string(),
+            locale: "en-US".to_string(),
+            accept_lang: "en-US,en;q=0.9".to_string(),
+            latency_ms: Some(45),
+        };
+        ws.sync_geo_for_proxy_endpoint(&sp_us.config, &us_geo).unwrap();
+
+        let reloaded = ws.list_profiles().unwrap();
+        let got_us = reloaded.iter().find(|p| p.id == p_us.id).unwrap();
+        let got_jp = reloaded.iter().find(|p| p.id == p_jp.id).unwrap();
+        assert_eq!(
+            got_us.resolved_geo.as_ref().map(|g| g.country_code.as_str()),
+            Some("US")
+        );
+        assert_eq!(
+            got_us
+                .proxy
+                .as_ref()
+                .and_then(|c| c.change_ip_url.as_deref()),
+            Some("https://rotate.example/us")
+        );
+        assert!(got_jp.resolved_geo.is_none());
+        assert!(
+            got_jp
+                .proxy
+                .as_ref()
+                .and_then(|c| c.change_ip_url.as_deref())
+                .is_none()
+        );
+
+        // 3. Atomic Workspace::clone_profiles copies saved cookies AND bookmarks
+        let src_bms = vec![
+            ("Shop".to_string(), "https://shop.example.com".to_string()),
+            ("Ads".to_string(), "https://ads.example.com".to_string()),
+        ];
+        ws.write_bookmarks_checked(&p_us, &src_bms).unwrap();
+        std::fs::write(
+            ws.states_dir()
+                .join(format!("bon_{}_prelaunch.json", p_us.short_id())),
+            r#"{"cookies":[{"name":"sess","value":"ok"}]}"#,
+        )
+        .unwrap();
+        let clones = ws.clone_profiles(&p_us, 2, Some("US Clone")).unwrap();
+        assert_eq!(clones.len(), 2);
+        assert_eq!(clones[0].name, "US Clone-01");
+        assert!(
+            ws.read_saved_cookies(&clones[0].short_id())
+                .unwrap()
+                .contains("\"sess\"")
+        );
+        assert_eq!(ws.read_bookmarks(&clones[0]), src_bms);
+        assert_eq!(ws.read_bookmarks(&clones[1]), src_bms);
+        assert!(
+            system_app_data_dir()
+                .to_string_lossy()
+                .ends_with("com.bonlogin.app")
+        );
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

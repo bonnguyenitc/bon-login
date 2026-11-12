@@ -390,7 +390,7 @@ All application data is stored locally under `~/Library/Application Support/com.
 ## Testing
 
 ```bash
-# Run the full unit & integration test suite (22 tests: SOCKS5 ATYP 0x03, Fail-Closed GeoIP,
+# Run the full unit & integration test suite (36 tests: SOCKS5 ATYP 0x03, Fail-Closed GeoIP,
 # SQLite CRUD, Cookie Parser, CRX3 Key Extraction, AgentFlow Locators, HTTP API, E2E Launch)
 cargo test --bin bon-login
 ```

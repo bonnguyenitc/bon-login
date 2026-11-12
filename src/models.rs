@@ -591,6 +591,20 @@ impl SavedProxy {
         }
         None
     }
+
+    pub fn parse_expiration_strict(raw: &str) -> Result<Option<i64>, &'static str> {
+        let s = raw.trim();
+        if s.is_empty()
+            || s.eq_ignore_ascii_case("none")
+            || s.eq_ignore_ascii_case("clear")
+            || s == "0"
+        {
+            return Ok(None);
+        }
+        Self::parse_expiration_input(s).map(Some).ok_or(
+            "Invalid expiration date (expected DD/MM/YYYY, YYYY-MM-DD, days like 30d, or 'clear')",
+        )
+    }
 }
 
 fn valid_civil_date(y: i32, m: u32, d: u32) -> bool {
@@ -709,15 +723,50 @@ impl Profile {
         }
     }
 
+    pub fn set_seed(&mut self, new_seed: u32) {
+        self.seed = new_seed;
+        self.os_version = self.os_platform.os_version_for_seed(new_seed).to_string();
+        self.brand_version = self.brand.version_for_seed(new_seed).to_string();
+        self.hardware_concurrency = self.os_platform.optimal_cores_for_seed(new_seed);
+    }
+
+    pub fn reseed(&mut self) -> u32 {
+        let new_seed = Self::random_seed();
+        self.set_seed(new_seed);
+        new_seed
+    }
+
+    pub fn set_platform(&mut self, os: PlatformType) {
+        self.os_platform = os;
+        self.os_version = os.os_version_for_seed(self.seed).to_string();
+        self.brand_version = self.brand.version_for_seed(self.seed).to_string();
+        self.hardware_concurrency = os.optimal_cores_for_seed(self.seed);
+        self.window_size = os.default_window_size().to_string();
+        if os != PlatformType::MacOS && self.gpu_spoofing == GpuSpoofMode::NativePassthrough {
+            self.gpu_spoofing = GpuSpoofMode::SeedGenerated;
+        }
+    }
+
+    pub fn set_brand(&mut self, brand: BrowserBrand) {
+        self.brand = brand;
+        self.brand_version = brand.version_for_seed(self.seed).to_string();
+    }
+
+    pub fn assign_saved_proxy(&mut self, sp: &SavedProxy) {
+        self.proxy = Some(sp.config.clone());
+        self.resolved_geo = sp.resolved_geo.clone();
+    }
+
+    pub fn clear_proxy(&mut self) {
+        self.proxy = None;
+        self.resolved_geo = None;
+    }
+
     pub fn cloned_with_new_seed(&self) -> Self {
         let mut copy = self.clone();
-        let new_seed = Self::random_seed();
         copy.id = uuid::Uuid::new_v4().to_string();
         copy.name = format!("{} (Copy)", self.name);
-        copy.seed = new_seed;
-        copy.os_version = copy.os_platform.os_version_for_seed(new_seed).to_string();
-        copy.brand_version = copy.brand.version_for_seed(new_seed).to_string();
-        copy.hardware_concurrency = copy.os_platform.optimal_cores_for_seed(new_seed);
+        copy.reseed();
         copy.created_at = unix_now();
         copy.last_launched_at = None;
         copy.deleted_at = None;
@@ -951,9 +1000,9 @@ impl RuntimeInfo {
 #[derive(Debug, Clone)]
 pub enum ProfileStatus {
     Stopped,
-    Starting(String),
+    Starting,
     Running(RuntimeInfo),
-    Error(String),
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -983,6 +1032,127 @@ impl BrowserExtension {
         None
     }
 
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileEditorDraft {
+    pub profile: Profile,
+    pub is_edit: bool,
+    pub cores_pinned: bool,
+}
+
+impl ProfileEditorDraft {
+    pub fn from_profile(template: &Profile, is_edit: bool) -> Self {
+        let mut profile = template.clone();
+        if !is_edit {
+            profile.id = uuid::Uuid::new_v4().to_string();
+        }
+        let cores_pinned = is_edit
+            && profile.hardware_concurrency
+                != profile.os_platform.optimal_cores_for_seed(profile.seed);
+        Self {
+            profile,
+            is_edit,
+            cores_pinned,
+        }
+    }
+
+    pub fn select_platform(&mut self, os: PlatformType) {
+        self.profile.set_platform(os);
+        self.cores_pinned = false;
+    }
+
+    pub fn select_brand(&mut self, brand: BrowserBrand) {
+        self.profile.set_brand(brand);
+    }
+
+    pub fn select_gpu_spoofing(&mut self, mode: GpuSpoofMode) {
+        if self.profile.os_platform != PlatformType::MacOS
+            && mode == GpuSpoofMode::NativePassthrough
+        {
+            self.profile.gpu_spoofing = GpuSpoofMode::SeedGenerated;
+        } else {
+            self.profile.gpu_spoofing = mode;
+        }
+    }
+
+    pub fn select_cores(&mut self, cores: u8) {
+        self.profile.hardware_concurrency = cores;
+        self.cores_pinned = true;
+    }
+
+    pub fn randomize_to_seed(&mut self, new_seed: u32) {
+        self.profile.set_seed(new_seed);
+        self.cores_pinned = false;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize(
+        &self,
+        name: &str,
+        seed_str: &str,
+        require_proxy: bool,
+        auto_geo: bool,
+        custom_tz: &str,
+        custom_locale: &str,
+        startup_url: &str,
+        notes: &str,
+        totp_secret: &str,
+    ) -> Result<Profile, String> {
+        let clean_name = name.trim().to_string();
+        if clean_name.is_empty() {
+            return Err("Profile name cannot be empty".to_string());
+        }
+        let seed: u32 = seed_str
+            .trim()
+            .parse()
+            .map_err(|_| "Seed must be a valid 32-bit unsigned integer".to_string())?;
+
+        let mut out = self.profile.clone();
+        out.name = clean_name;
+        out.group_tag = out.group_tag.trim().to_string();
+
+        if seed != out.seed {
+            let pinned = self.cores_pinned.then_some(out.hardware_concurrency);
+            out.set_seed(seed);
+            if let Some(c) = pinned {
+                out.hardware_concurrency = c;
+            }
+        }
+        if out.os_platform != PlatformType::MacOS
+            && out.gpu_spoofing == GpuSpoofMode::NativePassthrough
+        {
+            out.gpu_spoofing = GpuSpoofMode::SeedGenerated;
+        }
+
+        if !require_proxy {
+            out.clear_proxy();
+        } else if out.proxy.is_none() {
+            return Err(
+                "Select a proxy from Proxy manager or switch to 'Without proxy'".to_string(),
+            );
+        }
+
+        if auto_geo {
+            out.custom_timezone = None;
+            out.custom_locale = None;
+        } else {
+            let tz = custom_tz.trim();
+            let loc = custom_locale.trim();
+            out.custom_timezone = (!tz.is_empty()).then(|| tz.to_string());
+            out.custom_locale = (!loc.is_empty()).then(|| loc.to_string());
+        }
+
+        let url_trimmed = startup_url.trim();
+        out.startup_url = if url_trimmed.is_empty() {
+            "https://browserscan.net".to_string()
+        } else {
+            url_trimmed.to_string()
+        };
+        out.notes = notes.trim().to_string();
+        out.totp_secret = totp_secret.trim().to_string();
+        Ok(out)
+    }
 }
 
 pub fn unix_now() -> i64 {
@@ -1203,16 +1373,22 @@ mod tests {
         assert!(SavedProxy::parse_expiration_input("2026-04-31").is_none());
         assert!(SavedProxy::parse_expiration_input("29/02/2028").is_some());
 
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-model-ck-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
         let sid = "testck01";
-        let dst_sid = "testck02";
-        crate::launcher::save_prelaunch_cookies(sid, "[{\"name\":\"c_user\",\"value\":\"1\"}]")
-            .unwrap();
-        assert!(crate::launcher::read_prelaunch_cookies(sid).contains("c_user"));
-        crate::launcher::copy_prelaunch_cookies(sid, dst_sid);
-        assert!(crate::launcher::read_prelaunch_cookies(dst_sid).contains("c_user"));
-        crate::launcher::save_prelaunch_cookies(sid, "   ").unwrap();
-        crate::launcher::save_prelaunch_cookies(dst_sid, "   ").unwrap();
-        assert!(crate::launcher::read_prelaunch_cookies(sid).is_empty());
+        crate::launcher::save_prelaunch_cookies_in(
+            &tmp,
+            sid,
+            "[{\"name\":\"c_user\",\"value\":\"1\"}]",
+        )
+        .unwrap();
+        assert!(crate::launcher::read_prelaunch_cookies_in(&tmp, sid).contains("c_user"));
+        crate::launcher::save_prelaunch_cookies_in(&tmp, sid, "   ").unwrap();
+        assert!(crate::launcher::read_prelaunch_cookies_in(&tmp, sid).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1336,5 +1512,119 @@ mod tests {
         }
         assert!(!contains_ignore_ascii_case("@@@@@@@@@@@@@@@@@@@@", "`"));
         assert!(contains_ignore_ascii_case("@@@@@@@@@@@@@@@@@@@`", "`"));
+    }
+
+    #[test]
+    fn test_profile_coherence_invariants_preserve_macos_gpu_and_guard_windows_mismatch() {
+        let mut p = Profile::new_default("Mac Pro", PlatformType::MacOS);
+        p.gpu_spoofing = GpuSpoofMode::NativePassthrough;
+        let old_seed = p.seed;
+        let new_seed = p.reseed();
+        assert_ne!(new_seed, 0);
+        let _ = old_seed;
+        // Reseeding on macOS MUST preserve user-configured NativePassthrough GPU mode
+        assert_eq!(p.gpu_spoofing, GpuSpoofMode::NativePassthrough);
+        assert_eq!(p.os_version, PlatformType::MacOS.os_version_for_seed(new_seed));
+
+        // Switching platform to Windows MUST switch GPU spoofing to SeedGenerated (avoiding Apple GPU leak on Windows UA)
+        p.set_platform(PlatformType::Windows);
+        assert_eq!(p.os_platform, PlatformType::Windows);
+        assert_eq!(p.gpu_spoofing, GpuSpoofMode::SeedGenerated);
+        assert_eq!(p.os_version, PlatformType::Windows.os_version_for_seed(new_seed));
+
+        p.set_brand(BrowserBrand::Edge);
+        assert_eq!(p.brand, BrowserBrand::Edge);
+        assert_eq!(p.brand_version, BrowserBrand::Edge.version_for_seed(new_seed));
+    }
+
+    #[test]
+    fn test_profile_editor_draft_coherence_macos_gpu_manual_seed_and_cores_override() {
+        let mut orig = Profile::new_default("Mac Studio", PlatformType::MacOS);
+        orig.seed = 1302;
+        orig.set_seed(1302);
+        orig.gpu_spoofing = GpuSpoofMode::NativePassthrough;
+
+        let mut draft = ProfileEditorDraft::from_profile(&orig, true);
+
+        // 1. Selecting macOS in the editor MUST NOT clobber NativePassthrough GPU spoofing
+        draft.select_platform(PlatformType::MacOS);
+        assert_eq!(draft.profile.gpu_spoofing, GpuSpoofMode::NativePassthrough);
+
+        // 2. Selecting Windows switches GPU to SeedGenerated AND blocks NativePassthrough while on Windows
+        draft.select_platform(PlatformType::Windows);
+        assert_eq!(draft.profile.gpu_spoofing, GpuSpoofMode::SeedGenerated);
+        draft.select_gpu_spoofing(GpuSpoofMode::NativePassthrough);
+        assert_eq!(draft.profile.gpu_spoofing, GpuSpoofMode::SeedGenerated);
+
+        // 3. Typing a new seed manually in the input box recomputes optimal CPU cores + OS/Brand versions
+        let seed_pick_8 = (1000u32..2000)
+            .find(|&s| PlatformType::Windows.optimal_cores_for_seed(s) == 8)
+            .unwrap();
+        let seed_pick_16 = (2000u32..3000)
+            .find(|&s| PlatformType::Windows.optimal_cores_for_seed(s) == 16)
+            .unwrap();
+        draft.randomize_to_seed(seed_pick_8);
+        assert_eq!(draft.profile.hardware_concurrency, 8);
+
+        let finalized = draft
+            .finalize(
+                "Mac Studio Edited",
+                &seed_pick_16.to_string(),
+                false,
+                true,
+                "",
+                "",
+                "",
+                "note",
+                "",
+            )
+            .unwrap();
+        assert_eq!(finalized.id, orig.id);
+        assert_eq!(finalized.seed, seed_pick_16);
+        assert_eq!(
+            finalized.hardware_concurrency,
+            16,
+            "manual seed text edit must update hardware_concurrency when cores were not manually pinned"
+        );
+        assert_eq!(
+            finalized.os_version,
+            PlatformType::Windows.os_version_for_seed(seed_pick_16)
+        );
+
+        // 4. Explicit manual CPU core selection is respected even across seed text edits
+        draft.select_cores(12);
+        let pinned = draft
+            .finalize(
+                "Pinned Cores",
+                &seed_pick_16.to_string(),
+                false,
+                true,
+                "",
+                "",
+                "",
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(pinned.hardware_concurrency, 12);
+    }
+
+    #[test]
+    fn test_seed_edit_then_select_platform_updates_brand_version() {
+        let mut orig = Profile::new_default("SeedOS", PlatformType::MacOS);
+        orig.set_seed(1300);
+        let mut draft = ProfileEditorDraft::from_profile(&orig, true);
+
+        // Simulate typing `1301` in seed_input then clicking an OS pill before saving
+        draft.profile.seed = 1301;
+        draft.select_platform(PlatformType::Windows);
+        let saved = draft
+            .finalize("SeedOS", "1301", false, true, "", "", "", "", "")
+            .unwrap();
+        assert_eq!(
+            saved.brand_version,
+            BrowserBrand::Chrome.version_for_seed(1301),
+            "switching OS after editing seed must not leave brand_version on the old seed"
+        );
     }
 }

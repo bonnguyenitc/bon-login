@@ -260,11 +260,14 @@ pub fn render_profile_table(
                                     .unwrap_or(ProfileStatus::Stopped);
                                 let is_selected = selected_id == Some(profile.id.as_str());
                                 let is_checked = app.checked_profile_ids.contains(&profile.id);
+                                let is_checking_proxy =
+                                    app.profile_aux_tasks.contains_key(&profile.id);
                                 items.push(render_profile_row(
                                     profile,
                                     status,
                                     is_selected,
                                     is_checked,
+                                    is_checking_proxy,
                                     cols,
                                     cx,
                                 ));
@@ -393,7 +396,7 @@ pub fn render_profile_table(
                             .child({
                                 let pid_bm_edit = prof.id.clone();
                                 let pid_bm_click = prof.id.clone();
-                                let bms = crate::launcher::read_profile_bookmarks(&prof);
+                                let bms = app.selected_bookmarks.clone();
                                 v_flex()
                                     .w_full()
                                     .py_1()
@@ -838,10 +841,10 @@ fn build_profile_popup_menu(
                 }),
         );
     menu.item(
-        PopupMenuItem::new("\u{1002e6}   Cookie Robot (Warm-up)").on_click(move |_, _, cx| {
+        PopupMenuItem::new("\u{1002e6}   Cookie Robot (Warm-up)").on_click(move |_, window, cx| {
             let pid = pid_robot.clone();
             app_robot.update(cx, |app, cx| {
-                app.open_cookie_robot_modal(Some(pid), cx);
+                app.open_cookie_robot_modal(Some(pid), window, cx);
             });
         }),
     )
@@ -966,6 +969,7 @@ fn render_profile_row(
     status: ProfileStatus,
     is_selected: bool,
     is_checked: bool,
+    is_checking_proxy: bool,
     cols: ColumnVisibility,
     cx: &mut Context<BonLoginApp>,
 ) -> AnyElement {
@@ -973,14 +977,19 @@ fn render_profile_row(
     let profile_id = profile.id.clone();
     let select_id = profile.id.clone();
     let check_id = profile.id.clone();
-    let proxy_label = match (&profile.proxy, &profile.resolved_geo) {
-        (Some(_), Some(g)) => format!("{} {} ({})", SfSymbol::GLOBE, g.compact_ip(), g.country_code),
-        (Some(p), None) => format!("{} {}", SfSymbol::GLOBE, p.display_short()),
-        (None, _) => "Local IP".to_string(),
+    let proxy_label = if is_checking_proxy {
+        format!("{} Checking...", SfSymbol::GLOBE)
+    } else {
+        match (&profile.proxy, &profile.resolved_geo) {
+            (Some(_), Some(g)) => {
+                format!("{} {} ({})", SfSymbol::GLOBE, g.compact_ip(), g.country_code)
+            }
+            (Some(p), None) => format!("{} {}", SfSymbol::GLOBE, p.display_short()),
+            (None, _) => "Local IP".to_string(),
+        }
     };
-
     let is_running = matches!(status, ProfileStatus::Running(_));
-    let is_starting = matches!(status, ProfileStatus::Starting(_));
+    let is_starting = matches!(status, ProfileStatus::Starting);
 
     let (badge_bg, badge_fg, state_title) = match &status {
         ProfileStatus::Stopped => (
@@ -988,7 +997,7 @@ fn render_profile_row(
             BonTheme::success(),
             "Ready".to_string(),
         ),
-        ProfileStatus::Starting(_) => (
+        ProfileStatus::Starting => (
             BonTheme::warning_bg(),
             BonTheme::warning(),
             "Starting".to_string(),
@@ -998,7 +1007,7 @@ fn render_profile_row(
             BonTheme::info(),
             "Running".to_string(),
         ),
-        ProfileStatus::Error(_) => (
+        ProfileStatus::Error => (
             BonTheme::danger_bg(),
             BonTheme::danger(),
             "Error".to_string(),

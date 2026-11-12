@@ -65,10 +65,10 @@ Agents working in this repository MUST proactively use the 12 TypeSafe Jev MCP j
 |                                                                                   |
 |  +-------------------+   +----------------------+   +--------------------------+  |
 |  | Storage (SQLite)  |   | Proxy & GeoIP Engine |   | Process & CDP Supervisor |  |
-|  | - Single table:   |   | - Tokio Local Tunnel |   | - Locate & unquarantine  |  |
-|  |   `profiles`      |   |   (ATYP 0x03 domain, |   |   Chromium.app           |  |
-|  |   (proxy & geo    |   |    10s timeout,      |   | - Spawn with --remote-   |  |
-|  |    stored inline) |   |    JoinSet cleanup)  |   |   debugging-port=0       |  |
+|  | - 5 SQLite tables |   | - Tokio Local Tunnel |   | - Locate & unquarantine  |  |
+|  |   (`profiles`,    |   |   (ATYP 0x03 domain, |   |   Chromium.app           |  |
+|  |   `proxies`,      |   |    10s timeout,      |   | - Spawn with --remote-   |  |
+|  |   `extensions`...)|   |    JoinSet cleanup)  |   |   debugging-port=0       |  |
 |  |   (rusqlite)      |   | - Fail-closed GeoIP  |   | - Read DevToolsActivePort|  |
 |  +-------------------+   +----------------------+   +--------------------------+  |
 +-----------------------------------------+-----------------------------------------+
@@ -94,7 +94,7 @@ sequenceDiagram
     autonumber
     actor User as User / AI Agent
     participant UI as GPUI Desktop (gpui-kit 0.9.0)
-    participant DB as SQLite (db.rs - 1 table `profiles`)
+    participant DB as SQLite (db.rs - 5 tables)
     participant Tunnel as LocalProxyTunnel (proxy_tunnel.rs)
     participant Geo as GeoIP Engine (geoip.rs)
     participant Sup as Process Supervisor (launcher.rs)
@@ -134,31 +134,35 @@ Tuyệt đối giữ cấu trúc phẳng, rõ ràng, không tạo abstraction th
 
 ```text
 bon-login/
-├── AGENTS.md                  # Ponytail ruleset (lazy senior dev mode)
+├── GLOSSARY.md                # Từ điển miền nghiệp vụ (Profile, Workspace, RuntimeSupervisor, AgentFlow...)
 ├── CLAUDE.md                  # File kiến trúc & quy tắc chống lan man này
 ├── Cargo.toml                 # Dependencies tối giản, biên dịch nhanh
 └── src/
-    ├── main.rs                # Điểm vào GPUI App, khởi tạo Window & SIGTERM cleanup hook
-    ├── models.rs              # Structs: Profile, ProxyConfig, GeoInfo, RuntimeSession & AppState
-    ├── db.rs                  # SQLite CRUD (rusqlite) với duy nhất 1 bảng `profiles`
+    ├── main.rs                # Điểm vào GPUI App, khởi tạo Window & RuntimeSupervisor cleanup hook
+    ├── models.rs              # Deep Profile coherence invariants, ProxyConfig, SavedProxy, GeoInfo, TOTP
+    ├── db.rs                  # Deep Workspace module (SQLite 5 bảng + sidecars theo root_dir cô lập test)
     ├── proxy_tunnel.rs        # Tokio local HTTP proxy -> Upstream HTTP/SOCKS5 (ATYP 0x03, JoinSet)
     ├── geoip.rs               # Kiểm tra Proxy qua local tunnel (timeout 8s) -> IP, Timezone, Locale
-    ├── launcher.rs            # Định vị/xattr Chromium.app, build flags, spawn & đọc DevToolsActivePort
+    ├── launcher.rs            # Kernel locator, cờ Stealth, Raw-WS CDP, Cookie normalizer & RuntimeSupervisor
+    ├── extensions.rs          # Deep Extensions module (CRX2/3 key, MV3 agent shim, CWS sync & unpack)
+    ├── flows.rs               # Deep AgentFlows module (Snapshot refs, stable locators, heal & 0-token replay)
+    ├── control.rs             # Thin CLI & Local HTTP Control adapters (đồng bộ 100% UI ↔ CLI ↔ HTTP)
     └── ui/
-        ├── mod.rs             # Layout chính (Header + Profile Table + Modal, không làm Sidebar thừa)
-        ├── theme.rs           # Bảng màu Dark Mode hiện đại, sắc nét
-        ├── profile_list.rs    # Bảng Profile + Launch/Stop/Check Proxy/Copy CDP & Agent CLI
-        └── profile_modal.rs   # Form Tạo / Sửa Profile (Random Seed, OS, Proxy, GPU mode)
+        ├── mod.rs             # BonLoginApp workspace state & điều phối bất đồng bộ
+        ├── theme.rs           # Bảng màu Dark Mode & SF Symbols
+        ├── profile_list.rs    # Bảng Profile/Trash ảo hóa 120fps & Detail Drawer (0 disk I/O lúc render)
+        ├── profile_modal.rs   # Màn hình Tạo / Sửa Profile (Overview, Fingerprint, Proxy, Cookies, Bookmarks)
+        ├── workspace_views.rs # Các màn hình Quản lý Proxies, Extensions & Groups
+        └── popup_modals.rs    # Các hộp thoại Popup đóng gói trạng thái riêng (Clone, EditProxy, Flows...)
 ```
 
 ---
 
 ## 4. Thiết kế Chi tiết các Module Lõi
 
-### 4.1. Data Model & Single-Table SQLite (`src/models.rs` & `src/db.rs`)
+### 4.1. Data Model & Deep `Workspace` Storage (`src/models.rs` & `src/db.rs`)
 
-Chỉ sử dụng **duy nhất 1 bảng `profiles`** trong SQLite (lưu inline các cột proxy và geo, không tách bảng `proxies` hay `app_settings` dư thừa). Mỗi `Profile` chứa đầy đủ thông tin để tái tạo chính xác 1 máy tính duy nhất qua nhiều tháng:
-
+`Workspace` (`Database` gắn với `root_dir`) đóng gói toàn bộ lưu trữ SQLite (`profiles`, `proxies`, `profile_groups`, `proxy_tags`, `extensions`) cùng các file vệ tinh (`states/`, `flows/`, `extensions/`, `backups/`) đằng sau một `seam` duy nhất (`open_default()` cho thực tế, `open_at(temp_dir)` cho kiểm thử cô lập). Mỗi `Profile` giữ trọn vẹn các quy tắc nhất quán vân tay (`reseed`, `set_platform`, `set_brand`, `assign_saved_proxy`):
 - `id`: `String` (UUID v4)
 - `name`: `String` (VD: `"FB Ads - US 01"`)
 - `group_tag`: `String` (VD: `"Facebook"`, `"TikTok"`, `"AirDrop"`)
@@ -215,7 +219,7 @@ vec![
     format!("--fingerprint={}", profile.seed),
     format!("--fingerprint-platform={}", profile.os_platform.as_cli_str()),
     format!("--fingerprint-platform-version={}", profile.os_version),
-    format!("--fingerprint-brand={}", profile.brand.as_cli_str()), // Luôn là "Chrome"
+    format!("--fingerprint-brand={}", profile.brand.as_cli_str()), // "Chrome" hoặc "Edge"
     format!("--fingerprint-brand-version={}", profile.brand_version),
     format!("--fingerprint-hardware-concurrency={}", profile.hardware_concurrency),
     format!("--timezone={}", timezone),
@@ -252,7 +256,7 @@ vec![
 
 - **Phase 1 — Foundation & Core Backend (Rust):**
   1. Khởi tạo `Cargo.toml` với `gpui-kit = "0.9.0"`, `rusqlite = { version = "0.32", features = ["bundled"] }`, `tokio`, `reqwest`, `serde`, `serde_json`, `uuid`, `anyhow`.
-  2. Viết `models.rs` và `db.rs` (1 bảng `profiles` duy nhất trong SQLite, CRUD + tạo sẵn 2 Profile mẫu để test).
+  2. Viết `models.rs` và `db.rs` (5 bảng SQLite trong `Workspace`: `profiles`, `proxies`, `profile_groups`, `proxy_tags`, `extensions`, CRUD + tạo sẵn Profile mẫu để test).
   3. Viết `proxy_tunnel.rs` (Local HTTP Proxy nối thẳng lên HTTP/SOCKS5 có `user:pass`, gửi domain ATYP `0x03`, timeout `10s`, quản lý bằng `JoinSet`) + unit test kiểm chứng.
   4. Viết `geoip.rs` (Đi qua `proxy_tunnel` kiểm tra IP, Timezone, Country/Locale theo cơ chế Fail-Closed).
   5. Viết `launcher.rs` (Định vị binary `adryfish/fingerprint-chromium` trên macOS, tự chạy `xattr -cr`, spawn với `--remote-debugging-port=0`, đọc `DevToolsActivePort`, và gửi `SIGTERM` dọn sạch PID khi đóng app).
