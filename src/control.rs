@@ -3539,3 +3539,231 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_target_selectors_and_cli_lookup_helpers() {
+        let mut p1 = Profile::new_default("FB Ads Alpha", PlatformType::MacOS);
+        p1.group_tag = "Facebook".to_string();
+        let mut p2 = Profile::new_default("TikTok Shop Beta", PlatformType::Windows);
+        p2.group_tag = "TikTok".to_string();
+        let list = vec![p1.clone(), p2.clone()];
+
+        // 1. find_profile_by_query supports `bon_<short_id>`, exact name, and substring match
+        let bon_q = format!("bon_{}", p1.short_id());
+        assert_eq!(find_profile_by_query(&list, &bon_q).unwrap().id, p1.id);
+        assert_eq!(find_profile_by_query(&list, "shop beta").unwrap().id, p2.id);
+        assert!(find_profile_by_query(&list, "").is_err());
+
+        // 2. select_profiles_by_target supports `--all`, `--group`, and comma-separated targets
+        let (all_p, used_all) = select_profiles_by_target(&list, &["--all".to_string()]).unwrap();
+        assert_eq!(all_p.len(), 2);
+        assert_eq!(used_all, 1);
+
+        let (grp_p, used_grp) = select_profiles_by_target(
+            &list,
+            &["--group".to_string(), "tiktok".to_string(), "--extra".to_string()],
+        )
+        .unwrap();
+        assert_eq!(grp_p.len(), 1);
+        assert_eq!(grp_p[0].id, p2.id);
+        assert_eq!(used_grp, 2);
+
+        let csv_q = format!("{},{}", p1.short_id(), p2.short_id());
+        let (csv_p, _) = select_profiles_by_target(&list, &[csv_q]).unwrap();
+        assert_eq!(csv_p.len(), 2);
+
+        // 3. select_proxies_by_target supports `--all`, `--tag #Tag`, and host:port lookup
+        let sp1 = SavedProxy::new(
+            "US Proxy 1",
+            "US-Resi",
+            ProxyConfig {
+                protocol: ProxyProtocol::Socks5,
+                host: "198.51.100.10".to_string(),
+                port: 1080,
+                username: None,
+                password: None,
+                change_ip_url: None,
+            },
+        );
+        let proxies = vec![sp1.clone()];
+        let (tag_px, used_t) =
+            select_proxies_by_target(&proxies, &["--tag".to_string(), "#us-resi".to_string()])
+                .unwrap();
+        assert_eq!(tag_px.len(), 1);
+        assert_eq!(used_t, 2);
+        assert_eq!(
+            find_saved_proxy_by_query(&proxies, "198.51.100.10:1080")
+                .unwrap()
+                .id,
+            sp1.id
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_control_live_totp_screenshot_conflict_and_csrf_guards() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ctrl-live-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let ws = crate::db::Database::open_at(&tmp).unwrap();
+        let mut p = Profile::new_default("LiveCtrlProf", PlatformType::MacOS);
+        p.totp_secret = "JBSWY3DPEHPK3PXP".to_string();
+        ws.upsert_profile(&p).unwrap();
+
+        let sup = RuntimeSupervisor::new_in(&tmp);
+        let db_arc = Arc::new(Mutex::new(ws));
+        let engine = ControlEngine::attached(db_arc.clone(), sup.clone(), Arc::new(|| {}));
+
+        // 1. Calling `/type`, `/totp`, `/screenshot` on a STOPPED profile returns 409 Conflict
+        for action in ["type", "totp", "screenshot"] {
+            let (code, _) = engine
+                .handle_http("POST", &format!("/profiles/{}/{action}", p.short_id()), "hi")
+                .await;
+            assert_eq!(code, 409, "expected 409 when profile stopped for {action}");
+        }
+
+        // 2. Mock a live CDP server handling `/json/list`, `Input.dispatchKeyEvent` (for `/totp`), and `Page.captureScreenshot`
+        let cdp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cdp_port = cdp_listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in cdp_listener.incoming().flatten() {
+                let mut s = s;
+                let mut req_buf = [0u8; 1024];
+                let n = s.read(&mut req_buf).unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                if req_str.starts_with("GET /json/list") {
+                    let body = format!(
+                        r#"[{{"id":"t1","type":"page","url":"https://example.com","webSocketDebuggerUrl":"ws://127.0.0.1:{cdp_port}/devtools/page/t1"}}]"#
+                    );
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else if req_str.contains("Upgrade: websocket") {
+                    let _ = s.write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    );
+                    while let Ok(h) = {
+                        let mut b = [0u8; 2];
+                        s.read_exact(&mut b).map(|_| b)
+                    } {
+                        let len0 = (h[1] & 0x7f) as usize;
+                        let len = if len0 == 126 {
+                            let mut ext = [0u8; 2];
+                            if s.read_exact(&mut ext).is_err() {
+                                break;
+                            }
+                            u16::from_be_bytes(ext) as usize
+                        } else {
+                            len0
+                        };
+                        let mut mask = [0u8; 4];
+                        if s.read_exact(&mut mask).is_err() {
+                            break;
+                        }
+                        let mut payload = vec![0u8; len];
+                        if s.read_exact(&mut payload).is_err() {
+                            break;
+                        }
+                        for (i, b) in payload.iter_mut().enumerate() {
+                            *b ^= mask[i & 3];
+                        }
+                        let msg: serde_json::Value =
+                            serde_json::from_slice(&payload).unwrap_or_default();
+                        let id = msg["id"].as_u64().unwrap_or(1);
+                        let method = msg["method"].as_str().unwrap_or("");
+                        let reply = if method == "Page.captureScreenshot" {
+                            // Valid 1x1 PNG in base64 ("iVBORw0KGgo=")
+                            serde_json::json!({"id": id, "result": {"data": "iVBORw0KGgo="}})
+                        } else {
+                            serde_json::json!({"id": id, "result": {}})
+                        };
+                        let r_bytes = reply.to_string().into_bytes();
+                        let mut frame = vec![0x81, r_bytes.len() as u8];
+                        frame.extend_from_slice(&r_bytes);
+                        if s.write_all(&frame).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let info = RuntimeInfo {
+            pid: child.id(),
+            cdp_port,
+            ws_url: format!("ws://127.0.0.1:{cdp_port}/devtools/browser/live"),
+            local_proxy_port: None,
+        };
+        let pdir = db_arc.lock().unwrap().profile_user_data_dir(&p.id).unwrap();
+        std::fs::write(
+            pdir.join("bon_runtime.json"),
+            serde_json::to_string(&info).unwrap(),
+        )
+        .unwrap();
+        sup.insert_test_process(&p.id, &p.short_id(), child, info);
+
+        // 3. `/clean-cache` on a RUNNING profile must return 409 Conflict
+        let (code_cc, _) = engine
+            .handle_http("POST", &format!("/profiles/{}/clean-cache", p.short_id()), "")
+            .await;
+        assert_eq!(code_cc, 409);
+
+        // 4. `/totp` generates 6-digit code and types it via CDP (7 chars including '\n')
+        let (code_totp, body_totp) = engine
+            .handle_http("POST", &format!("/profiles/{}/totp", p.short_id()), "")
+            .await;
+        assert_eq!(code_totp, 200, "totp failed: {body_totp}");
+        let totp_val: serde_json::Value = serde_json::from_str(&body_totp).unwrap();
+        assert_eq!(totp_val["code"].as_str().unwrap().len(), 6);
+
+        // 5. `/screenshot` captures PNG into workspace downloads directory
+        let (code_shot, body_shot) = engine
+            .handle_http("POST", &format!("/profiles/{}/screenshot", p.short_id()), "")
+            .await;
+        assert_eq!(code_shot, 200, "screenshot failed: {body_shot}");
+        let shot_val: serde_json::Value = serde_json::from_str(&body_shot).unwrap();
+        let shot_path = PathBuf::from(shot_val["path"].as_str().unwrap());
+        assert!(shot_path.is_file());
+        assert_eq!(std::fs::read(&shot_path).unwrap(), b"\x89PNG\r\n\x1a\n");
+
+        // 6. Browser cross-origin headers (`Origin` and `Sec-Fetch-Site`) are rejected with 403
+        let std_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        std_l.set_nonblocking(true).unwrap();
+        let http_p = std_l.local_addr().unwrap().port();
+        let tk_l = tokio::net::TcpListener::from_std(std_l).unwrap();
+        let eng_cl = engine.clone();
+        let srv = tokio::spawn(async move {
+            let _ = serve_control_http_with_engine(tk_l, eng_cl).await;
+        });
+        for evil_hdr in ["Origin: https://evil.example", "Sec-Fetch-Site: cross-site"] {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", http_p)).unwrap();
+            s.write_all(
+                format!("GET /profiles HTTP/1.1\r\nHost: 127.0.0.1:{http_p}\r\n{evil_hdr}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let mut resp = String::new();
+            let _ = s.read_to_string(&mut resp);
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "expected 403 for {evil_hdr}, got: {resp}"
+            );
+        }
+        srv.abort();
+        sup.stop_all();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

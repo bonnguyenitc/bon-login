@@ -1322,3 +1322,176 @@ pub async fn activate_extension_cancellable_in(
     Ok(ext)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    fn push_proto_varint(out: &mut Vec<u8>, mut val: u64) {
+        loop {
+            let mut byte = (val & 0x7f) as u8;
+            val >>= 7;
+            if val != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if val == 0 {
+                break;
+            }
+        }
+    }
+
+    fn build_crx3_key_proof(field_num: u64, spki_bytes: &[u8]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        push_proto_varint(&mut inner, (1 << 3) | 2); // field 1 (public_key), wire type 2
+        push_proto_varint(&mut inner, spki_bytes.len() as u64);
+        inner.extend_from_slice(spki_bytes);
+
+        let mut outer = Vec::new();
+        push_proto_varint(&mut outer, (field_num << 3) | 2);
+        push_proto_varint(&mut outer, inner.len() as u64);
+        outer.extend_from_slice(&inner);
+        outer
+    }
+
+    #[test]
+    fn test_crx2_and_crx3_public_key_extraction_and_header_stripping() {
+        let dev_b64 = deterministic_spki_key_b64("my-dev-extension");
+        let dev_der = base64::engine::general_purpose::STANDARD
+            .decode(&dev_b64)
+            .unwrap();
+        let dev_ext_id = pubkey_to_chrome_ext_id(&dev_der);
+
+        // 1. CRX2 archive: Cr24 + version(2) + pub_len + sig_len + pub_key + sig + PK\x03\x04
+        let sig = b"FAKE_SIGNATURE";
+        let mut crx2 = Vec::new();
+        crx2.extend_from_slice(b"Cr24");
+        crx2.extend_from_slice(&2u32.to_le_bytes());
+        crx2.extend_from_slice(&(dev_der.len() as u32).to_le_bytes());
+        crx2.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        crx2.extend_from_slice(&dev_der);
+        crx2.extend_from_slice(sig);
+        crx2.extend_from_slice(b"PK\x03\x04CRX2_ZIP_BODY");
+
+        assert_eq!(
+            extract_crx_public_key_b64(&crx2, None).as_deref(),
+            Some(dev_b64.as_str())
+        );
+        assert_eq!(strip_crx_header(&crx2).unwrap(), b"PK\x03\x04CRX2_ZIP_BODY");
+
+        // 2. CRX3 archive with two proofs: developer key + preferred key
+        let pref_b64 = deterministic_spki_key_b64("preferred-store-ext");
+        let pref_der = base64::engine::general_purpose::STANDARD
+            .decode(&pref_b64)
+            .unwrap();
+        let pref_ext_id = pubkey_to_chrome_ext_id(&pref_der);
+
+        let mut crx3_hdr = Vec::new();
+        crx3_hdr.extend_from_slice(&build_crx3_key_proof(2, &dev_der));
+        crx3_hdr.extend_from_slice(&build_crx3_key_proof(2, &pref_der));
+
+        let mut crx3 = Vec::new();
+        crx3.extend_from_slice(b"Cr24");
+        crx3.extend_from_slice(&3u32.to_le_bytes());
+        crx3.extend_from_slice(&(crx3_hdr.len() as u32).to_le_bytes());
+        crx3.extend_from_slice(&crx3_hdr);
+        crx3.extend_from_slice(b"PK\x03\x04CRX3_ZIP_BODY");
+
+        // Matching preferred_id picks the exact matching proof key
+        assert_eq!(
+            extract_crx_public_key_b64(&crx3, Some(&dev_ext_id)).as_deref(),
+            Some(dev_b64.as_str())
+        );
+        assert_eq!(
+            extract_crx_public_key_b64(&crx3, Some(&pref_ext_id)).as_deref(),
+            Some(pref_b64.as_str())
+        );
+        // Fallback without preferred_id returns non-webstore developer key
+        assert!(extract_crx_public_key_b64(&crx3, None).is_some());
+        assert!(strip_crx_header(b"NOT_AN_ARCHIVE").is_err());
+    }
+
+    #[test]
+    fn test_ensure_extension_unpacked_locales_nested_flatten_and_folder_install() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-unit-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Built-in tools (`coordinates`, `ip-status-badge`) unpack full MV3 bundles and are NOT placeholders
+        for (id, name) in [
+            ("coordinates", "Coordinates Helper"),
+            ("ip-status-badge", "Proxy / IP Status Badge"),
+        ] {
+            let ext = BrowserExtension {
+                id: id.to_string(),
+                name: name.to_string(),
+                icon_label: "🎯".to_string(),
+                icon_bg: 0x3B82F6,
+                is_default: true,
+                enabled: true,
+                source_url: String::new(),
+                folder_path: String::new(),
+                created_at: 1,
+            };
+            let dir = ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+            assert!(dir.join("manifest.json").is_file());
+            assert!(dir.join("__bon_ext_shim.js").is_file());
+            assert!(!is_placeholder_extension_dir(&dir));
+            assert!(!needs_remote_extension_download_in(&tmp, &ext));
+            let ( is_svg, bytes) = load_extension_icon_bytes(&ext).unwrap();
+            assert!(is_svg && !bytes.is_empty());
+        }
+
+        // 2. Remote CWS extension unpacks a placeholder initially and flags `needs_remote_extension_download_in == true`
+        let remote_ext = BrowserExtension {
+            id: "metamask".to_string(),
+            name: "MetaMask".to_string(),
+            icon_label: "🦊".to_string(),
+            icon_bg: 0xEA580C,
+            is_default: true,
+            enabled: true,
+            source_url: "nkbihfbeogaeaoehlefnkodbefgpgknn".to_string(),
+            folder_path: String::new(),
+            created_at: 2,
+        };
+        let mm_dir = ensure_extension_unpacked_in(&tmp, &remote_ext).unwrap();
+        assert!(is_placeholder_extension_dir(&mm_dir));
+        assert!(needs_remote_extension_download_in(&tmp, &remote_ext));
+
+        // 3. Nested wrapper dir flattening + `__MSG_appName__` localization lookup + install_extension_from_file_in
+        let nested_root = tmp.join("nested_stage");
+        let inner_dir = nested_root.join("extension-v1.0");
+        let locale_dir = inner_dir.join("_locales/en");
+        std::fs::create_dir_all(&locale_dir).unwrap();
+        std::fs::create_dir_all(nested_root.join("__MACOSX")).unwrap();
+        std::fs::write(
+            inner_dir.join("manifest.json"),
+            r#"{"manifest_version":3,"name":"__MSG_extTitle__","default_locale":"en","version":"1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            locale_dir.join("messages.json"),
+            r#"{"EXTTITLE":{"message":"Localized Wallet Pro"}}"#,
+        )
+        .unwrap();
+
+        flatten_single_nested_manifest_dir(&nested_root);
+        assert!(nested_root.join("manifest.json").is_file());
+        assert_eq!(
+            read_extension_name_from_dir(&nested_root, "fallback"),
+            "Localized Wallet Pro"
+        );
+
+        let installed = install_extension_from_file_in(&tmp, &nested_root).unwrap();
+        assert_eq!(installed.name, "Localized Wallet Pro");
+        assert_eq!(installed.icon_label, "LO");
+        assert!(Path::new(&installed.folder_path).join("manifest.json").is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+

@@ -266,4 +266,60 @@ mod tests {
         let res = resolve_geo_via_port(Some(closed_port)).await;
         assert!(res.is_err());
     }
+
+    #[tokio::test]
+    async fn test_trigger_proxy_rotation_and_parser_rejection_edges() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Rejects non-HTTP(S) schemes immediately
+        assert!(trigger_proxy_rotation("ftp://example.com/rotate").await.is_err());
+        assert!(trigger_proxy_rotation("   ").await.is_err());
+
+        // 2. Loopback HTTP rotation server (200 with multiline body, 200 with empty body, 503 error)
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for step in 0..4 {
+                if let Ok((mut s, _)) = listener.accept().await {
+                    let mut buf = [0u8; 512];
+                    let _ = s.read(&mut buf).await;
+                    let resp = match step {
+                        0 => "HTTP/1.1 200 OK\r\nContent-Length: 31\r\nConnection: close\r\n\r\n  Rotated to 198.51.100.42  \nOK",
+                        1 => "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        2 => "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n   ",
+                        _ => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nRateLimit",
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/rotate");
+        let msg1 = trigger_proxy_rotation(&url).await.unwrap();
+        assert_eq!(msg1, "Rotated to 198.51.100.42");
+        let msg2 = trigger_proxy_rotation(&url).await.unwrap();
+        assert_eq!(msg2, "OK");
+        let msg3 = trigger_proxy_rotation(&url).await.unwrap();
+        assert_eq!(msg3, "HTTP 200");
+        let err4 = trigger_proxy_rotation(&url).await.unwrap_err().to_string();
+        assert!(err4.contains("503"));
+
+        // 3. Fail-closed parser rejections on provider error payloads or blank fields
+        assert!(parse_ipwho_json(r#"{"success":false,"ip":"1.1.1.1"}"#, None).is_err());
+        assert!(
+            parse_ipwho_json(
+                r#"{"success":true,"ip":"   ","country_code":"US","timezone":{"id":"UTC"}}"#,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ipapi_json(
+                r#"{"status":"fail","message":"reserved range","query":"127.0.0.1"}"#,
+                None
+            )
+            .is_err()
+        );
+        assert!(parse_ipinfo_json(r#"{"ip":"8.8.8.8","country":"US"}"#, None).is_err());
+    }
 }

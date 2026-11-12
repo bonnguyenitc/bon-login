@@ -1879,4 +1879,70 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
+
+    #[test]
+    fn test_cascading_group_tag_delete_quick_meta_tsv_and_flow_crud() {
+        let db = Database::open_in_memory().unwrap();
+
+        // 1. Deleting a profile group clears `group_tag` (case-insensitively) on member profiles
+        let mut p1 = Profile::new_default("Acc 1", PlatformType::MacOS);
+        p1.group_tag = "TikTok-Shop".to_string();
+        db.upsert_profile(&p1).unwrap();
+        assert!(db.list_groups().unwrap().contains(&"TikTok-Shop".to_string()));
+        db.delete_group("tiktok-shop").unwrap();
+        assert!(!db.list_groups().unwrap().contains(&"TikTok-Shop".to_string()));
+        assert_eq!(db.list_profiles().unwrap()[0].group_tag, "");
+
+        // 2. Deleting a proxy tag clears `group_tag` on matching SavedProxies
+        let sp = SavedProxy::new(
+            "VN Proxy 1",
+            "VN-ISP",
+            ProxyConfig {
+                protocol: ProxyProtocol::Http,
+                host: "203.0.113.1".to_string(),
+                port: 8080,
+                username: None,
+                password: None,
+                change_ip_url: None,
+            },
+        );
+        db.upsert_proxy(&sp).unwrap();
+        assert!(db.list_tags().unwrap().contains(&"VN-ISP".to_string()));
+        db.delete_tag("vn-isp").unwrap();
+        assert!(!db.list_tags().unwrap().contains(&"VN-ISP".to_string()));
+        assert_eq!(db.list_proxies().unwrap()[0].group_tag, "");
+
+        // 3. update_profile_quick_meta updates notes, tags, and totp_secret in place
+        db.update_profile_quick_meta(
+            &p1.id,
+            "  Updated campaign note  ",
+            &["Live".to_string(), "2FA".to_string()],
+            "  JBSWY3DPEHPK3PXP  ",
+        )
+        .unwrap();
+        let updated = &db.list_profiles().unwrap()[0];
+        assert_eq!(updated.notes, "Updated campaign note");
+        assert_eq!(updated.tags, vec!["Live", "2FA"]);
+        assert_eq!(updated.totp_secret, "JBSWY3DPEHPK3PXP");
+
+        // 4. TSV (tab-delimited) import + JSON export to custom path + delete_flow
+        let tsv = "name\tgroup\tos\tbrand\tproxy\ttotp_secret\ttags\tstartup_url\tnotes\n\
+                   TSV Seller\tShopee\twindows\tedge\t1.2.3.4:8080\t\tWarmup\thttps://shopee.vn\tTab note";
+        assert_eq!(db.import_profiles_csv(tsv).unwrap(), 1);
+        let json_out = db.backups_dir().join("custom_export.json");
+        let (written_path, exported_json) = db.export_profiles_json_to(Some(&json_out)).unwrap();
+        assert_eq!(written_path, json_out);
+        assert!(exported_json.contains("TSV Seller"));
+
+        let fl_path = db.flow_file_path("temp_flow").unwrap();
+        let mut fl = crate::flows::AgentFlow {
+            name: "temp_flow".to_string(),
+            domain: "shopee.vn".to_string(),
+            updated_at: 1,
+            steps: vec![],
+        };
+        crate::flows::save_flow_to_path(&fl_path, &mut fl).unwrap();
+        assert!(db.delete_flow("temp_flow").unwrap());
+        assert!(!db.delete_flow("temp_flow").unwrap());
+    }
 }

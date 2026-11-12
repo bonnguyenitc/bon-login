@@ -1527,3 +1527,166 @@ pub fn save_profile_history_as_flow_in(
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_flow_steps_find_variants_wait_scroll_and_mutate_actions() {
+        let mut snap_map = std::collections::HashMap::new();
+        snap_map.insert(
+            "e1".to_string(),
+            SnapshotRefMeta {
+                role: "button".to_string(),
+                name: "Submit Order".to_string(),
+                unique: true,
+                role_index: 0,
+            },
+        );
+        let dom_attrs = std::collections::HashMap::new();
+
+        // 1. `find` subcommands (`role`, `text`, `label`, `placeholder`, `testid`)
+        let s_role = build_flow_step_from_cmd(
+            &[
+                "--json".to_string(),
+                "find".to_string(),
+                "role".to_string(),
+                "button".to_string(),
+                "click".to_string(),
+                "--name".to_string(),
+                "Submit Order".to_string(),
+                "--exact".to_string(),
+            ],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert_eq!(s_role.op, "click");
+        assert_eq!(s_role.locators, vec!["role:button:Submit Order"]);
+
+        let s_label = build_flow_step_from_cmd(
+            &[
+                "find".to_string(),
+                "label".to_string(),
+                "Password".to_string(),
+                "fill".to_string(),
+                "s3cr3t".to_string(),
+            ],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert_eq!(s_label.op, "fill");
+        assert_eq!(s_label.locators, vec!["label:Password"]);
+        assert_eq!(s_label.value.as_deref(), Some("s3cr3t"));
+
+        let s_ph = build_flow_step_from_cmd(
+            &[
+                "find".to_string(),
+                "placeholder".to_string(),
+                "Search \"items\"".to_string(),
+                "fill".to_string(),
+                "shoes".to_string(),
+            ],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert_eq!(s_ph.locators, vec![r#"[placeholder="Search \"items\""]"#]);
+
+        let s_tid = build_flow_step_from_cmd(
+            &[
+                "find".to_string(),
+                "testid".to_string(),
+                "checkout-btn".to_string(),
+                "click".to_string(),
+            ],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert_eq!(s_tid.locators, vec![r#"[data-testid="checkout-btn"]"#]);
+
+        // 2. `wait @e1` vs `wait 1500`, `scrollinto`, `press`, `scroll`
+        let w_ref = build_flow_step_from_cmd(
+            &["wait".to_string(), "@e1".to_string()],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert_eq!(w_ref.op, "wait");
+        assert_eq!(w_ref.locators, vec!["role:button:Submit Order"]);
+
+        let w_ms = build_flow_step_from_cmd(
+            &["wait".to_string(), "1500".to_string()],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert!(w_ms.locators.is_empty());
+        assert_eq!(w_ms.extra_args, vec!["1500"]);
+
+        let sc_into = build_flow_step_from_cmd(
+            &["scrollinto".to_string(), "@e1".to_string()],
+            &snap_map,
+            &dom_attrs,
+        )
+        .unwrap();
+        assert_eq!(sc_into.op, "scrollintoview");
+
+        // 3. `unpack_agent_commands` with `batch` and shell quotes
+        let unpacked = unpack_agent_commands(&[
+            "--json".to_string(),
+            "batch".to_string(),
+            "--bail".to_string(),
+            "fill @e1 \"hello world\"".to_string(),
+            "press Enter".to_string(),
+        ]);
+        assert_eq!(
+            unpacked,
+            vec![
+                vec!["fill", "@e1", "hello world"],
+                vec!["press", "Enter"]
+            ]
+        );
+
+        // 4. `mutate_flow_step_in` (`optional`, `required`, `toggle`, `delete`, out-of-range, invalid action)
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-flow-mut-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let fpath = flow_file_path_in(&tmp, "mut_test").unwrap();
+        let mut fl = AgentFlow {
+            name: "mut_test".to_string(),
+            domain: String::new(),
+            updated_at: 0,
+            steps: vec![
+                FlowStep {
+                    op: "open".to_string(),
+                    locators: vec![],
+                    value: Some("https://shop.example.com/cart".to_string()),
+                    extra_args: vec![],
+                    optional: false,
+                },
+                s_role,
+            ],
+        };
+        save_flow_to_path(&fpath, &mut fl).unwrap();
+        // Domain is auto-derived from first `open` step on save
+        let loaded = load_flow_from_path(&fpath, "mut_test").unwrap();
+        assert_eq!(loaded.domain, "shop.example.com");
+
+        let f1 = mutate_flow_step_in(&tmp, "mut_test", 1, "toggle").unwrap();
+        assert!(f1.steps[1].optional);
+        let f2 = mutate_flow_step_in(&tmp, "mut_test", 1, "required").unwrap();
+        assert!(!f2.steps[1].optional);
+        let f3 = mutate_flow_step_in(&tmp, "mut_test", 0, "delete").unwrap();
+        assert_eq!(f3.steps.len(), 1);
+        assert!(mutate_flow_step_in(&tmp, "mut_test", 9, "optional").is_err());
+        assert!(mutate_flow_step_in(&tmp, "mut_test", 0, "invalid_op").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+

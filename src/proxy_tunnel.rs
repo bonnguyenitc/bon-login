@@ -606,4 +606,165 @@ mod tests {
         }
         assert_eq!(find_double_crlf(b"\r\n\r"), None);
     }
+
+    #[tokio::test]
+    async fn test_http_upstream_connect_plain_http_and_socks5_bnd_variants() {
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<String>();
+        let mock_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = mock_http.local_addr().unwrap().port();
+
+        // Mock upstream HTTP proxy handling both CONNECT and plain HTTP GET
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = mock_http.accept().await {
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let Ok((hdr, body)) = read_until_double_crlf(&mut sock).await else {
+                        return;
+                    };
+                    let hdr_str = String::from_utf8_lossy(&hdr).into_owned();
+                    let _ = seen_tx.send(hdr_str.clone());
+                    if hdr_str.starts_with("CONNECT ") {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await;
+                        let mut ping = [0u8; 4];
+                        if !body.is_empty() || sock.read_exact(&mut ping).await.is_ok() {
+                            let _ = sock.write_all(b"HTTP_OK").await;
+                        }
+                    } else {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nPLAIN",
+                            )
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let mut http_tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port: http_port,
+            username: Some("httpuser".to_string()),
+            password: Some("httppass".to_string()),
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        let t_port = http_tunnel.local_port();
+
+        // 1. HTTP Upstream CONNECT with Basic Proxy-Authorization
+        let mut c1 = TcpStream::connect(("127.0.0.1", t_port)).await.unwrap();
+        c1.write_all(b"CONNECT api.example.com:8443 HTTP/1.1\r\nHost: api.example.com:8443\r\n\r\n")
+            .await
+            .unwrap();
+        let (r1_hdr, _) = read_until_double_crlf(&mut c1).await.unwrap();
+        assert!(String::from_utf8_lossy(&r1_hdr).starts_with("HTTP/1.1 200"));
+        let upstream_req1 = seen_rx.recv().await.unwrap();
+        assert!(upstream_req1.starts_with("CONNECT api.example.com:8443 HTTP/1.1"));
+        assert!(
+            upstream_req1.contains("Proxy-Authorization: Basic aHR0cHVzZXI6aHR0cHBhc3M=\r\n"),
+            "missing Basic auth in upstream CONNECT: {upstream_req1}"
+        );
+        c1.write_all(b"PING").await.unwrap();
+        let mut reply1 = [0u8; 7];
+        c1.read_exact(&mut reply1).await.unwrap();
+        assert_eq!(&reply1, b"HTTP_OK");
+        drop(c1);
+
+        // 2. Plain HTTP GET to HTTP upstream (strips client Proxy-Authorization, injects tunnel's)
+        let mut c2 = TcpStream::connect(("127.0.0.1", t_port)).await.unwrap();
+        c2.write_all(
+            b"GET http://ip-api.com/json HTTP/1.1\r\nHost: ip-api.com\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic STALE\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut plain_resp = Vec::new();
+        c2.read_to_end(&mut plain_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&plain_resp).ends_with("PLAIN"));
+        let upstream_req2 = seen_rx.recv().await.unwrap();
+        assert!(upstream_req2.contains("Proxy-Authorization: Basic aHR0cHVzZXI6aHR0cHBhc3M=\r\n"));
+        assert!(!upstream_req2.contains("Basic STALE"));
+        http_tunnel.stop();
+
+        // 3. No-auth SOCKS5 upstream with plain HTTP GET rewriting & ATYP 0x04 (IPv6) BND.ADDR reply
+        let mock_s5 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s5_port = mock_s5.local_addr().unwrap().port();
+        let (s5_tx, mut s5_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = mock_s5.accept().await {
+                let mut greet = [0u8; 3];
+                sock.read_exact(&mut greet).await.unwrap();
+                assert_eq!(greet, [0x05, 0x01, 0x00]);
+                sock.write_all(&[0x05, 0x00]).await.unwrap();
+
+                let mut req_head = [0u8; 5];
+                sock.read_exact(&mut req_head).await.unwrap();
+                assert_eq!(&req_head[..4], &[0x05, 0x01, 0x00, 0x03]);
+                let dlen = req_head[4] as usize;
+                let mut dom_port = vec![0u8; dlen + 2];
+                sock.read_exact(&mut dom_port).await.unwrap();
+
+                // Reply with ATYP = 0x04 (IPv6 16 bytes + 2 bytes port = 18 bytes)
+                let mut v6_reply = vec![0x05, 0x00, 0x00, 0x04];
+                v6_reply.extend_from_slice(&[0u8; 18]);
+                sock.write_all(&v6_reply).await.unwrap();
+
+                let (forwarded_hdr, _) = read_until_double_crlf(&mut sock).await.unwrap();
+                let _ = s5_tx.send(String::from_utf8_lossy(&forwarded_hdr).into_owned());
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    .await;
+            }
+        });
+
+        let mut s5_tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: s5_port,
+            username: None,
+            password: None,
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        let mut c3 = TcpStream::connect(("127.0.0.1", s5_tunnel.local_port()))
+            .await
+            .unwrap();
+        c3.write_all(
+            b"GET http://check.example.com:8080/status?x=1 HTTP/1.1\r\nHost: check.example.com:8080\r\nProxy-Connection: keep-alive\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut s5_resp = Vec::new();
+        c3.read_to_end(&mut s5_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&s5_resp).ends_with("OK"));
+        let rewritten = s5_rx.recv().await.unwrap();
+        assert!(
+            rewritten.starts_with("GET /status?x=1 HTTP/1.1\r\n"),
+            "SOCKS5 plain HTTP must rewrite absolute URI to relative path, got: {rewritten}"
+        );
+        assert!(!rewritten.to_ascii_lowercase().contains("proxy-connection"));
+        s5_tunnel.stop();
+
+        // 4. Unit checks for parse_host_port IPv6 & relative URI fallback in parse_client_request
+        assert_eq!(
+            parse_host_port("[2001:db8::1]:9050", 443).unwrap(),
+            ("2001:db8::1".to_string(), 9050)
+        );
+        assert_eq!(
+            parse_host_port("[::1]", 443).unwrap(),
+            ("::1".to_string(), 443)
+        );
+        let rel_req = parse_client_request(
+            b"GET /v1/ping HTTP/1.1\r\nHost: internal.example.org:3000\r\n\r\n",
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!rel_req.is_connect);
+        assert_eq!(rel_req.target_host, "internal.example.org");
+        assert_eq!(rel_req.target_port, 3000);
+        assert_eq!(rel_req.first_line_rewritten, "GET /v1/ping HTTP/1.1");
+    }
 }
