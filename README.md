@@ -278,6 +278,7 @@ bon-login profile delete <id|name|--group <g>|--all> [--permanent]
 ```bash
 # Proxy Pool Manager
 bon-login proxy list [--tag <tag>]
+bon-login proxy free [--protocol socks5|http] [--country <CC>] [--search <q>] [--limit <n>] [--verify] [--save] [--tag <t>]
 bon-login proxy add "socks5://user:pass@1.2.3.4:1080|https://api.rot.local/ip" --tag "US" --expire 30d
 bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>] [--rotate-url <url|none>]
 bon-login proxy check <id|name|--tag <t>|--all>

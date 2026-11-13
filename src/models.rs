@@ -607,6 +607,126 @@ impl SavedProxy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeProxyCandidate {
+    pub config: ProxyConfig,
+    pub country_code: String,
+    pub city: String,
+    pub timezone: String,
+    pub isp: String,
+    pub anonymity: String,
+    pub source: String,
+    pub reported_latency_ms: Option<u32>,
+    pub uptime_pct: Option<u8>,
+    pub ssl: bool,
+    pub verified_geo: Option<GeoInfo>,
+    pub last_error: Option<String>,
+}
+
+impl FreeProxyCandidate {
+    pub fn endpoint_key(&self) -> String {
+        format!(
+            "{}://{}:{}",
+            self.config.protocol.as_str(),
+            self.config.host,
+            self.config.port
+        )
+    }
+
+    pub fn effective_country(&self) -> &str {
+        self.verified_geo
+            .as_ref()
+            .map(|g| g.country_code.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.country_code.as_str())
+    }
+
+    pub fn effective_latency_ms(&self) -> Option<u32> {
+        self.verified_geo
+            .as_ref()
+            .and_then(|g| g.latency_ms)
+            .or(self.reported_latency_ms)
+    }
+
+    pub fn matches_filter(
+        &self,
+        query: &str,
+        protocol: Option<ProxyProtocol>,
+        country: &str,
+        only_live: bool,
+    ) -> bool {
+        if only_live && self.verified_geo.is_none() {
+            return false;
+        }
+        if let Some(proto) = protocol
+            && self.config.protocol != proto
+        {
+            return false;
+        }
+        let cc = self.effective_country();
+        if !country.is_empty()
+            && !country.eq_ignore_ascii_case("All")
+            && !cc.eq_ignore_ascii_case(country)
+        {
+            return false;
+        }
+        let q = query.trim();
+        if q.is_empty() {
+            return true;
+        }
+        let port_str = self.config.port.to_string();
+        contains_ignore_ascii_case(&self.config.host, q)
+            || port_str.contains(q)
+            || contains_ignore_ascii_case(cc, q)
+            || contains_ignore_ascii_case(&self.city, q)
+            || contains_ignore_ascii_case(&self.isp, q)
+            || contains_ignore_ascii_case(&self.source, q)
+            || contains_ignore_ascii_case(&self.anonymity, q)
+            || contains_ignore_ascii_case(self.config.protocol.as_str(), q)
+            || self
+                .verified_geo
+                .as_ref()
+                .is_some_and(|g| contains_ignore_ascii_case(&g.ip, q) || contains_ignore_ascii_case(&g.timezone, q))
+    }
+
+    pub fn to_saved_proxy(&self, tag: &str) -> SavedProxy {
+        let cc = self.effective_country();
+        let label_cc = if cc.is_empty() {
+            self.config.protocol.as_str().to_ascii_uppercase()
+        } else {
+            cc.to_ascii_uppercase()
+        };
+        let name = if self.city.is_empty() {
+            format!("Free {label_cc} ({}:{})", self.config.host, self.config.port)
+        } else {
+            format!(
+                "Free {label_cc} - {} ({}:{})",
+                self.city, self.config.host, self.config.port
+            )
+        };
+        let group_tag = if tag.trim().is_empty() {
+            "free".to_string()
+        } else {
+            tag.trim().trim_start_matches('#').to_string()
+        };
+        let mut sp = SavedProxy::new(name, group_tag, self.config.clone());
+        if let Some(geo) = &self.verified_geo {
+            sp.resolved_geo = Some(geo.clone());
+        } else if !cc.is_empty() && !self.timezone.is_empty() {
+            let (locale, accept_lang) = GeoInfo::locale_for_country(cc);
+            sp.resolved_geo = Some(GeoInfo {
+                ip: self.config.host.clone(),
+                country_code: cc.to_ascii_uppercase(),
+                timezone: self.timezone.clone(),
+                locale,
+                accept_lang,
+                latency_ms: self.reported_latency_ms,
+            });
+        }
+        sp
+    }
+}
+
 fn valid_civil_date(y: i32, m: u32, d: u32) -> bool {
     if !(2000..=2200).contains(&y) || !(1..=12).contains(&m) || d == 0 {
         return false;

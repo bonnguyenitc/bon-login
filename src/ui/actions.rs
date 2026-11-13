@@ -371,6 +371,419 @@ impl BonLoginApp {
         cx.notify();
     }
 
+    pub fn switch_proxy_sub_tab(&mut self, tab: ProxySubTab, cx: &mut Context<Self>) {
+        self.proxy_sub_tab = tab;
+        if tab == ProxySubTab::FreeProxies
+            && self.free_proxies.is_empty()
+            && !self.fetching_free_proxies
+        {
+            self.fetch_free_proxies(cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_free_proxy_checked(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.checked_free_keys.remove(key) {
+            self.checked_free_keys.insert(key.to_string());
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_all_filtered_free_proxies_checked(&mut self, cx: &mut Context<Self>) {
+        let filtered = self.filtered_free_proxy_indices();
+        let all_checked = !filtered.is_empty()
+            && filtered
+                .iter()
+                .all(|&i| self.checked_free_keys.contains(&self.free_proxies[i].endpoint_key()));
+        for i in filtered {
+            let k = self.free_proxies[i].endpoint_key();
+            if all_checked {
+                self.checked_free_keys.remove(&k);
+            } else {
+                self.checked_free_keys.insert(k);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn clear_checked_free_proxies(&mut self, cx: &mut Context<Self>) {
+        self.checked_free_keys.clear();
+        cx.notify();
+    }
+
+    pub fn copy_checked_free_proxies(&mut self, cx: &mut Context<Self>) {
+        let lines: Vec<String> = self
+            .free_proxies
+            .iter()
+            .filter(|fp| self.checked_free_keys.contains(&fp.endpoint_key()))
+            .map(|fp| fp.config.to_editable_string())
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let count = lines.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        self.banner_message = Some(format!("Copied {count} free proxy(s) to clipboard"));
+        cx.notify();
+    }
+
+    pub fn fetch_free_proxies(&mut self, cx: &mut Context<Self>) {
+        if self.fetching_free_proxies {
+            return;
+        }
+        if let Some(prev) = self.free_proxy_batch_task.take() {
+            prev.abort();
+        }
+        self.fetching_free_proxies = true;
+        self.verifying_free_proxies = false;
+        self.banner_message = Some("Fetching public free proxy feeds...".to_string());
+        cx.notify();
+
+        let tokio_handle = self.tokio_handle.clone();
+        let join_handle =
+            tokio_handle.spawn(async move { crate::geoip::fetch_free_proxy_candidates().await });
+        self.free_proxy_batch_task = Some(join_handle.abort_handle());
+
+        cx.spawn(async move |this, cx| {
+            let res = join_handle.await;
+            let _ = this.update(cx, |app, cx| {
+                app.fetching_free_proxies = false;
+                app.free_proxy_batch_task = None;
+                match res {
+                    Ok(Ok(mut list)) => {
+                        let prev_verified: HashMap<String, crate::models::GeoInfo> = app
+                            .free_proxies
+                            .iter()
+                            .filter_map(|fp| {
+                                fp.verified_geo
+                                    .as_ref()
+                                    .map(|g| (fp.endpoint_key(), g.clone()))
+                            })
+                            .collect();
+                        for item in &mut list {
+                            if let Some(g) = prev_verified.get(&item.endpoint_key()) {
+                                item.verified_geo = Some(g.clone());
+                            }
+                        }
+                        let total = list.len();
+                        app.free_proxies = list;
+                        app.checked_free_keys.clear();
+                        app.banner_message = Some(format!(
+                            "Loaded {total} free proxies — auto-scanning top candidates..."
+                        ));
+                        app.verify_filtered_free_proxies(24, cx);
+                    }
+                    Ok(Err(e)) => {
+                        app.banner_message = Some(format!("Failed to fetch free proxies: {e}"));
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn stop_verifying_free_proxies(&mut self, cx: &mut Context<Self>) {
+        if let Some(h) = self.free_proxy_batch_task.take() {
+            h.abort();
+        }
+        for (_, h) in self.free_proxy_tasks.drain() {
+            h.abort();
+        }
+        self.checking_free_keys.clear();
+        self.verifying_free_proxies = false;
+        self.banner_message = Some("Stopped free proxy scan".to_string());
+        cx.notify();
+    }
+
+    pub fn check_single_free_proxy(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(fp) = self
+            .free_proxies
+            .iter()
+            .find(|p| p.endpoint_key() == key)
+            .cloned()
+        else {
+            return;
+        };
+        let k = fp.endpoint_key();
+        let disp = fp.config.display_short();
+        if let Some(prev) = self.free_proxy_tasks.remove(&k) {
+            prev.abort();
+        }
+        self.checking_free_keys.insert(k.clone());
+        self.banner_message = Some(format!("Checking free proxy {disp}..."));
+        cx.notify();
+
+        let cfg = fp.config.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        let join_handle =
+            tokio_handle.spawn(async move { crate::control::check_free_proxy_config_fast(&cfg).await });
+        let abort_handle = join_handle.abort_handle();
+        let task_id = abort_handle.id();
+        self.free_proxy_tasks.insert(k.clone(), abort_handle);
+
+        cx.spawn(async move |this, cx| {
+            let join_res = join_handle.await;
+            let _ = this.update(cx, |app, cx| {
+                if app
+                    .free_proxy_tasks
+                    .get(&k)
+                    .is_some_and(|h| h.id() == task_id)
+                {
+                    app.free_proxy_tasks.remove(&k);
+                    app.checking_free_keys.remove(&k);
+                }
+                let res = match join_res {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => Err(anyhow::anyhow!("Join error: {e}")),
+                };
+                if let Some(slot) = app.free_proxies.iter_mut().find(|p| p.endpoint_key() == k) {
+                    match res {
+                        Ok(geo) => {
+                            slot.country_code = geo.country_code.clone();
+                            slot.timezone = geo.timezone.clone();
+                            slot.last_error = None;
+                            app.banner_message =
+                                Some(format!("Free proxy {disp} LIVE: {}", geo.summary_badge()));
+                            slot.verified_geo = Some(geo);
+                        }
+                        Err(e) => {
+                            slot.verified_geo = None;
+                            slot.last_error = Some("DEAD".to_string());
+                            app.banner_message = Some(format!("Free proxy {disp} dead: {e}"));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn verify_filtered_free_proxies(&mut self, max_candidates: usize, cx: &mut Context<Self>) {
+        let filtered = self.filtered_free_proxy_indices();
+        let target_indices: Vec<usize> = if !self.checked_free_keys.is_empty() {
+            filtered
+                .into_iter()
+                .filter(|&i| {
+                    self.checked_free_keys
+                        .contains(&self.free_proxies[i].endpoint_key())
+                })
+                .collect()
+        } else {
+            // Prioritize unchecked candidates first, then already-checked ones
+            let mut unchecked: Vec<usize> = filtered
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    self.free_proxies[i].verified_geo.is_none()
+                        && self.free_proxies[i].last_error.is_none()
+                })
+                .collect();
+            if unchecked.is_empty() {
+                unchecked = filtered;
+            }
+            unchecked.truncate(max_candidates);
+            unchecked
+        };
+        if target_indices.is_empty() {
+            self.banner_message = Some("No free proxies match current filter".to_string());
+            cx.notify();
+            return;
+        }
+        if let Some(prev) = self.free_proxy_batch_task.take() {
+            prev.abort();
+        }
+        let targets: Vec<(String, ProxyConfig)> = target_indices
+            .into_iter()
+            .map(|i| {
+                let fp = &self.free_proxies[i];
+                (fp.endpoint_key(), fp.config.clone())
+            })
+            .collect();
+        for (k, _) in &targets {
+            self.checking_free_keys.insert(k.clone());
+        }
+        let scan_total = targets.len();
+        self.verifying_free_proxies = true;
+        self.banner_message = Some(format!("Scanning {scan_total} free proxies for live HTTPS/SOCKS5..."));
+        cx.notify();
+
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<(String, anyhow::Result<crate::models::GeoInfo>)>(32);
+        let tokio_handle = self.tokio_handle.clone();
+        let worker = tokio_handle.spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            for (key, cfg) in targets {
+                let tx_cl = tx.clone();
+                set.spawn(async move {
+                    let res = crate::control::check_free_proxy_config_fast(&cfg).await;
+                    let _ = tx_cl.send((key, res)).await;
+                });
+            }
+            while set.join_next().await.is_some() {}
+        });
+        self.free_proxy_batch_task = Some(worker.abort_handle());
+
+        cx.spawn(async move |this, cx| {
+            while let Some((key, res)) = rx.recv().await {
+                let ok = this.update(cx, |app, cx| {
+                    app.checking_free_keys.remove(&key);
+                    if let Some(slot) = app.free_proxies.iter_mut().find(|p| p.endpoint_key() == key)
+                    {
+                        match res {
+                            Ok(geo) => {
+                                slot.country_code = geo.country_code.clone();
+                                slot.timezone = geo.timezone.clone();
+                                slot.last_error = None;
+                                slot.verified_geo = Some(geo);
+                            }
+                            Err(_) => {
+                                slot.verified_geo = None;
+                                slot.last_error = Some("DEAD".to_string());
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.verifying_free_proxies = false;
+                app.free_proxy_batch_task = None;
+                app.checking_free_keys.clear();
+                // Sort verified LIVE proxies to the top so user can pick them immediately
+                app.free_proxies.sort_by(|a, b| {
+                    let rank = |p: &crate::models::FreeProxyCandidate| -> u8 {
+                        if p.verified_geo.is_some() {
+                            0
+                        } else if p.last_error.is_none() {
+                            1
+                        } else {
+                            2
+                        }
+                    };
+                    rank(a).cmp(&rank(b)).then_with(|| {
+                        a.effective_latency_ms()
+                            .unwrap_or(9999)
+                            .cmp(&b.effective_latency_ms().unwrap_or(9999))
+                    })
+                });
+                let live_cnt = app.live_free_proxies_count();
+                app.banner_message = Some(format!(
+                    "Scan complete: {live_cnt} live free proxy(s) verified ready"
+                ));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn save_free_proxy_to_my_proxies(
+        &mut self,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<SavedProxy> {
+        let fp = self
+            .free_proxies
+            .iter()
+            .find(|p| p.endpoint_key() == key)?
+            .clone();
+        if let Some(existing) = self.saved_proxies.iter().find(|sp| {
+            sp.config.protocol == fp.config.protocol
+                && sp.config.host.eq_ignore_ascii_case(&fp.config.host)
+                && sp.config.port == fp.config.port
+        }) {
+            let cloned = existing.clone();
+            self.banner_message = Some(format!(
+                "Proxy {} is already in My Proxies ('{}')",
+                fp.config.display_short(),
+                cloned.name
+            ));
+            cx.notify();
+            return Some(cloned);
+        }
+        let sp = fp.to_saved_proxy("free");
+        if let Ok(db) = self.db.lock() {
+            let _ = db.insert_tag("free");
+            let _ = db.upsert_proxy(&sp);
+        }
+        self.reload_profiles();
+        self.banner_message = Some(format!(
+            "Saved '{}' to My Proxies (#free)",
+            sp.config.display_short()
+        ));
+        cx.notify();
+        Some(sp)
+    }
+
+    pub fn save_selected_or_live_free_proxies(&mut self, cx: &mut Context<Self>) {
+        let candidates: Vec<crate::models::FreeProxyCandidate> =
+            if !self.checked_free_keys.is_empty() {
+                self.free_proxies
+                    .iter()
+                    .filter(|fp| self.checked_free_keys.contains(&fp.endpoint_key()))
+                    .cloned()
+                    .collect()
+            } else {
+                self.free_proxies
+                    .iter()
+                    .filter(|fp| fp.verified_geo.is_some())
+                    .cloned()
+                    .collect()
+            };
+        if candidates.is_empty() {
+            self.banner_message = Some(
+                "Select free proxies or click 'Scan Live' first to save verified proxies"
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
+        let mut added_count = 0usize;
+        if let Ok(db) = self.db.lock() {
+            let _ = db.insert_tag("free");
+            let _ = db.with_transaction(|db| {
+                for fp in &candidates {
+                    let exists = self.saved_proxies.iter().any(|sp| {
+                        sp.config.protocol == fp.config.protocol
+                            && sp.config.host.eq_ignore_ascii_case(&fp.config.host)
+                            && sp.config.port == fp.config.port
+                    });
+                    if !exists {
+                        let sp = fp.to_saved_proxy("free");
+                        let _ = db.upsert_proxy(&sp);
+                        added_count += 1;
+                    }
+                }
+                Ok(())
+            });
+        }
+        self.checked_free_keys.clear();
+        self.reload_profiles();
+        self.banner_message = Some(format!(
+            "Saved {added_count} free proxy(s) to My Proxies (#free)"
+        ));
+        cx.notify();
+    }
+
+    pub fn apply_free_proxy_to_selected_profile(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sp) = self.save_free_proxy_to_my_proxies(key, cx) else {
+            return;
+        };
+        self.apply_saved_proxy_to_selected_profile(&sp.id, window, cx);
+    }
+
     pub fn proxies_for_batch_group(&self) -> Vec<SavedProxy> {
         if self.batch_proxy_group == "None" {
             return Vec::new();

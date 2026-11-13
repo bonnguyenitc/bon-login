@@ -52,6 +52,12 @@ pub enum ProfileSubTab {
     Trash,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxySubTab {
+    MyProxies,
+    FreeProxies,
+}
+
 #[derive(Clone)]
 pub enum ActivePopupModal {
     QuickAdd,
@@ -137,6 +143,19 @@ pub struct BonLoginApp {
     pub proxy_selected_tag: String,
     pub proxy_raw_input: Entity<TextareaState>,
     pub proxy_expire_input: Entity<InputState>,
+    pub proxy_sub_tab: ProxySubTab,
+    pub free_proxies: Vec<crate::models::FreeProxyCandidate>,
+    pub free_proxy_search_input: Entity<InputState>,
+    pub free_proxy_search_query: String,
+    pub free_proxy_protocol_filter: Option<ProxyProtocol>,
+    pub free_proxy_country_filter: String,
+    pub free_proxy_only_live: bool,
+    pub fetching_free_proxies: bool,
+    pub verifying_free_proxies: bool,
+    pub checked_free_keys: HashSet<String>,
+    pub checking_free_keys: HashSet<String>,
+    pub free_proxy_tasks: HashMap<String, tokio::task::AbortHandle>,
+    pub free_proxy_batch_task: Option<tokio::task::AbortHandle>,
     pub statuses: HashMap<String, ProfileStatus>,
     pub supervisor: RuntimeSupervisor,
     pub tokio_handle: tokio::runtime::Handle,
@@ -255,6 +274,10 @@ impl BonLoginApp {
                 .placeholder("DD/MM/YYYY, YYYY-MM-DD, or days (e.g. 30)")
                 .default_value("30")
         });
+        let free_proxy_search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("\u{1002ab}  Search IP, country, city, ISP, source...")
+        });
 
         let ext_url_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Input URL")
@@ -308,6 +331,16 @@ impl BonLoginApp {
             move |this, _, ev: &InputEvent, _window, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.search_query = search_input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            }
+        });
+        let free_search_sub = cx.subscribe_in(&free_proxy_search_input, window, {
+            let free_proxy_search_input = free_proxy_search_input.clone();
+            move |this, _, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.free_proxy_search_query =
+                        free_proxy_search_input.read(cx).value().to_string();
                     cx.notify();
                 }
             }
@@ -422,6 +455,19 @@ impl BonLoginApp {
             proxy_selected_tag: initial_tag,
             proxy_raw_input,
             proxy_expire_input,
+            proxy_sub_tab: ProxySubTab::MyProxies,
+            free_proxies: Vec::new(),
+            free_proxy_search_input,
+            free_proxy_search_query: String::new(),
+            free_proxy_protocol_filter: None,
+            free_proxy_country_filter: "All".to_string(),
+            free_proxy_only_live: false,
+            fetching_free_proxies: false,
+            verifying_free_proxies: false,
+            checked_free_keys: HashSet::new(),
+            checking_free_keys: HashSet::new(),
+            free_proxy_tasks: HashMap::new(),
+            free_proxy_batch_task: None,
             statuses: HashMap::new(),
             supervisor,
             tokio_handle,
@@ -463,7 +509,7 @@ impl BonLoginApp {
             proxy_indices_cache: std::cell::RefCell::new(None),
             banner_message: None,
             banner_timer_for: None,
-            _subscriptions: vec![search_sub],
+            _subscriptions: vec![search_sub, free_search_sub],
         }
     }
 
@@ -642,6 +688,43 @@ impl BonLoginApp {
 
     pub fn filtered_proxy_indices(&self) -> Vec<usize> {
         self.filtered_proxy_indices_rc().to_vec()
+    }
+
+    pub fn filtered_free_proxy_indices_rc(&self) -> std::rc::Rc<[usize]> {
+        let q = self.free_proxy_search_query.trim();
+        let proto = self.free_proxy_protocol_filter;
+        let country = self.free_proxy_country_filter.as_str();
+        let only_live = self.free_proxy_only_live;
+        self.free_proxies
+            .iter()
+            .enumerate()
+            .filter_map(|(i, fp)| fp.matches_filter(q, proto, country, only_live).then_some(i))
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    pub fn filtered_free_proxy_indices(&self) -> Vec<usize> {
+        self.filtered_free_proxy_indices_rc().to_vec()
+    }
+
+    pub fn distinct_free_proxy_countries_with_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for fp in &self.free_proxies {
+            let cc = fp.effective_country().trim();
+            if !cc.is_empty() {
+                *counts.entry(cc.to_ascii_uppercase()).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    pub fn live_free_proxies_count(&self) -> usize {
+        self.free_proxies
+            .iter()
+            .filter(|fp| fp.verified_geo.is_some())
+            .count()
     }
 
 }

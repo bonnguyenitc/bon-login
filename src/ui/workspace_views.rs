@@ -6,9 +6,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use std::time::Duration;
-use crate::models::{BrowserBrand, PlatformType};
+use crate::models::{BrowserBrand, PlatformType, ProxyProtocol};
 use crate::ui::theme::{BonTheme, SfSymbol};
-use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction, ProfileSubTab, WorkspaceView};
+use crate::ui::{
+    ActivePopupModal, BonLoginApp, PendingDeleteAction, ProfileSubTab, ProxySubTab, WorkspaceView,
+};
 
 static ICON_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Image>>>,
@@ -318,7 +320,74 @@ pub fn render_proxies_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
 ) -> Div {
+    let proxy_sub_tab = app.proxy_sub_tab;
     let total_proxies = app.saved_proxies.len();
+    let free_total = app.free_proxies.len();
+    let free_live = app.live_free_proxies_count();
+
+    let subtab_bar = h_flex()
+        .w_full()
+        .flex_shrink_0()
+        .justify_between()
+        .items_center()
+        .gap_3()
+        .child(
+            h_flex()
+                .gap_3()
+                .items_center()
+                .child(
+                    h_flex()
+                        .p(px(3.))
+                        .gap(px(2.))
+                        .rounded_lg()
+                        .bg(BonTheme::bg_well())
+                        .border_1()
+                        .border_color(BonTheme::border())
+                        .child(proxy_subtab_item(
+                            "My Proxies",
+                            total_proxies,
+                            proxy_sub_tab == ProxySubTab::MyProxies,
+                            ProxySubTab::MyProxies,
+                            cx,
+                        ))
+                        .child(proxy_subtab_item(
+                            "Free Proxies",
+                            free_total,
+                            proxy_sub_tab == ProxySubTab::FreeProxies,
+                            ProxySubTab::FreeProxies,
+                            cx,
+                        )),
+                )
+                .children((free_live > 0).then(|| {
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(BonTheme::success_bg())
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(BonTheme::success())
+                        .child(format!("● {free_live} Live Free Ready"))
+                })),
+        );
+
+    if proxy_sub_tab == ProxySubTab::FreeProxies {
+        return v_flex()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .gap_3()
+            .overflow_hidden()
+            .child(subtab_bar)
+            .child(
+                render_free_proxies_subtab_view(app, cx).with_animation(
+                    "subtab-free-proxies-enter",
+                    BonTheme::ui_enter_anim(),
+                    |this, delta| this.opacity(delta),
+                ),
+            );
+    }
+    let _ = total_proxies;
     let proxy_groups = app.distinct_proxy_groups_with_counts();
     let selected_pgrp = app.selected_proxy_group.clone();
     let filtered_indices = app.filtered_proxy_indices_rc();
@@ -354,6 +423,7 @@ pub fn render_proxies_view(
         .min_h_0()
         .gap_3()
         .overflow_hidden()
+        .child(subtab_bar)
         // 1. GenLogin Top Toolbar: `[+ Add proxy]` + `[All Tag ▾]` + `[↻]` ... `[Check proxy]`
         .child(
             h_flex()
@@ -1123,6 +1193,894 @@ pub fn render_proxies_view(
                                 )
                                 .child("/ 1"),
                         ),
+                ),
+        )
+}
+
+fn proxy_subtab_item(
+    label: &'static str,
+    count: usize,
+    active: bool,
+    target_tab: ProxySubTab,
+    cx: &mut Context<BonLoginApp>,
+) -> impl IntoElement {
+    h_flex()
+        .px_3()
+        .py_1()
+        .gap_1p5()
+        .items_center()
+        .cursor_pointer()
+        .rounded_md()
+        .hover(|s| {
+            if active {
+                s.bg(rgb(0x2997ff))
+            } else {
+                s.bg(BonTheme::bg_hover())
+            }
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, cx| {
+                app.switch_proxy_sub_tab(target_tab, cx);
+            }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(if active {
+                    rgb(0xffffff).into()
+                } else {
+                    BonTheme::text_secondary()
+                })
+                .child(label),
+        )
+        .child(
+            div()
+                .px_1p5()
+                .py(px(1.))
+                .rounded_full()
+                .bg(if active {
+                    rgba(0xffffff2e)
+                } else {
+                    rgba(0xffffff0d)
+                })
+                .text_size(px(10.5))
+                .font_semibold()
+                .text_color(if active {
+                    rgb(0xffffff).into()
+                } else {
+                    BonTheme::text_muted()
+                })
+                .child(count.to_string()),
+        )
+        .with_spring(
+            SharedString::from(format!("proxy-subtab-spring-{label}")),
+            SpringAnimation::new(BonTheme::snappy_spring()).to(active),
+            |this, phase| {
+                this.bg(phase.interpolate_clamped(
+                    rgba(0x00000000).into(),
+                    BonTheme::accent(),
+                ))
+            },
+        )
+}
+
+fn render_free_proxies_subtab_view(
+    app: &BonLoginApp,
+    cx: &mut Context<BonLoginApp>,
+) -> Div {
+    let total_free = app.free_proxies.len();
+    let live_count = app.live_free_proxies_count();
+    let filtered_indices = app.filtered_free_proxy_indices_rc();
+    let filtered_len = filtered_indices.len();
+    let checked_count = app.checked_free_keys.len();
+    let proto_filter = app.free_proxy_protocol_filter;
+    let selected_country = app.free_proxy_country_filter.clone();
+    let only_live = app.free_proxy_only_live;
+    let is_fetching = app.fetching_free_proxies;
+    let is_verifying = app.verifying_free_proxies;
+    let countries_with_counts = app.distinct_free_proxy_countries_with_counts();
+
+    let all_filtered_checked = !filtered_indices.is_empty()
+        && filtered_indices.iter().all(|&i| {
+            app.checked_free_keys
+                .contains(&app.free_proxies[i].endpoint_key())
+        });
+    let any_filtered_checked = filtered_indices.iter().any(|&i| {
+        app.checked_free_keys
+            .contains(&app.free_proxies[i].endpoint_key())
+    });
+    let hdr_mark = if all_filtered_checked {
+        SfSymbol::CHECKMARK
+    } else if any_filtered_checked {
+        SfSymbol::MINUS
+    } else {
+        ""
+    };
+
+    let country_dropdown_label = if selected_country == "All" || selected_country.is_empty() {
+        format!("All Countries ({total_free})")
+    } else {
+        let flag = crate::models::GeoInfo::country_flag(&selected_country);
+        format!("{flag}  {selected_country} ({filtered_len})")
+    };
+    let app_for_cc_menu = cx.entity();
+    let cc_list_for_menu = countries_with_counts.clone();
+
+    let saved_set: std::rc::Rc<std::collections::HashSet<(ProxyProtocol, String, u16)>> =
+        std::rc::Rc::new(
+            app.saved_proxies
+                .iter()
+                .map(|sp| {
+                    (
+                        sp.config.protocol,
+                        sp.config.host.to_ascii_lowercase(),
+                        sp.config.port,
+                    )
+                })
+                .collect(),
+        );
+
+    v_flex()
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .gap_3()
+        .overflow_hidden()
+        // 1. Free Proxies Search & Discovery Toolbar
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .w(px(260.))
+                                .child(Input::new(&app.free_proxy_search_input)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    Button::new("fp-proto-all")
+                                        .small()
+                                        .with_variant(BonTheme::toggle_pill(
+                                            cx,
+                                            proto_filter.is_none(),
+                                        ))
+                                        .label("All")
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.free_proxy_protocol_filter = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("fp-proto-socks5")
+                                        .small()
+                                        .with_variant(BonTheme::toggle_pill(
+                                            cx,
+                                            proto_filter == Some(ProxyProtocol::Socks5),
+                                        ))
+                                        .label("SOCKS5")
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.free_proxy_protocol_filter =
+                                                Some(ProxyProtocol::Socks5);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("fp-proto-http")
+                                        .small()
+                                        .with_variant(BonTheme::toggle_pill(
+                                            cx,
+                                            proto_filter == Some(ProxyProtocol::Http),
+                                        ))
+                                        .label("HTTP/SSL")
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.free_proxy_protocol_filter =
+                                                Some(ProxyProtocol::Http);
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            Button::new("fp-country-dropdown")
+                                .min_w(px(148.))
+                                .outline()
+                                .dropdown_caret(true)
+                                .small()
+                                .label(country_dropdown_label)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    let app_all = app_for_cc_menu.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(format!(
+                                            "{}   All Countries ({total_free})",
+                                            SfSymbol::GLOBE
+                                        ))
+                                        .on_click(move |_, _, cx| {
+                                            app_all.update(cx, |app, cx| {
+                                                app.free_proxy_country_filter = "All".to_string();
+                                                cx.notify();
+                                            });
+                                        }),
+                                    );
+                                    for (cc, cnt) in cc_list_for_menu.iter().take(28) {
+                                        let cc_val = cc.clone();
+                                        let app_cc = app_for_cc_menu.clone();
+                                        let flag = crate::models::GeoInfo::country_flag(&cc_val);
+                                        menu = menu.item(
+                                            PopupMenuItem::new(format!("{flag}   {cc_val} ({cnt})"))
+                                                .on_click(move |_, _, cx| {
+                                                    let c = cc_val.clone();
+                                                    app_cc.update(cx, |app, cx| {
+                                                        app.free_proxy_country_filter = c;
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        )
+                        .child(
+                            Button::new("fp-only-live-toggle")
+                                .small()
+                                .with_variant(BonTheme::toggle_pill(cx, only_live))
+                                .label(format!(
+                                    "{}  Live Only ({live_count})",
+                                    SfSymbol::CHECKMARK
+                                ))
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.free_proxy_only_live = !app.free_proxy_only_live;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Button::new("fp-fetch-feeds")
+                                .with_variant(BonTheme::row_action(cx))
+                                .small()
+                                .disabled(is_fetching)
+                                .label(if is_fetching {
+                                    "Fetching...".to_string()
+                                } else {
+                                    format!("{}  Refresh Sources", SfSymbol::ARROW_CLOCKWISE)
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.fetch_free_proxies(cx);
+                                })),
+                        )
+                        .child(if is_verifying {
+                            Button::new("fp-stop-scan")
+                                .with_variant(BonTheme::outline_danger(cx))
+                                .small()
+                                .label(format!("{}  Stop Scan", SfSymbol::STOP_FILL))
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.stop_verifying_free_proxies(cx);
+                                }))
+                        } else {
+                            Button::new("fp-scan-live")
+                                .with_variant(BonTheme::outline_blue(cx))
+                                .small()
+                                .disabled(filtered_indices.is_empty() || is_fetching)
+                                .label(if checked_count > 0 {
+                                    format!("{}  Scan Selected ({checked_count})", SfSymbol::BOLT_FILL)
+                                } else {
+                                    format!("{}  Scan Live (24)", SfSymbol::BOLT_FILL)
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.verify_filtered_free_proxies(24, cx);
+                                }))
+                        })
+                        .child(
+                            Button::new("fp-save-live-or-sel")
+                                .with_variant(BonTheme::primary_cta(cx))
+                                .small()
+                                .disabled(checked_count == 0 && live_count == 0)
+                                .label(if checked_count > 0 {
+                                    format!("{}  Save Selected ({checked_count})", SfSymbol::PLUS)
+                                } else {
+                                    format!("{}  Save Live ({live_count})", SfSymbol::PLUS)
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.save_selected_or_live_free_proxies(cx);
+                                })),
+                        ),
+                ),
+        )
+        // 2. Selection Action Bar when 1+ free proxies checked
+        .children((checked_count > 0).then(|| {
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("fp-clear-sel")
+                        .with_variant(BonTheme::outline_blue(cx))
+                        .small()
+                        .label(SfSymbol::XMARK)
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.clear_checked_free_proxies(cx);
+                        })),
+                )
+                .child(
+                    Button::new("fp-batch-check")
+                        .with_variant(BonTheme::outline_blue(cx))
+                        .small()
+                        .label("Check Selected")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.verify_filtered_free_proxies(40, cx);
+                        })),
+                )
+                .child(
+                    Button::new("fp-batch-save")
+                        .with_variant(BonTheme::success_cta(cx))
+                        .small()
+                        .label("Save to My Proxies (#free)")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.save_selected_or_live_free_proxies(cx);
+                        })),
+                )
+                .child(
+                    Button::new("fp-batch-copy")
+                        .with_variant(BonTheme::primary_cta(cx))
+                        .small()
+                        .label("Copy")
+                        .on_click(cx.listener(|app, _, _, cx| {
+                            app.copy_checked_free_proxies(cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(BonTheme::text_secondary())
+                        .child(format!("{checked_count} selected")),
+                )
+                .with_animation(
+                    "fp-batch-bar-enter",
+                    BonTheme::ui_enter_anim(),
+                    |this, delta| this.opacity(delta),
+                )
+        }))
+        // 3. Free Proxies Table (`[☐] | # | Proxy (IP:Port) | Protocol | Country / ISP | Source | Status | Actions`)
+        .child(
+            v_flex()
+                .w_full()
+                .flex_1()
+                .rounded_lg()
+                .bg(BonTheme::bg_panel())
+                .border_1()
+                .border_color(BonTheme::border())
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .flex_shrink_0()
+                        .px_3()
+                        .py_2p5()
+                        .gap_2()
+                        .items_center()
+                        .bg(BonTheme::bg_elevated())
+                        .border_b_1()
+                        .border_color(BonTheme::border())
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(BonTheme::text_muted())
+                        .child(BonTheme::checkbox(
+                            "fp-hdr-chk-spring",
+                            all_filtered_checked || any_filtered_checked,
+                            hdr_mark,
+                            BonTheme::bg_panel(),
+                            cx.listener(|app, _, _, cx| {
+                                app.toggle_all_filtered_free_proxies_checked(cx);
+                            }),
+                        ))
+                        .child(div().w(px(28.)).flex_shrink_0().truncate().child("#"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(150.))
+                                .truncate()
+                                .child("Proxy Endpoint"),
+                        )
+                        .child(div().w(px(90.)).flex_shrink_0().truncate().child("Protocol"))
+                        .child(
+                            div()
+                                .w(px(190.))
+                                .flex_shrink_0()
+                                .truncate()
+                                .child("Country / Location"),
+                        )
+                        .child(div().w(px(96.)).flex_shrink_0().truncate().child("Source"))
+                        .child(div().w(px(108.)).flex_shrink_0().truncate().child("Status"))
+                        .child(
+                            div()
+                                .w(px(148.))
+                                .flex_shrink_0()
+                                .flex()
+                                .justify_end()
+                                .child(SfSymbol::GEARSHAPE_FILL),
+                        ),
+                )
+                .child(if filtered_indices.is_empty() {
+                    v_flex()
+                        .id("free-proxies-empty")
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .py_16()
+                        .items_center()
+                        .justify_center()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(BonTheme::text_primary())
+                                .child(if is_fetching {
+                                    "Fetching public free proxy feeds (ProxyScrape, Proxifly, Fyvri)..."
+                                } else if only_live {
+                                    "No verified live free proxies match your filter yet"
+                                } else {
+                                    "No free proxies match your filter"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
+                                .child(if only_live {
+                                    "Click 'Scan Live (24)' to test candidates through BonLogin's Fail-Closed GeoIP tunnel."
+                                } else {
+                                    "Click 'Refresh Sources' to pull the latest SOCKS5 & HTTPS public proxies."
+                                }),
+                        )
+                        .children((!is_fetching).then(|| {
+                            Button::new("fp-empty-action")
+                                .with_variant(BonTheme::primary_cta(cx))
+                                .small()
+                                .label(if only_live && total_free > 0 {
+                                    format!("{}  Disable 'Live Only' & Scan", SfSymbol::BOLT_FILL)
+                                } else {
+                                    format!("{}  Fetch Free Proxies", SfSymbol::ARROW_CLOCKWISE)
+                                })
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    if only_live && total_free > 0 {
+                                        app.free_proxy_only_live = false;
+                                        app.verify_filtered_free_proxies(24, cx);
+                                    } else {
+                                        app.fetch_free_proxies(cx);
+                                    }
+                                }))
+                        }))
+                        .into_any_element()
+                } else {
+                    let indices_for_list = filtered_indices.clone();
+                    let saved_set_for_list = saved_set.clone();
+                    uniform_list(
+                        "free-proxies-table-rows",
+                        indices_for_list.len(),
+                        cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
+                            let app_entity = cx.entity();
+                            let mut items = Vec::with_capacity(range.len());
+                            for row_ix in range {
+                                let Some(&fp_ix) = indices_for_list.get(row_ix) else {
+                                    continue;
+                                };
+                                let Some(fp) = app.free_proxies.get(fp_ix) else {
+                                    continue;
+                                };
+                                let row_num = row_ix + 1;
+                                let key = fp.endpoint_key();
+                                let key_chk = key.clone();
+                                let key_check_btn = key.clone();
+                                let key_save_btn = key.clone();
+                                let key_menu_save = key.clone();
+                                let key_menu_assign = key.clone();
+                                let copy_val = fp.config.to_editable_string();
+                                let is_checked = app.checked_free_keys.contains(&key);
+                                let is_checking = app.checking_free_keys.contains(&key);
+                                let is_already_saved = saved_set_for_list.contains(&(
+                                    fp.config.protocol,
+                                    fp.config.host.to_ascii_lowercase(),
+                                    fp.config.port,
+                                ));
+
+                                let cc = fp.effective_country().to_string();
+                                let flag = if cc.is_empty() {
+                                    SfSymbol::GLOBE
+                                } else {
+                                    crate::models::GeoInfo::country_flag(&cc)
+                                };
+                                let endpoint_str = fp.config.display_short();
+                                let sub_meta = match (fp.anonymity.as_str(), fp.uptime_pct) {
+                                    (anon, Some(up)) if !anon.is_empty() => {
+                                        format!("{anon} • {up}% uptime")
+                                    }
+                                    (anon, None) if !anon.is_empty() => anon.to_string(),
+                                    _ => "public proxy".to_string(),
+                                };
+                                let proto_label = match fp.config.protocol {
+                                    ProxyProtocol::Socks5 => "SOCKS5".to_string(),
+                                    ProxyProtocol::Http => "HTTP • SSL".to_string(),
+                                };
+                                let loc_primary = if cc.is_empty() {
+                                    "Unknown".to_string()
+                                } else if !fp.city.is_empty() {
+                                    format!("{cc} • {}", fp.city)
+                                } else if let Some(g) = &fp.verified_geo {
+                                    let short_tz =
+                                        g.timezone.rsplit('/').next().unwrap_or(&g.timezone);
+                                    format!("{cc} • {short_tz}")
+                                } else {
+                                    cc.clone()
+                                };
+                                let loc_sub = if !fp.isp.is_empty() {
+                                    fp.isp.clone()
+                                } else if !fp.timezone.is_empty() {
+                                    fp.timezone.clone()
+                                } else {
+                                    "-".to_string()
+                                };
+
+                                let (badge_bg, badge_fg, status_text) = if is_checking {
+                                    (
+                                        BonTheme::info_bg(),
+                                        BonTheme::info(),
+                                        "CHECKING...".to_string(),
+                                    )
+                                } else if let Some(g) = &fp.verified_geo {
+                                    let ms = g.latency_ms.unwrap_or(0);
+                                    (
+                                        BonTheme::success_bg(),
+                                        BonTheme::success(),
+                                        if ms > 0 {
+                                            format!("LIVE • {ms}ms")
+                                        } else {
+                                            "LIVE".to_string()
+                                        },
+                                    )
+                                } else if fp.last_error.is_some() {
+                                    (
+                                        BonTheme::danger_bg(),
+                                        BonTheme::danger(),
+                                        "DEAD".to_string(),
+                                    )
+                                } else if let Some(ms) = fp.reported_latency_ms {
+                                    (
+                                        BonTheme::bg_elevated(),
+                                        BonTheme::text_secondary(),
+                                        format!("~{ms}ms"),
+                                    )
+                                } else {
+                                    (
+                                        BonTheme::bg_elevated(),
+                                        BonTheme::text_muted(),
+                                        "UNCHECKED".to_string(),
+                                    )
+                                };
+
+                                let src_str = fp.source.clone();
+                                let app_row_menu = app_entity.clone();
+                                items.push(
+                                    h_flex()
+                                        .w_full()
+                                        .px_3()
+                                        .py_2p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .border_b_1()
+                                        .border_color(BonTheme::border())
+                                        .bg(if is_checked {
+                                            BonTheme::bg_selected()
+                                        } else {
+                                            BonTheme::bg_panel()
+                                        })
+                                        .hover(|s| {
+                                            if is_checked {
+                                                s.bg(rgba(0x0a84ff3d))
+                                            } else {
+                                                s.bg(BonTheme::bg_hover())
+                                            }
+                                        })
+                                        .child(BonTheme::checkbox(
+                                            format!("fp-row-chk-{row_num}"),
+                                            is_checked,
+                                            if is_checked { SfSymbol::CHECKMARK } else { "" },
+                                            BonTheme::bg_elevated(),
+                                            cx.listener(move |app, _, _, cx| {
+                                                app.toggle_free_proxy_checked(&key_chk, cx);
+                                            }),
+                                        ))
+                                        .child(
+                                            div()
+                                                .w(px(28.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(BonTheme::text_secondary())
+                                                .child(format!("{row_num}")),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .w_0()
+                                                .flex_1()
+                                                .min_w(px(150.))
+                                                .overflow_hidden()
+                                                .gap_0p5()
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .truncate()
+                                                        .text_sm()
+                                                        .font_semibold()
+                                                        .text_color(BonTheme::text_primary())
+                                                        .child(endpoint_str),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .text_color(BonTheme::text_secondary())
+                                                        .child(sub_meta),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(90.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(if fp.config.protocol == ProxyProtocol::Socks5 {
+                                                    BonTheme::info()
+                                                } else {
+                                                    BonTheme::text_primary()
+                                                })
+                                                .child(proto_label),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .w(px(190.))
+                                                .flex_shrink_0()
+                                                .overflow_hidden()
+                                                .gap_0p5()
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1p5()
+                                                        .items_center()
+                                                        .child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .text_xs()
+                                                                .child(flag),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .truncate()
+                                                                .text_xs()
+                                                                .font_semibold()
+                                                                .text_color(BonTheme::text_primary())
+                                                                .child(loc_primary),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .text_color(BonTheme::text_muted())
+                                                        .child(loc_sub),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(96.))
+                                                .flex_shrink_0()
+                                                .overflow_hidden()
+                                                .child(
+                                                    h_flex().child(
+                                                        div()
+                                                            .truncate()
+                                                            .px_1p5()
+                                                            .py_0p5()
+                                                            .rounded_sm()
+                                                            .bg(BonTheme::accent_subtle())
+                                                            .text_xs()
+                                                            .text_color(BonTheme::accent())
+                                                            .child(src_str),
+                                                    ),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(108.))
+                                                .flex_shrink_0()
+                                                .overflow_hidden()
+                                                .child({
+                                                    let badge = div()
+                                                        .truncate()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded_sm()
+                                                        .bg(badge_bg)
+                                                        .text_xs()
+                                                        .font_semibold()
+                                                        .text_color(badge_fg)
+                                                        .child(status_text);
+                                                    h_flex().child(if is_checking {
+                                                        badge
+                                                            .with_animation(
+                                                                SharedString::from(format!(
+                                                                    "fp-chk-pulse-{row_num}"
+                                                                )),
+                                                                Animation::new(
+                                                                    Duration::from_millis(1100),
+                                                                )
+                                                                .repeat()
+                                                                .with_easing(pulsating_between(
+                                                                    0.4, 1.0,
+                                                                )),
+                                                                |this, alpha| this.opacity(alpha),
+                                                            )
+                                                            .into_any_element()
+                                                    } else {
+                                                        badge.into_any_element()
+                                                    })
+                                                }),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .w(px(148.))
+                                                .flex_shrink_0()
+                                                .justify_end()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "fp-chk-{row_num}"
+                                                    )))
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .small()
+                                                    .disabled(is_checking)
+                                                    .label(if is_checking { "..." } else { "Check" })
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.check_single_free_proxy(
+                                                            &key_check_btn,
+                                                            cx,
+                                                        );
+                                                    })),
+                                                )
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "fp-save-{row_num}"
+                                                    )))
+                                                    .with_variant(if is_already_saved {
+                                                        BonTheme::row_action(cx)
+                                                    } else {
+                                                        BonTheme::success_cta(cx)
+                                                    })
+                                                    .small()
+                                                    .disabled(is_already_saved)
+                                                    .label(if is_already_saved {
+                                                        "Saved"
+                                                    } else {
+                                                        "+ Save"
+                                                    })
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.save_free_proxy_to_my_proxies(
+                                                            &key_save_btn,
+                                                            cx,
+                                                        );
+                                                    })),
+                                                )
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "fp-more-{row_num}"
+                                                    )))
+                                                    .ghost()
+                                                    .small()
+                                                    .label(SfSymbol::ELLIPSIS)
+                                                    .dropdown_menu(move |menu, _, _| {
+                                                        let c_val = copy_val.clone();
+                                                        let app_c = app_row_menu.clone();
+                                                        let s_key = key_menu_save.clone();
+                                                        let app_s = app_row_menu.clone();
+                                                        let a_key = key_menu_assign.clone();
+                                                        let app_a = app_row_menu.clone();
+                                                        menu.item(
+                                                            PopupMenuItem::new(format!(
+                                                                "{}   Save to My Proxies (#free)",
+                                                                SfSymbol::PLUS
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                let k = s_key.clone();
+                                                                app_s.update(cx, |app, cx| {
+                                                                    app.save_free_proxy_to_my_proxies(
+                                                                        &k, cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                        )
+                                                        .item(
+                                                            PopupMenuItem::new(format!(
+                                                                "{}   Assign to selected profile",
+                                                                SfSymbol::LINK
+                                                            ))
+                                                            .on_click(move |_, window, cx| {
+                                                                let k = a_key.clone();
+                                                                app_a.update(cx, |app, cx| {
+                                                                    app.apply_free_proxy_to_selected_profile(
+                                                                        &k, window, cx,
+                                                                    );
+                                                                });
+                                                            }),
+                                                        )
+                                                        .item(
+                                                            PopupMenuItem::new(format!(
+                                                                "{}   Copy proxy",
+                                                                SfSymbol::DOC_ON_DOC
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                let v = c_val.clone();
+                                                                app_c.update(cx, |app, cx| {
+                                                                    cx.write_to_clipboard(
+                                                                        ClipboardItem::new_string(
+                                                                            v,
+                                                                        ),
+                                                                    );
+                                                                    app.banner_message = Some(
+                                                                        "Copied free proxy to clipboard"
+                                                                            .to_string(),
+                                                                    );
+                                                                    cx.notify();
+                                                                });
+                                                            }),
+                                                        )
+                                                    }),
+                                                ),
+                                        ),
+                                );
+                            }
+                            items
+                        }),
+                    )
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .into_any_element()
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_4()
+                        .py_2()
+                        .justify_between()
+                        .items_center()
+                        .gap_3()
+                        .bg(BonTheme::bg_elevated())
+                        .border_t_1()
+                        .border_color(BonTheme::border())
+                        .text_xs()
+                        .text_color(BonTheme::text_secondary())
+                        .child("Sources: ProxyScrape v4 • Fyvri SOCKS5 • Proxifly (Verified via LocalProxyTunnel)")
+                        .child(format!(
+                            "Showing: {filtered_len} / {total_free}  •  Live: {live_count}"
+                        )),
                 ),
         )
 }

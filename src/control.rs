@@ -389,6 +389,64 @@ pub async fn check_proxy_config_live(cfg: &ProxyConfig) -> Result<GeoInfo> {
     res
 }
 
+pub async fn check_free_proxy_config_fast(cfg: &ProxyConfig) -> Result<GeoInfo> {
+    let mut tun = crate::proxy_tunnel::LocalProxyTunnel::start(cfg.clone()).await?;
+    let port = tun.local_port();
+    let res = crate::geoip::resolve_geo_via_port_fast(port).await;
+    tun.stop();
+    res
+}
+
+pub async fn discover_free_proxies(
+    protocol: Option<ProxyProtocol>,
+    country: Option<&str>,
+    search_query: &str,
+    limit: usize,
+    verify: bool,
+) -> Result<Vec<crate::models::FreeProxyCandidate>> {
+    let all = crate::geoip::fetch_free_proxy_candidates().await?;
+    let cc_filter = country.unwrap_or("All");
+    let mut matched: Vec<crate::models::FreeProxyCandidate> = all
+        .into_iter()
+        .filter(|fp| fp.matches_filter(search_query, protocol, cc_filter, false))
+        .collect();
+    if !verify {
+        matched.truncate(limit);
+        return Ok(matched);
+    }
+    let scan_cap = (limit * 4).clamp(16, 48);
+    matched.truncate(scan_cap);
+    let mut set = tokio::task::JoinSet::new();
+    for mut fp in matched {
+        set.spawn(async move {
+            if let Ok(geo) = check_free_proxy_config_fast(&fp.config).await {
+                fp.country_code = geo.country_code.clone();
+                fp.timezone = geo.timezone.clone();
+                fp.verified_geo = Some(geo);
+                Some(fp)
+            } else {
+                None
+            }
+        });
+    }
+    let mut live = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(fp)) = res {
+            live.push(fp);
+            if live.len() >= limit {
+                set.abort_all();
+                break;
+            }
+        }
+    }
+    live.sort_by(|a, b| {
+        a.effective_latency_ms()
+            .unwrap_or(9999)
+            .cmp(&b.effective_latency_ms().unwrap_or(9999))
+    });
+    Ok(live)
+}
+
 pub async fn rotate_and_check_proxy_live(cfg: &ProxyConfig) -> Result<(String, GeoInfo)> {
     let url = cfg
         .change_ip_url
@@ -574,6 +632,7 @@ fn print_cli_help() {
            bon-login profile restore <file>\n\n\
          PROXY MANAGER (`bon-login proxy ...`):\n  \
            bon-login proxy list [--tag <t>]\n  \
+           bon-login proxy free [--protocol socks5|http] [--country <CC>] [--search <q>] [--limit <n>] [--verify] [--save] [--tag <t>]\n  \
            bon-login proxy add <raw_proxy_or_file> [--protocol http|socks5] [--tag <t>] [--name <n>] [--expire <days_or_date>]\n  \
            bon-login proxy update <id|name|--tag <t>|--all> [--name <n>] [--tag <t>] [--expire <days_or_date|none>] [--rotate-url <url|none>]\n  \
            bon-login proxy check <id|name|--tag <t>|--all>\n  \
@@ -1611,6 +1670,93 @@ fn run_proxy_subcommand(args: &[String]) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&items)?);
             Ok(())
         }
+        "free" | "find-free" | "search-free" => {
+            let mut protocol: Option<ProxyProtocol> = None;
+            let mut country: Option<String> = None;
+            let mut search_query = String::new();
+            let mut limit: usize = 20;
+            let mut verify = false;
+            let mut save = false;
+            let mut tag = "free".to_string();
+            let mut idx = 0;
+            while idx < rest.len() {
+                match rest[idx].as_str() {
+                    "--protocol" | "--type" | "-p" => {
+                        if let Some(v) = rest.get(idx + 1) {
+                            protocol = Some(ProxyProtocol::from_str_lossy(v));
+                        }
+                        idx += 2;
+                    }
+                    "--country" | "-c" => {
+                        country = rest.get(idx + 1).cloned();
+                        idx += 2;
+                    }
+                    "--search" | "-q" => {
+                        search_query = rest.get(idx + 1).cloned().unwrap_or_default();
+                        idx += 2;
+                    }
+                    "--limit" | "-n" => {
+                        if let Some(v) = rest.get(idx + 1).and_then(|s| s.parse::<usize>().ok()) {
+                            limit = v.clamp(1, 200);
+                        }
+                        idx += 2;
+                    }
+                    "--tag" => {
+                        if let Some(v) = rest.get(idx + 1) {
+                            tag = v.trim().trim_start_matches('#').to_string();
+                        }
+                        idx += 2;
+                    }
+                    "--verify" | "--live" => {
+                        verify = true;
+                        idx += 1;
+                    }
+                    "--save" | "--import" => {
+                        save = true;
+                        idx += 1;
+                    }
+                    _ => idx += 1,
+                }
+            }
+            let found = cli_tokio_handle().block_on(discover_free_proxies(
+                protocol,
+                country.as_deref(),
+                &search_query,
+                limit,
+                verify,
+            ))?;
+            let mut saved_ids = Vec::new();
+            if save && !found.is_empty() {
+                let existing = db.list_proxies()?;
+                let _ = db.insert_tag(&tag);
+                db.with_transaction(|db| {
+                    for fp in &found {
+                        let dup = existing.iter().any(|sp| {
+                            sp.config.protocol == fp.config.protocol
+                                && sp.config.host.eq_ignore_ascii_case(&fp.config.host)
+                                && sp.config.port == fp.config.port
+                        });
+                        if !dup {
+                            let sp = fp.to_saved_proxy(&tag);
+                            saved_ids.push(sp.id.clone());
+                            db.upsert_proxy(&sp)?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "verified": verify,
+                    "saved_count": saved_ids.len(),
+                    "count": found.len(),
+                    "proxies": found,
+                }))?
+            );
+            Ok(())
+        }
         "add" | "import" => {
             let raw_arg = rest
                 .first()
@@ -2607,6 +2753,19 @@ impl ControlEngine {
                         serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
                     )
                 })
+            }
+            ("GET", "/proxies/free") => {
+                match discover_free_proxies(None, None, "", 30, false).await {
+                    Ok(list) => (
+                        200,
+                        serde_json::json!({"ok": true, "count": list.len(), "proxies": list})
+                            .to_string(),
+                    ),
+                    Err(e) => (
+                        500,
+                        serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                    ),
+                }
             }
             ("GET", "/flows") => {
                 let root_dir = self.supervisor.root_dir().to_path_buf();

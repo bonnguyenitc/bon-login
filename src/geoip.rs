@@ -1,4 +1,4 @@
-use crate::models::GeoInfo;
+use crate::models::{FreeProxyCandidate, GeoInfo, ProxyConfig, ProxyProtocol};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::sync::LazyLock;
@@ -232,6 +232,392 @@ pub async fn trigger_proxy_rotation(change_ip_url: &str) -> Result<String> {
     })
 }
 
+// shortcut: separate 12-permit semaphore for bulk free-proxy scanning so it doesn't starve profile launches
+static FREE_SCAN_SEM: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(12));
+
+pub async fn resolve_geo_via_port_fast(local_proxy_port: u16) -> Result<GeoInfo> {
+    let _permit = FREE_SCAN_SEM.acquire().await;
+    let proxy_url = format!("http://127.0.0.1:{local_proxy_port}");
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(3200))
+        .read_timeout(Duration::from_millis(4200))
+        .timeout(Duration::from_millis(4500))
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
+        .user_agent("curl/8.7.1")
+        .proxy(
+            reqwest::Proxy::all(&proxy_url)
+                .with_context(|| format!("Invalid local proxy URL {proxy_url}"))?,
+        )
+        .build()
+        .context("Failed to build fast GeoIP client")?;
+
+    type ParserFn = fn(&str, Option<u32>) -> Result<GeoInfo>;
+    let providers: [(&'static str, &'static str, ParserFn); 2] = [
+        ("ipinfo.io", "https://ipinfo.io/json", parse_ipinfo_json),
+        ("ipwho.is", "https://ipwho.is/", parse_ipwho_json),
+    ];
+    let mut set = JoinSet::new();
+    for (name, url, parser) in providers {
+        let c = client.clone();
+        set.spawn(async move {
+            let t0 = Instant::now();
+            let resp = c
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| format!("{name}: {e}"))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("{name} body: {e}"))?;
+            let ms = t0.elapsed().as_millis() as u32;
+            parser(&text, Some(ms)).map_err(|e| format!("{name}: {e}"))
+        });
+    }
+    let mut last_err = String::from("timeout");
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(geo)) => {
+                set.abort_all();
+                return Ok(geo);
+            }
+            Ok(Err(e)) => last_err = e,
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    bail!("Proxy check failed ({last_err})")
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyScrapeFeed {
+    #[serde(default)]
+    proxies: Vec<ProxyScrapeItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyScrapeItem {
+    #[serde(default)]
+    alive: bool,
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    port: u16,
+    #[serde(default)]
+    ssl: bool,
+    #[serde(default)]
+    anonymity: String,
+    timeout: Option<f64>,
+    uptime: Option<f64>,
+    ip_data: Option<ProxyScrapeIpData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxyScrapeIpData {
+    #[serde(rename = "countryCode", default)]
+    country_code: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    isp: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxiflyItem {
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    port: u16,
+    #[serde(default)]
+    https: bool,
+    #[serde(default)]
+    anonymity: String,
+    geolocation: Option<ProxiflyGeo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProxiflyGeo {
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    city: String,
+}
+
+pub fn parse_proxyscrape_free_json(body: &str) -> Vec<FreeProxyCandidate> {
+    let Ok(feed) = serde_json::from_str::<ProxyScrapeFeed>(body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in feed.proxies {
+        if !item.alive || item.ip.trim().is_empty() || item.port == 0 {
+            continue;
+        }
+        let protocol = match item.protocol.trim().to_ascii_lowercase().as_str() {
+            "socks5" => ProxyProtocol::Socks5,
+            "http" | "https" => ProxyProtocol::Http,
+            _ => continue,
+        };
+        // Skip plain HTTP proxies that don't support SSL/CONNECT
+        if protocol == ProxyProtocol::Http && !item.ssl {
+            continue;
+        }
+        let ip_data = item.ip_data.unwrap_or(ProxyScrapeIpData {
+            country_code: String::new(),
+            city: String::new(),
+            timezone: String::new(),
+            isp: String::new(),
+        });
+        let cc = ip_data.country_code.trim().to_ascii_uppercase();
+        let reported_latency_ms = item
+            .timeout
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v.round() as u32);
+        let uptime_pct = item
+            .uptime
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v.round().clamp(0.0, 100.0) as u8);
+        out.push(FreeProxyCandidate {
+            config: ProxyConfig {
+                protocol,
+                host: item.ip.trim().to_string(),
+                port: item.port,
+                username: None,
+                password: None,
+                change_ip_url: None,
+            },
+            country_code: if cc == "ZZ" || cc == "UNKNOWN" {
+                String::new()
+            } else {
+                cc
+            },
+            city: ip_data.city.trim().to_string(),
+            timezone: ip_data.timezone.trim().to_string(),
+            isp: ip_data.isp.trim().to_string(),
+            anonymity: if item.anonymity.trim().is_empty() {
+                "elite".to_string()
+            } else {
+                item.anonymity.trim().to_ascii_lowercase()
+            },
+            source: "ProxyScrape".to_string(),
+            reported_latency_ms,
+            uptime_pct,
+            ssl: item.ssl || protocol == ProxyProtocol::Socks5,
+            verified_geo: None,
+            last_error: None,
+        });
+    }
+    out
+}
+
+pub fn parse_proxifly_free_json(body: &str) -> Vec<FreeProxyCandidate> {
+    let Ok(items) = serde_json::from_str::<Vec<ProxiflyItem>>(body) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        if item.ip.trim().is_empty() || item.port == 0 {
+            continue;
+        }
+        let protocol = match item.protocol.trim().to_ascii_lowercase().as_str() {
+            "socks5" => ProxyProtocol::Socks5,
+            "http" | "https" => ProxyProtocol::Http,
+            _ => continue,
+        };
+        if protocol == ProxyProtocol::Http && !item.https {
+            continue;
+        }
+        let (cc, city) = item
+            .geolocation
+            .map(|g| {
+                let c = g.country.trim().to_ascii_uppercase();
+                (
+                    if c == "ZZ" || c == "UNKNOWN" {
+                        String::new()
+                    } else {
+                        c
+                    },
+                    g.city.trim().to_string(),
+                )
+            })
+            .unwrap_or_default();
+        out.push(FreeProxyCandidate {
+            config: ProxyConfig {
+                protocol,
+                host: item.ip.trim().to_string(),
+                port: item.port,
+                username: None,
+                password: None,
+                change_ip_url: None,
+            },
+            country_code: cc,
+            city,
+            timezone: String::new(),
+            isp: String::new(),
+            anonymity: if item.anonymity.trim().is_empty() {
+                "anonymous".to_string()
+            } else {
+                item.anonymity.trim().to_ascii_lowercase()
+            },
+            source: "Proxifly".to_string(),
+            reported_latency_ms: None,
+            uptime_pct: None,
+            ssl: item.https || protocol == ProxyProtocol::Socks5,
+            verified_geo: None,
+            last_error: None,
+        });
+    }
+    out
+}
+
+pub fn parse_plain_free_proxy_lines(
+    body: &str,
+    default_proto: ProxyProtocol,
+    source_name: &str,
+    max_lines: usize,
+) -> Vec<FreeProxyCandidate> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if out.len() >= max_lines {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Ok(Some((cfg, _))) = ProxyConfig::parse_with_optional_name(trimmed, default_proto) {
+            out.push(FreeProxyCandidate {
+                config: cfg,
+                country_code: String::new(),
+                city: String::new(),
+                timezone: String::new(),
+                isp: String::new(),
+                anonymity: "elite".to_string(),
+                source: source_name.to_string(),
+                reported_latency_ms: None,
+                uptime_pct: None,
+                ssl: true,
+                verified_geo: None,
+                last_error: None,
+            });
+        }
+    }
+    out
+}
+
+pub async fn fetch_free_proxy_candidates() -> Result<Vec<FreeProxyCandidate>> {
+    let mut set = JoinSet::new();
+
+    // Source 1: ProxyScrape v4 (rich metadata: country, city, ISP, latency, uptime)
+    {
+        let c = DIRECT_CLIENT.clone();
+        set.spawn(async move {
+            let url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&timeout=3500";
+            let text = c.get(url).send().await.ok()?.text().await.ok()?;
+            Some(parse_proxyscrape_free_json(&text))
+        });
+    }
+    // Source 2: Fyvri Fresh SOCKS5 (high live rate for SOCKS5)
+    {
+        let c = DIRECT_CLIENT.clone();
+        set.spawn(async move {
+            let url = "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt";
+            let text = c.get(url).send().await.ok()?.text().await.ok()?;
+            Some(parse_plain_free_proxy_lines(
+                &text,
+                ProxyProtocol::Socks5,
+                "Fyvri",
+                120,
+            ))
+        });
+    }
+    // Source 3: Proxifly All JSON (updated every 5m, includes country & city)
+    {
+        let c = DIRECT_CLIENT.clone();
+        set.spawn(async move {
+            let url = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.json";
+            let text = c.get(url).send().await.ok()?.text().await.ok()?;
+            Some(parse_proxifly_free_json(&text))
+        });
+    }
+
+    let mut combined = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(batch)) = res {
+            combined.extend(batch);
+        }
+    }
+    if combined.is_empty() {
+        bail!("Failed to fetch free proxy lists from public sources");
+    }
+
+    // Deduplicate by (protocol, host, port), preferring entries with country_code / latency metadata
+    let mut seen: std::collections::HashMap<(ProxyProtocol, String, u16), usize> =
+        std::collections::HashMap::new();
+    let mut deduped: Vec<FreeProxyCandidate> = Vec::new();
+    for item in combined {
+        let key = (
+            item.config.protocol,
+            item.config.host.clone(),
+            item.config.port,
+        );
+        if let Some(&idx) = seen.get(&key) {
+            let existing = &mut deduped[idx];
+            if existing.country_code.is_empty() && !item.country_code.is_empty() {
+                existing.country_code = item.country_code;
+                existing.city = item.city;
+                existing.timezone = item.timezone;
+                existing.isp = item.isp;
+            }
+            if existing.reported_latency_ms.is_none() && item.reported_latency_ms.is_some() {
+                existing.reported_latency_ms = item.reported_latency_ms;
+            }
+        } else {
+            seen.insert(key, deduped.len());
+            deduped.push(item);
+        }
+    }
+
+    // Sort: SOCKS5 & elite & known country & low latency first
+    deduped.sort_by(|a, b| {
+        let proto_rank = |p: &FreeProxyCandidate| match p.config.protocol {
+            ProxyProtocol::Socks5 => 0u8,
+            ProxyProtocol::Http => 1u8,
+        };
+        let has_meta = |p: &FreeProxyCandidate| -> u8 {
+            if !p.country_code.is_empty() && p.reported_latency_ms.is_some() {
+                0
+            } else if !p.country_code.is_empty() {
+                1
+            } else {
+                2
+            }
+        };
+        let anon_rank = |p: &FreeProxyCandidate| match p.anonymity.as_str() {
+            "elite" => 0u8,
+            "anonymous" => 1u8,
+            _ => 2u8,
+        };
+        proto_rank(a)
+            .cmp(&proto_rank(b))
+            .then_with(|| has_meta(a).cmp(&has_meta(b)))
+            .then_with(|| anon_rank(a).cmp(&anon_rank(b)))
+            .then_with(|| {
+                a.reported_latency_ms
+                    .unwrap_or(9999)
+                    .cmp(&b.reported_latency_ms.unwrap_or(9999))
+            })
+    });
+    deduped.truncate(400);
+    Ok(deduped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +729,50 @@ mod tests {
             .is_err()
         );
         assert!(parse_ipinfo_json(r#"{"ip":"8.8.8.8","country":"US"}"#, None).is_err());
+    }
+
+    #[test]
+    fn test_parse_free_proxy_sources_and_filter() {
+        let ps_json = r#"{
+            "proxies": [
+                {
+                    "alive": true,
+                    "protocol": "socks5",
+                    "ip": "45.194.33.12",
+                    "port": 30002,
+                    "ssl": true,
+                    "anonymity": "elite",
+                    "timeout": 182.4,
+                    "uptime": 98.7,
+                    "ip_data": {
+                        "countryCode": "HK",
+                        "city": "Hong Kong",
+                        "timezone": "Asia/Hong_Kong",
+                        "isp": "HK Broadband"
+                    }
+                },
+                {
+                    "alive": true,
+                    "protocol": "http",
+                    "ip": "1.2.3.4",
+                    "port": 80,
+                    "ssl": false
+                }
+            ]
+        }"#;
+        let list = parse_proxyscrape_free_json(ps_json);
+        assert_eq!(list.len(), 1);
+        let item = &list[0];
+        assert_eq!(item.config.protocol, ProxyProtocol::Socks5);
+        assert_eq!(item.country_code, "HK");
+        assert_eq!(item.reported_latency_ms, Some(182));
+        assert_eq!(item.uptime_pct, Some(99));
+        assert!(item.matches_filter("hong", Some(ProxyProtocol::Socks5), "HK", false));
+        assert!(!item.matches_filter("hong", Some(ProxyProtocol::Http), "HK", false));
+        assert!(!item.matches_filter("", None, "All", true));
+        let saved = item.to_saved_proxy("free");
+        assert_eq!(saved.group_tag, "free");
+        assert!(saved.name.contains("Free HK"));
+        assert_eq!(saved.resolved_geo.as_ref().unwrap().country_code, "HK");
     }
 }
