@@ -236,7 +236,13 @@ pub fn render_profile_table(
                         )
                         .into_any_element()
                 } else {
-                    let indices_for_list = filtered_indices.clone();
+                    let filtered_len = filtered_indices.len();
+                    let (_, _, page_start, page_end) = app.current_page_bounds(
+                        crate::ui::PaginatedTable::Profiles,
+                        filtered_len,
+                    );
+                    let indices_for_list: std::rc::Rc<[usize]> =
+                        filtered_indices[page_start..page_end].into();
                     uniform_list(
                         "profiles-table-rows",
                         indices_for_list.len(),
@@ -281,18 +287,15 @@ pub fn render_profile_table(
                 })
                 // GenLogin Table Footer (`Profiles: N   < [1] >   25 / page`)
                 .child(
-                    h_flex()
-                        .w_full()
-                        .px_4()
-                        .py_2p5()
-                        .border_t_1()
-                        .border_color(BonTheme::border())
-                        .justify_end()
-                        .items_center()
-                        .gap_3()
-                        .text_xs()
-                        .text_color(BonTheme::text_secondary())
-                        .child(format!("Profiles: {}", filtered_indices.len())),
+                    crate::ui::workspace_views::render_table_pagination_footer(
+                        "profiles",
+                        crate::ui::PaginatedTable::Profiles,
+                        "Profiles",
+                        filtered_indices.len(),
+                        None,
+                        app,
+                        cx,
+                    ),
                 ),
         )
         // Right: GenLogin Collapsible `Detail` Drawer (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
@@ -1420,9 +1423,14 @@ fn render_profile_row(
 }
 
 pub fn render_trash_table(
-    trashed: &[Profile],
+    app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
 ) -> Div {
+    let trashed = &app.trashed_profiles;
+    let total_trash = trashed.len();
+    let (_, _, page_start, page_end) =
+        app.current_page_bounds(crate::ui::PaginatedTable::Trash, total_trash);
+    let page_count = page_end.saturating_sub(page_start);
     v_flex()
         .w_full()
         .flex_1()
@@ -1527,11 +1535,11 @@ pub fn render_trash_table(
                 } else {
                     uniform_list(
                         "trash-table-rows",
-                        trashed.len(),
-                        cx.processor(|app, range: std::ops::Range<usize>, _window, cx| {
+                        page_count,
+                        cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
                             let mut items = Vec::with_capacity(range.len());
                             for ix in range {
-                                let Some(p) = app.trashed_profiles.get(ix) else {
+                                let Some(p) = app.trashed_profiles.get(page_start + ix) else {
                                     continue;
                                 };
                                 let pid_restore = p.id.clone();
@@ -1652,6 +1660,17 @@ pub fn render_trash_table(
                     .flex_1()
                     .min_h_0()
                     .into_any_element()
-                }),
+                })
+                .child(
+                    crate::ui::workspace_views::render_table_pagination_footer(
+                        "trash",
+                        crate::ui::PaginatedTable::Trash,
+                        "Trashed",
+                        total_trash,
+                        None,
+                        app,
+                        cx,
+                    ),
+                ),
         )
 }

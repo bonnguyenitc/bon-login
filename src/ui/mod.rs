@@ -58,6 +58,14 @@ pub enum ProxySubTab {
     FreeProxies,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaginatedTable {
+    Profiles,
+    Trash,
+    MyProxies,
+    FreeProxies,
+}
+
 #[derive(Clone)]
 pub enum ActivePopupModal {
     QuickAdd,
@@ -156,6 +164,11 @@ pub struct BonLoginApp {
     pub checking_free_keys: HashSet<String>,
     pub free_proxy_tasks: HashMap<String, tokio::task::AbortHandle>,
     pub free_proxy_batch_task: Option<tokio::task::AbortHandle>,
+    pub page_size: usize,
+    pub profiles_page: usize,
+    pub trash_page: usize,
+    pub my_proxies_page: usize,
+    pub free_proxies_page: usize,
     pub statuses: HashMap<String, ProfileStatus>,
     pub supervisor: RuntimeSupervisor,
     pub tokio_handle: tokio::runtime::Handle,
@@ -331,6 +344,7 @@ impl BonLoginApp {
             move |this, _, ev: &InputEvent, _window, cx| {
                 if matches!(ev, InputEvent::Change) {
                     this.search_query = search_input.read(cx).value().to_string();
+                    this.profiles_page = 0;
                     cx.notify();
                 }
             }
@@ -341,6 +355,7 @@ impl BonLoginApp {
                 if matches!(ev, InputEvent::Change) {
                     this.free_proxy_search_query =
                         free_proxy_search_input.read(cx).value().to_string();
+                    this.free_proxies_page = 0;
                     cx.notify();
                 }
             }
@@ -468,6 +483,11 @@ impl BonLoginApp {
             checking_free_keys: HashSet::new(),
             free_proxy_tasks: HashMap::new(),
             free_proxy_batch_task: None,
+            page_size: 25,
+            profiles_page: 0,
+            trash_page: 0,
+            my_proxies_page: 0,
+            free_proxies_page: 0,
             statuses: HashMap::new(),
             supervisor,
             tokio_handle,
@@ -725,6 +745,50 @@ impl BonLoginApp {
             .iter()
             .filter(|fp| fp.verified_geo.is_some())
             .count()
+    }
+
+    /// Returns `(current_page, total_pages, start_ix, end_ix)` clamped to `total_items`.
+    pub fn current_page_bounds(
+        &self,
+        table: PaginatedTable,
+        total_items: usize,
+    ) -> (usize, usize, usize, usize) {
+        let page_size = self.page_size.max(1);
+        let total_pages = total_items.div_ceil(page_size).max(1);
+        let raw_page = match table {
+            PaginatedTable::Profiles => self.profiles_page,
+            PaginatedTable::Trash => self.trash_page,
+            PaginatedTable::MyProxies => self.my_proxies_page,
+            PaginatedTable::FreeProxies => self.free_proxies_page,
+        };
+        let cur_page = raw_page.min(total_pages - 1);
+        let start_ix = cur_page * page_size;
+        let end_ix = (start_ix + page_size).min(total_items);
+        (cur_page, total_pages, start_ix, end_ix)
+    }
+
+    pub fn set_table_page(
+        &mut self,
+        table: PaginatedTable,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match table {
+            PaginatedTable::Profiles => self.profiles_page = page,
+            PaginatedTable::Trash => self.trash_page = page,
+            PaginatedTable::MyProxies => self.my_proxies_page = page,
+            PaginatedTable::FreeProxies => self.free_proxies_page = page,
+        }
+        cx.notify();
+    }
+
+    pub fn set_table_page_size(&mut self, size: usize, cx: &mut Context<Self>) {
+        self.page_size = size.clamp(5, 500);
+        self.profiles_page = 0;
+        self.trash_page = 0;
+        self.my_proxies_page = 0;
+        self.free_proxies_page = 0;
+        cx.notify();
     }
 
 }

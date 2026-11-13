@@ -462,7 +462,7 @@ impl Render for BonLoginApp {
                                     )
                                     .into_any_element()
                             } else if sub_tab == ProfileSubTab::Trash {
-                                render_trash_table(&self.trashed_profiles, cx)
+                                render_trash_table(self, cx)
                                     .with_animation(
                                         "subtab-trash-enter",
                                         BonTheme::ui_enter_anim(),

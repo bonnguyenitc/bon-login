@@ -9,7 +9,8 @@ use std::time::Duration;
 use crate::models::{BrowserBrand, PlatformType, ProxyProtocol};
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::{
-    ActivePopupModal, BonLoginApp, PendingDeleteAction, ProfileSubTab, ProxySubTab, WorkspaceView,
+    ActivePopupModal, BonLoginApp, PaginatedTable, PendingDeleteAction, ProfileSubTab, ProxySubTab,
+    WorkspaceView,
 };
 
 static ICON_CACHE: std::sync::LazyLock<
@@ -704,7 +705,10 @@ pub fn render_proxies_view(
                         )
                         .into_any_element()
                 } else {
-                    let indices_for_list = filtered_indices.clone();
+                    let (_, _, page_start, page_end) =
+                        app.current_page_bounds(PaginatedTable::MyProxies, filtered_len);
+                    let indices_for_list: std::rc::Rc<[usize]> =
+                        filtered_indices[page_start..page_end].into();
                     let counts_for_list = used_counts.clone();
                     uniform_list(
                         "proxies-table-rows",
@@ -719,7 +723,7 @@ pub fn render_proxies_view(
                                 let Some(sp) = app.saved_proxies.get(sp_ix) else {
                                     continue;
                                 };
-                                let row_num = row_ix + 1;
+                                let row_num = page_start + row_ix + 1;
                                 let pid = sp.id.clone();
                                 let pid_chk_toggle = sp.id.clone();
                                 let pid_check = sp.id.clone();
@@ -1163,37 +1167,15 @@ pub fn render_proxies_view(
                     .min_h_0()
                     .into_any_element()
                 })
-                // Table Footer (`Proxies: N   < [ 1 ] / 1 >`)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_4()
-                        .py_2()
-                        .justify_end()
-                        .items_center()
-                        .gap_3()
-                        .bg(BonTheme::bg_elevated())
-                        .border_t_1()
-                        .border_color(BonTheme::border())
-                        .text_xs()
-                        .text_color(BonTheme::text_secondary())
-                        .child(format!("Proxies: {filtered_len}"))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(BonTheme::border())
-                                        .child("1"),
-                                )
-                                .child("/ 1"),
-                        ),
-                ),
+                .child(render_table_pagination_footer(
+                    "my-proxies",
+                    PaginatedTable::MyProxies,
+                    "Proxies",
+                    filtered_len,
+                    None,
+                    app,
+                    cx,
+                )),
         )
 }
 
@@ -1668,7 +1650,10 @@ fn render_free_proxies_subtab_view(
                         }))
                         .into_any_element()
                 } else {
-                    let indices_for_list = filtered_indices.clone();
+                    let (_, _, page_start, page_end) =
+                        app.current_page_bounds(PaginatedTable::FreeProxies, filtered_len);
+                    let indices_for_list: std::rc::Rc<[usize]> =
+                        filtered_indices[page_start..page_end].into();
                     let saved_set_for_list = saved_set.clone();
                     uniform_list(
                         "free-proxies-table-rows",
@@ -1683,7 +1668,7 @@ fn render_free_proxies_subtab_view(
                                 let Some(fp) = app.free_proxies.get(fp_ix) else {
                                     continue;
                                 };
-                                let row_num = row_ix + 1;
+                                let row_num = page_start + row_ix + 1;
                                 let key = fp.endpoint_key();
                                 let key_chk = key.clone();
                                 let key_check_btn = key.clone();
@@ -2064,24 +2049,17 @@ fn render_free_proxies_subtab_view(
                     .min_h_0()
                     .into_any_element()
                 })
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_4()
-                        .py_2()
-                        .justify_between()
-                        .items_center()
-                        .gap_3()
-                        .bg(BonTheme::bg_elevated())
-                        .border_t_1()
-                        .border_color(BonTheme::border())
-                        .text_xs()
-                        .text_color(BonTheme::text_secondary())
-                        .child("Sources: ProxyScrape v4 • Fyvri SOCKS5 • Proxifly (Verified via LocalProxyTunnel)")
-                        .child(format!(
-                            "Showing: {filtered_len} / {total_free}  •  Live: {live_count}"
-                        )),
-                ),
+                .child(render_table_pagination_footer(
+                    "free-proxies",
+                    PaginatedTable::FreeProxies,
+                    "Free Proxies",
+                    filtered_len,
+                    Some(format!(
+                        "Live: {live_count}  •  Sources: ProxyScrape v4, Fyvri SOCKS5, Proxifly"
+                    )),
+                    app,
+                    cx,
+                )),
         )
 }
 
@@ -2090,6 +2068,160 @@ pub(crate) fn field_label(text: &'static str) -> Div {
         .text_xs()
         .text_color(BonTheme::text_secondary())
         .child(text)
+}
+
+pub fn render_table_pagination_footer(
+    id_prefix: &'static str,
+    table: PaginatedTable,
+    item_label: &str,
+    total_items: usize,
+    extra_left_info: Option<String>,
+    app: &BonLoginApp,
+    cx: &mut Context<BonLoginApp>,
+) -> Div {
+    let (cur_page, total_pages, start_ix, end_ix) = app.current_page_bounds(table, total_items);
+    let page_size = app.page_size;
+    let summary_str = if total_items == 0 {
+        format!("{item_label}: 0")
+    } else {
+        format!(
+            "{item_label}: {total_items}  (Showing {}–{end_ix})",
+            start_ix + 1
+        )
+    };
+    let win_start = cur_page
+        .saturating_sub(2)
+        .min(total_pages.saturating_sub(5));
+    let win_end = (win_start + 5).min(total_pages);
+    let app_for_size = cx.entity();
+
+    h_flex()
+        .w_full()
+        .px_4()
+        .py_2()
+        .justify_between()
+        .items_center()
+        .gap_3()
+        .bg(BonTheme::bg_elevated())
+        .border_t_1()
+        .border_color(BonTheme::border())
+        .text_xs()
+        .text_color(BonTheme::text_secondary())
+        .child(
+            h_flex()
+                .gap_2p5()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .font_semibold()
+                        .text_color(BonTheme::text_primary())
+                        .child(summary_str),
+                )
+                .children(extra_left_info.map(|info| {
+                    div()
+                        .truncate()
+                        .text_color(BonTheme::text_secondary())
+                        .child(format!("•  {info}"))
+                })),
+        )
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new(SharedString::from(format!("{id_prefix}-pg-size")))
+                        .outline()
+                        .dropdown_caret(true)
+                        .xsmall()
+                        .label(format!("{page_size} / page"))
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for sz in [10usize, 25, 50, 100] {
+                                let app_sz = app_for_size.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(format!("{sz} / page"))
+                                        .checked(page_size == sz)
+                                        .on_click(move |_, _, cx| {
+                                            app_sz.update(cx, |app, cx| {
+                                                app.set_table_page_size(sz, cx);
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}-pg-first")))
+                                .with_variant(BonTheme::row_action(cx))
+                                .xsmall()
+                                .disabled(cur_page == 0)
+                                .label("«")
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.set_table_page(table, 0, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}-pg-prev")))
+                                .with_variant(BonTheme::row_action(cx))
+                                .xsmall()
+                                .disabled(cur_page == 0)
+                                .label("‹ Prev")
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.set_table_page(table, cur_page.saturating_sub(1), cx);
+                                })),
+                        )
+                        .children((win_start..win_end).map(|p| {
+                            let is_cur = p == cur_page;
+                            Button::new(SharedString::from(format!("{id_prefix}-pg-num-{p}")))
+                                .with_variant(if is_cur {
+                                    BonTheme::primary_cta(cx)
+                                } else {
+                                    BonTheme::row_action(cx)
+                                })
+                                .xsmall()
+                                .label(format!("{}", p + 1))
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.set_table_page(table, p, cx);
+                                }))
+                        }))
+                        .child(
+                            div()
+                                .px_1()
+                                .text_color(BonTheme::text_muted())
+                                .child(format!("/ {total_pages}")),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}-pg-next")))
+                                .with_variant(BonTheme::row_action(cx))
+                                .xsmall()
+                                .disabled(cur_page + 1 >= total_pages)
+                                .label("Next ›")
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.set_table_page(
+                                        table,
+                                        (cur_page + 1).min(total_pages - 1),
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{id_prefix}-pg-last")))
+                                .with_variant(BonTheme::row_action(cx))
+                                .xsmall()
+                                .disabled(cur_page + 1 >= total_pages)
+                                .label("»")
+                                .on_click(cx.listener(move |app, _, _, cx| {
+                                    app.set_table_page(table, total_pages - 1, cx);
+                                })),
+                        ),
+                ),
+        )
 }
 
 pub(crate) fn render_batch_group_dropdown(
