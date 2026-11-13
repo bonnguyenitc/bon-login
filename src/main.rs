@@ -1,4 +1,7 @@
 mod control;
+mod archive;
+mod bookmarks;
+mod cookies;
 mod db;
 mod extensions;
 mod flows;
