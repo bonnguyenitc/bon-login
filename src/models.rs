@@ -923,14 +923,29 @@ impl Profile {
 
     /// Returns `(text_rgb_hex, bg_rgba_hex)` for a profile status/category tag.
     pub fn tag_badge_colors(tag: &str) -> (u32, u32) {
-        let lower = tag.trim().to_ascii_lowercase();
-        if lower.contains("live") || lower.contains("ready") || lower.contains("ok") || lower.contains("active") {
+        let t = tag.trim();
+        if contains_ignore_ascii_case(t, "live")
+            || contains_ignore_ascii_case(t, "ready")
+            || contains_ignore_ascii_case(t, "ok")
+            || contains_ignore_ascii_case(t, "active")
+        {
             (0x34d399, 0x10b98126)
-        } else if lower.contains("die") || lower.contains("ban") || lower.contains("block") || lower.contains("err") {
+        } else if contains_ignore_ascii_case(t, "die")
+            || contains_ignore_ascii_case(t, "ban")
+            || contains_ignore_ascii_case(t, "block")
+            || contains_ignore_ascii_case(t, "err")
+        {
             (0xf87171, 0xef444426)
-        } else if lower.contains("warm") || lower.contains("check") || lower.contains("pend") || lower.contains("hold") {
+        } else if contains_ignore_ascii_case(t, "warm")
+            || contains_ignore_ascii_case(t, "check")
+            || contains_ignore_ascii_case(t, "pend")
+            || contains_ignore_ascii_case(t, "hold")
+        {
             (0xfbbf24, 0xf59e0b26)
-        } else if lower.contains("vip") || lower.contains("2fa") || lower.contains("pro") {
+        } else if contains_ignore_ascii_case(t, "vip")
+            || contains_ignore_ascii_case(t, "2fa")
+            || contains_ignore_ascii_case(t, "pro")
+        {
             (0xc084fc, 0xa855f726)
         } else {
             (0x60a5fa, 0x3b82f626)

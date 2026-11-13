@@ -168,6 +168,22 @@ pub struct BonLoginApp {
     pub http_api_port: Option<u16>,
     pub selected_disk_usage: String,
     pub selected_bookmarks: Vec<(String, String)>,
+    pub used_proxy_counts: std::rc::Rc<HashMap<(ProxyProtocol, String, u16), usize>>,
+    pub cached_group_counts: Vec<(String, usize)>,
+    pub cached_proxy_group_counts: Vec<(String, usize)>,
+    pub profile_data_rev: u64,
+    profile_indices_cache: std::cell::RefCell<
+        Option<(
+            u64,
+            String,
+            String,
+            Option<ProfileSortColumn>,
+            bool,
+            usize,
+            std::rc::Rc<[usize]>,
+        )>,
+    >,
+    proxy_indices_cache: std::cell::RefCell<Option<(u64, String, std::rc::Rc<[usize]>)>>,
     pub banner_message: Option<String>,
     banner_timer_for: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -375,7 +391,10 @@ impl BonLoginApp {
 
         let initial_group = saved_groups.first().cloned().unwrap_or_default();
         let initial_tag = saved_tags.first().cloned().unwrap_or_default();
-
+        let used_proxy_counts = std::rc::Rc::new(Self::compute_used_proxy_counts(&profiles));
+        let cached_group_counts = Self::compute_group_counts(&saved_groups, &profiles);
+        let cached_proxy_group_counts =
+            Self::compute_proxy_group_counts(&saved_tags, &saved_proxies);
         Self {
             db: Arc::new(Mutex::new(db)),
             workspace_root,
@@ -434,6 +453,12 @@ impl BonLoginApp {
             http_api_port: None,
             selected_disk_usage,
             selected_bookmarks,
+            used_proxy_counts,
+            cached_group_counts,
+            cached_proxy_group_counts,
+            profile_data_rev: 1,
+            profile_indices_cache: std::cell::RefCell::new(None),
+            proxy_indices_cache: std::cell::RefCell::new(None),
             banner_message: None,
             banner_timer_for: None,
             _subscriptions: vec![search_sub],
@@ -482,8 +507,62 @@ impl BonLoginApp {
         }
         self.saved_flows = crate::flows::list_saved_flows_in(&self.workspace_root);
         self.refresh_selected_bookmarks();
+        self.used_proxy_counts = std::rc::Rc::new(Self::compute_used_proxy_counts(&self.profiles));
+        self.cached_group_counts =
+            Self::compute_group_counts(&self.saved_groups, &self.profiles);
+        self.cached_proxy_group_counts =
+            Self::compute_proxy_group_counts(&self.saved_tags, &self.saved_proxies);
+        self.profile_data_rev = self.profile_data_rev.wrapping_add(1);
     }
 
+    fn compute_group_counts(saved_groups: &[String], profiles: &[Profile]) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = saved_groups.iter().map(|g| (g.clone(), 0)).collect();
+        for p in profiles {
+            let tag = p.group_tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(entry) = out.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
+                entry.1 += 1;
+            } else {
+                out.push((tag.to_string(), 1));
+            }
+        }
+        out
+    }
+
+    fn compute_proxy_group_counts(
+        saved_tags: &[String],
+        saved_proxies: &[SavedProxy],
+    ) -> Vec<(String, usize)> {
+        let mut out: Vec<(String, usize)> = saved_tags.iter().map(|t| (t.clone(), 0)).collect();
+        for sp in saved_proxies {
+            let tag = sp.group_tag.trim();
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(entry) = out.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
+                entry.1 += 1;
+            } else {
+                out.push((tag.to_string(), 1));
+            }
+        }
+        out
+    }
+
+    fn compute_used_proxy_counts(
+        profiles: &[Profile],
+    ) -> HashMap<(ProxyProtocol, String, u16), usize> {
+        let mut used_map = HashMap::new();
+        for p in profiles {
+            if let Some(cfg) = &p.proxy {
+                *used_map
+                    .entry((cfg.protocol, cfg.host.clone(), cfg.port))
+                    .or_insert(0) += 1;
+            }
+        }
+        used_map
+    }
     pub fn refresh_selected_bookmarks(&mut self) {
         self.selected_bookmarks = self
             .selected_profile_id
@@ -532,27 +611,19 @@ impl BonLoginApp {
     }
 
     pub fn distinct_proxy_groups_with_counts(&self) -> Vec<(String, usize)> {
-        let mut out: Vec<(String, usize)> = self
-            .saved_tags
-            .iter()
-            .map(|t| (t.clone(), 0))
-            .collect();
-        for sp in &self.saved_proxies {
-            let tag = sp.group_tag.trim();
-            if tag.is_empty() {
-                continue;
-            }
-            if let Some(entry) = out.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
-                entry.1 += 1;
-            } else {
-                out.push((tag.to_string(), 1));
-            }
-        }
-        out
+        self.cached_proxy_group_counts.clone()
     }
 
-    pub fn filtered_proxy_indices(&self) -> Vec<usize> {
-        self.saved_proxies
+    pub fn filtered_proxy_indices_rc(&self) -> std::rc::Rc<[usize]> {
+        let rev = self.profile_data_rev;
+        if let Some((c_rev, c_grp, cached)) = self.proxy_indices_cache.borrow().as_ref()
+            && *c_rev == rev
+            && c_grp == &self.selected_proxy_group
+        {
+            return cached.clone();
+        }
+        let indices: std::rc::Rc<[usize]> = self
+            .saved_proxies
             .iter()
             .enumerate()
             .filter_map(|(i, sp)| {
@@ -560,7 +631,15 @@ impl BonLoginApp {
                     || sp.group_tag.eq_ignore_ascii_case(&self.selected_proxy_group))
                 .then_some(i)
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .into();
+        *self.proxy_indices_cache.borrow_mut() =
+            Some((rev, self.selected_proxy_group.clone(), indices.clone()));
+        indices
+    }
+
+    pub fn filtered_proxy_indices(&self) -> Vec<usize> {
+        self.filtered_proxy_indices_rc().to_vec()
     }
 
     pub fn toggle_proxy_checked(&mut self, proxy_id: &str, cx: &mut Context<Self>) {
@@ -1705,7 +1784,34 @@ impl BonLoginApp {
         cx.notify();
     }
 
-    pub fn filtered_profile_indices(&self) -> Vec<usize> {
+    pub fn filtered_profile_indices_rc(&self) -> std::rc::Rc<[usize]> {
+        let rev = self.profile_data_rev;
+        let status_sig = if self.sort_col == Some(ProfileSortColumn::Status) {
+            self.statuses
+                .iter()
+                .fold(0usize, |acc, (k, st)| {
+                    let r: usize = match st {
+                        ProfileStatus::Running(_) => 3,
+                        ProfileStatus::Starting => 2,
+                        ProfileStatus::Error => 1,
+                        ProfileStatus::Stopped => 0,
+                    };
+                    acc.wrapping_add(k.len().wrapping_mul(31).wrapping_add(r))
+                })
+        } else {
+            0
+        };
+        if let Some((c_rev, c_q, c_grp, c_col, c_asc, c_sig, cached)) =
+            self.profile_indices_cache.borrow().as_ref()
+            && *c_rev == rev
+            && c_q == &self.search_query
+            && c_grp == &self.selected_group
+            && *c_col == self.sort_col
+            && *c_asc == self.sort_asc
+            && *c_sig == status_sig
+        {
+            return cached.clone();
+        }
         let group_opt = (self.selected_group != "All").then_some(self.selected_group.as_str());
         let mut out: Vec<usize> = self
             .profiles
@@ -1780,27 +1886,25 @@ impl BonLoginApp {
                 final_ord.then_with(|| b.created_at.cmp(&a.created_at))
             });
         }
-        out
+        let rc: std::rc::Rc<[usize]> = out.into();
+        *self.profile_indices_cache.borrow_mut() = Some((
+            rev,
+            self.search_query.clone(),
+            self.selected_group.clone(),
+            self.sort_col,
+            self.sort_asc,
+            status_sig,
+            rc.clone(),
+        ));
+        rc
+    }
+
+    pub fn filtered_profile_indices(&self) -> Vec<usize> {
+        self.filtered_profile_indices_rc().to_vec()
     }
 
     pub fn distinct_groups_with_counts(&self) -> Vec<(String, usize)> {
-        let mut out: Vec<(String, usize)> = self
-            .saved_groups
-            .iter()
-            .map(|g| (g.clone(), 0))
-            .collect();
-        for p in &self.profiles {
-            let tag = p.group_tag.trim();
-            if tag.is_empty() {
-                continue;
-            }
-            if let Some(entry) = out.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
-                entry.1 += 1;
-            } else {
-                out.push((tag.to_string(), 1));
-            }
-        }
-        out
+        self.cached_group_counts.clone()
     }
 
     pub fn open_create_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4646,11 +4750,7 @@ impl Render for BonLoginApp {
         let active_view = self.active_view;
         let sub_tab = self.profile_sub_tab;
         let popup_modal = self.popup_modal.clone();
-        let group_count = if active_view == WorkspaceView::Profiles {
-            self.distinct_groups_with_counts().len()
-        } else {
-            0
-        };
+        let group_count = self.cached_group_counts.len();
         let selected_group = self.selected_group.clone();
         let (kernel_dot, kernel_label) = match &self.kernel_info {
             Some(_) => (BonTheme::success(), "Chromium 148 Online".to_string()),
@@ -5595,8 +5695,7 @@ impl Render for BonLoginApp {
                                     }))
                                     // GenLogin Table + Right-Hand `Detail` Drawer
                                     .child({
-                                        let filtered_indices: std::rc::Rc<[usize]> =
-                                            self.filtered_profile_indices().into();
+                                        let filtered_indices = self.filtered_profile_indices_rc();
                                         render_profile_table(self, filtered_indices, cx)
                                     })
                                     .with_animation(
@@ -5616,11 +5715,10 @@ impl Render for BonLoginApp {
                             .into_any_element(),
                         WorkspaceView::EditProfile => {
                             if let Some(modal) = self.modal.as_ref() {
-                                let proxy_group_counts = self.distinct_proxy_groups_with_counts();
                                 render_edit_profile_view(
                                     modal,
                                     &self.saved_groups,
-                                    &proxy_group_counts,
+                                    &self.cached_proxy_group_counts,
                                     &self.saved_proxies,
                                     cx,
                                 )
@@ -5648,12 +5746,11 @@ impl Render for BonLoginApp {
             .children(popup_modal.map(|kind| render_popup_modal(kind, self, cx)))
             // Floating Bottom-Right Toast Notification (auto-dismisses after 3.2s)
             .children(self.banner_message.as_ref().map(|msg| {
-                let lower = msg.to_ascii_lowercase();
-                let is_err = lower.contains("failed")
-                    || lower.contains("error")
-                    || lower.contains("blocked")
-                    || lower.contains("invalid")
-                    || lower.contains("cannot");
+                let is_err = crate::models::contains_ignore_ascii_case(msg, "failed")
+                    || crate::models::contains_ignore_ascii_case(msg, "error")
+                    || crate::models::contains_ignore_ascii_case(msg, "blocked")
+                    || crate::models::contains_ignore_ascii_case(msg, "invalid")
+                    || crate::models::contains_ignore_ascii_case(msg, "cannot");
                 let is_loading = msg.ends_with("...");
                 let (accent_color, icon_bg, icon_str) = if is_err {
                     (BonTheme::danger(), BonTheme::danger_bg(), SfSymbol::XMARK_CIRCLE_FILL)

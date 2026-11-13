@@ -262,8 +262,9 @@ fn unix_send_signal(pid: u32, sig: i32) {
 
 /// Checks whether a profile currently has a live Chromium instance with an open window.
 pub fn probe_live_runtime_in(root_dir: &Path, profile_id: &str) -> Option<RuntimeInfo> {
-    let prof_dir = root_dir.join("profiles").join(profile_id);
-    let rt_path = prof_dir.join("bon_runtime.json");
+    let mut rt_path = root_dir.join("profiles");
+    rt_path.push(profile_id);
+    rt_path.push("bon_runtime.json");
 
     let Ok(raw) = std::fs::read_to_string(&rt_path) else {
         return None;
@@ -275,7 +276,8 @@ pub fn probe_live_runtime_in(root_dir: &Path, profile_id: &str) -> Option<Runtim
     let pid_alive = info.pid > 0 && unix_pid_alive(info.pid);
     if info.pid > 0 && !pid_alive {
         let _ = std::fs::remove_file(&rt_path);
-        let _ = std::fs::remove_file(prof_dir.join("DevToolsActivePort"));
+        rt_path.set_file_name("DevToolsActivePort");
+        let _ = std::fs::remove_file(&rt_path);
         return None;
     }
 
@@ -285,7 +287,8 @@ pub fn probe_live_runtime_in(root_dir: &Path, profile_id: &str) -> Option<Runtim
         None if pid_alive => Some(info),
         None => {
             let _ = std::fs::remove_file(&rt_path);
-            let _ = std::fs::remove_file(prof_dir.join("DevToolsActivePort"));
+            rt_path.set_file_name("DevToolsActivePort");
+            let _ = std::fs::remove_file(&rt_path);
             None
         }
     }
@@ -1847,19 +1850,30 @@ impl RuntimeSupervisor {
         &self,
         candidate_ids: &[String],
     ) -> (Vec<String>, std::collections::HashMap<String, RuntimeInfo>) {
-        let mut exited = Vec::new();
+        let mut exited_procs = Vec::new();
         let mut in_proc_ids = std::collections::HashSet::new();
         if let Ok(mut map) = self.processes.lock() {
-            map.retain(|id, proc| {
-                if proc.is_alive() {
-                    in_proc_ids.insert(id.clone());
-                    true
-                } else {
-                    proc.stop_gracefully();
-                    exited.push(id.clone());
-                    false
+            let dead_ids: Vec<String> = map
+                .iter_mut()
+                .filter_map(|(id, proc)| {
+                    if proc.is_alive() {
+                        in_proc_ids.insert(id.clone());
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
+                })
+                .collect();
+            for id in dead_ids {
+                if let Some(proc) = map.remove(&id) {
+                    exited_procs.push((id, proc));
                 }
-            });
+            }
+        }
+        let mut exited = Vec::with_capacity(exited_procs.len());
+        for (id, mut proc) in exited_procs {
+            proc.stop_gracefully();
+            exited.push(id);
         }
         let mut external_live = std::collections::HashMap::new();
         for pid in candidate_ids {

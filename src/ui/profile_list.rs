@@ -73,13 +73,11 @@ pub fn render_profile_table(
         ""
     };
 
-    let selected_profile = selected_profile_id
-        .and_then(|id| {
-            filtered_indices
-                .iter()
-                .find_map(|&i| (profiles[i].id == id).then_some(&profiles[i]))
-        })
-        .cloned();
+    let selected_profile = selected_profile_id.and_then(|id| {
+        filtered_indices
+            .iter()
+            .find_map(|&i| (profiles[i].id == id).then_some(&profiles[i]))
+    });
     h_flex()
         .w_full()
         .flex_1()
@@ -299,8 +297,7 @@ pub fn render_profile_table(
         )
         // Right: GenLogin Collapsible `Detail` Drawer (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
         .children(
-            (show_detail_drawer && selected_profile.is_some()).then(|| {
-                let prof = selected_profile.unwrap();
+            selected_profile.filter(|_| show_detail_drawer).map(|prof| {
                 let pid_refresh = prof.id.clone();
                 let pid_edit = prof.id.clone();
                 let proxy_str = match &prof.proxy {

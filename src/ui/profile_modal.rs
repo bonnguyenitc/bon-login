@@ -1052,8 +1052,6 @@ pub fn render_edit_profile_view(
                                 }))
                                 .children((proxy_mode == ProxyEditMode::SavedPool).then(|| {
                                     let app_for_menu = cx.entity();
-                                    let proxies_for_menu: Vec<SavedProxy> =
-                                        saved_proxies.to_vec();
                                     let selected_sp_label = selected_proxy
                                         .as_ref()
                                         .map(|cfg| {
@@ -1164,30 +1162,37 @@ pub fn render_edit_profile_view(
                                                         .small()
                                                         .disabled(saved_proxies.is_empty())
                                                         .label(selected_sp_label)
-                                                        .dropdown_menu(move |mut menu, _, _| {
-                                                            for sp in &proxies_for_menu {
-                                                                let sp_id = sp.id.clone();
+                                                        .dropdown_menu(move |mut menu, _, cx| {
+                                                            let items: Vec<(String, String)> = app_for_menu
+                                                                .read(cx)
+                                                                .saved_proxies
+                                                                .iter()
+                                                                .map(|sp| {
+                                                                    let flag = sp
+                                                                        .resolved_geo
+                                                                        .as_ref()
+                                                                        .map(|g| {
+                                                                            crate::models::GeoInfo::country_flag(
+                                                                                &g.country_code,
+                                                                            )
+                                                                        })
+                                                                        .unwrap_or(SfSymbol::GLOBE);
+                                                                    let label = format!(
+                                                                        "{flag}  {}:{} ({}) - {} (#{})",
+                                                                        sp.config.host,
+                                                                        sp.config.port,
+                                                                        sp.config
+                                                                            .protocol
+                                                                            .as_str()
+                                                                            .to_uppercase(),
+                                                                        sp.name,
+                                                                        sp.group_tag
+                                                                    );
+                                                                    (sp.id.clone(), label)
+                                                                })
+                                                                .collect();
+                                                            for (sp_id, item_label) in items {
                                                                 let app_pick = app_for_menu.clone();
-                                                                let flag = sp
-                                                                    .resolved_geo
-                                                                    .as_ref()
-                                                                    .map(|g| {
-                                                                        crate::models::GeoInfo::country_flag(
-                                                                            &g.country_code,
-                                                                        )
-                                                                    })
-                                                                    .unwrap_or(SfSymbol::GLOBE);
-                                                                let item_label = format!(
-                                                                    "{flag}  {}:{} ({}) - {} (#{})",
-                                                                    sp.config.host,
-                                                                    sp.config.port,
-                                                                    sp.config
-                                                                        .protocol
-                                                                        .as_str()
-                                                                        .to_uppercase(),
-                                                                    sp.name,
-                                                                    sp.group_tag
-                                                                );
                                                                 menu = menu.item(
                                                                     PopupMenuItem::new(item_label)
                                                                         .on_click(

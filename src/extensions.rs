@@ -4,6 +4,18 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use std::sync::LazyLock;
+
+static EXT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .build()
+        .expect("Failed to initialize EXT_CLIENT")
+});
 
 /// Computes SHA-256 via macOS CommonCrypto for Chrome 32-char extension IDs (`a-p`).
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -1073,11 +1085,7 @@ pub async fn download_extension_from_url_cancellable_in(
             bail!("Invalid URL or Chrome Web Store ID: {trimmed}");
         };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
-        .build()?;
-    let resp = client
+    let resp = EXT_CLIENT
         .get(&download_url)
         .send()
         .await
@@ -1095,8 +1103,30 @@ pub async fn download_extension_from_url_cancellable_in(
     if bytes.is_empty() {
         bail!("Downloaded empty response from store");
     }
-    let preferred_id = target_id_override.or(store_id_opt.as_deref());
-    install_extension_from_bytes_cancellable_in(root_dir, &bytes, preferred_id, trimmed, cancelled)
+    let root_owned = root_dir.to_path_buf();
+    let preferred_owned = target_id_override
+        .map(ToString::to_string)
+        .or(store_id_opt);
+    let trimmed_owned = trimmed.to_string();
+    let cancelled_arc = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        cancelled.load(Ordering::SeqCst),
+    ));
+    let res = tokio::task::spawn_blocking(move || {
+        install_extension_from_bytes_cancellable_in(
+            &root_owned,
+            &bytes,
+            preferred_owned.as_deref(),
+            &trimmed_owned,
+            &cancelled_arc,
+        )
+    })
+    .await
+    .context("Extension unpack task panicked")??;
+    if cancelled.load(Ordering::SeqCst) {
+        let _ = std::fs::remove_dir_all(&res.folder_path);
+        bail!("Extension download cancelled");
+    }
+    Ok(res)
 }
 
 /// Ensures an enabled extension has a valid unpacked MV3 directory on disk in `extensions/<id>`.

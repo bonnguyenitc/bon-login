@@ -11,6 +11,7 @@ const GEO_TIMEOUT: Duration = Duration::from_secs(6);
 static DIRECT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(GEO_CONNECT_TIMEOUT)
+        .read_timeout(GEO_TIMEOUT)
         .timeout(GEO_TIMEOUT)
         .tcp_nodelay(true)
         .user_agent("curl/8.7.1")
@@ -18,6 +19,38 @@ static DIRECT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to initialize direct GeoIP HTTP client")
 });
 
+static PROXY_CLIENT_CACHE: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u16, reqwest::Client>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn geo_client_for_port(port: u16) -> Result<reqwest::Client> {
+    if let Ok(guard) = PROXY_CLIENT_CACHE.lock()
+        && let Some(c) = guard.get(&port)
+    {
+        return Ok(c.clone());
+    }
+    let proxy_url = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .connect_timeout(GEO_CONNECT_TIMEOUT)
+        .read_timeout(GEO_TIMEOUT)
+        .timeout(GEO_TIMEOUT)
+        .pool_max_idle_per_host(0)
+        .tcp_nodelay(true)
+        .user_agent("curl/8.7.1")
+        .proxy(
+            reqwest::Proxy::all(&proxy_url)
+                .with_context(|| format!("Invalid local proxy URL {proxy_url}"))?,
+        )
+        .build()
+        .context("Failed to build GeoIP HTTP client")?;
+    if let Ok(mut guard) = PROXY_CLIENT_CACHE.lock() {
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+        guard.insert(port, client.clone());
+    }
+    Ok(client)
+}
 // shortcut: cap concurrent GeoIP checks at 5 across UI + bulk launches + CLI to avoid 429 rate-limits
 static GEO_SEM: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(5));
@@ -115,18 +148,7 @@ fn parse_ipapi_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
 pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoInfo> {
     let _permit = GEO_SEM.acquire().await;
     let client = if let Some(port) = local_proxy_port {
-        let proxy_url = format!("http://127.0.0.1:{port}");
-        reqwest::Client::builder()
-            .connect_timeout(GEO_CONNECT_TIMEOUT)
-            .timeout(GEO_TIMEOUT)
-            .tcp_nodelay(true)
-            .user_agent("curl/8.7.1")
-            .proxy(
-                reqwest::Proxy::all(&proxy_url)
-                    .with_context(|| format!("Invalid local proxy URL {proxy_url}"))?,
-            )
-            .build()
-            .context("Failed to build GeoIP HTTP client")?
+        geo_client_for_port(port)?
     } else {
         DIRECT_CLIENT.clone()
     };

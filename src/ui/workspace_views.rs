@@ -6,7 +6,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use std::time::Duration;
-use crate::models::{BrowserBrand, PlatformType, ProxyProtocol};
+use crate::models::{BrowserBrand, PlatformType};
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction, ProfileSubTab, WorkspaceView};
 
@@ -44,8 +44,7 @@ pub fn render_extensions_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
 ) -> Div {
-    let rows: Vec<Vec<crate::models::BrowserExtension>> =
-        app.extensions.chunks(4).map(|c| c.to_vec()).collect();
+    let rows = app.extensions.chunks(4);
 
     v_flex()
         .w_full()
@@ -88,13 +87,13 @@ pub fn render_extensions_view(
                 .flex_1()
                 .gap_3p5()
                 .overflow_y_scroll()
-                .children(rows.into_iter().enumerate().map(|(row_idx, row_exts)| {
+                .children(rows.enumerate().map(|(row_idx, row_exts)| {
                     let missing = 4usize.saturating_sub(row_exts.len());
                     h_flex()
                         .w_full()
                         .gap_3p5()
                         .items_stretch()
-                        .children(row_exts.into_iter().map(|ext| {
+                        .children(row_exts.iter().map(|ext| {
                             let ext_id_toggle = ext.id.clone();
                             let ext_id_remove = ext.id.clone();
                             let ext_id_agent = ext.id.clone();
@@ -152,7 +151,7 @@ pub fn render_extensions_view(
                                                 })),
                                         )
                                         .child(
-                                            if let Some(icon_img) = get_extension_icon(&ext) {
+                                            if let Some(icon_img) = get_extension_icon(ext) {
                                                 div()
                                                     .w(px(38.))
                                                     .h(px(38.))
@@ -182,7 +181,7 @@ pub fn render_extensions_view(
                                                     .text_xs()
                                                     .font_bold()
                                                     .text_color(rgb(0xffffff))
-                                                    .child(ext.icon_label)
+                                                    .child(ext.icon_label.clone())
                                                     .into_any_element()
                                             },
                                         ),
@@ -322,7 +321,7 @@ pub fn render_proxies_view(
     let total_proxies = app.saved_proxies.len();
     let proxy_groups = app.distinct_proxy_groups_with_counts();
     let selected_pgrp = app.selected_proxy_group.clone();
-    let filtered_indices: std::rc::Rc<[usize]> = app.filtered_proxy_indices().into();
+    let filtered_indices = app.filtered_proxy_indices_rc();
     let filtered_len = filtered_indices.len();
     let checked_count = app.checked_proxy_ids.len();
     let all_filtered_checked = !filtered_indices.is_empty()
@@ -344,16 +343,7 @@ pub fn render_proxies_view(
     } else {
         format!("#{selected_pgrp} ({filtered_len})")
     };
-    let mut used_map: std::collections::HashMap<(ProxyProtocol, String, u16), usize> =
-        std::collections::HashMap::new();
-    for p in &app.profiles {
-        if let Some(cfg) = &p.proxy {
-            *used_map
-                .entry((cfg.protocol, cfg.host.clone(), cfg.port))
-                .or_insert(0) += 1;
-        }
-    }
-    let used_counts = std::rc::Rc::new(used_map);
+    let used_counts = app.used_proxy_counts.clone();
 
     let app_for_tag_menu = cx.entity();
     let groups_for_menu = proxy_groups.clone();
@@ -1316,11 +1306,11 @@ pub fn render_groups_subtab_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
 ) -> Div {
-    let q = app.search_query.trim().to_ascii_lowercase();
+    let q = app.search_query.trim();
     let groups: Vec<(String, usize)> = app
         .distinct_groups_with_counts()
         .into_iter()
-        .filter(|(grp, _)| q.is_empty() || grp.to_ascii_lowercase().contains(&q))
+        .filter(|(grp, _)| q.is_empty() || crate::models::contains_ignore_ascii_case(grp, q))
         .collect();
     v_flex()
         .w_full()
