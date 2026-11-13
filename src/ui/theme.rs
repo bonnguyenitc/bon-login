@@ -54,6 +54,11 @@ impl BonTheme {
             .with_easing(pulsating_between(0.45, 1.0))
     }
 
+    /// Phase-locked continuous 360° clockwise spin (`900ms`, linear) for loading icons
+    pub fn spin_anim() -> Animation {
+        Animation::new(Duration::from_millis(900)).repeat_synced()
+    }
+
     /// macOS Recessed Segmented Control Track / Code Well (`#151517`)
     pub fn bg_well() -> Hsla {
         rgb(0x151517).into()
@@ -334,5 +339,11 @@ mod tests {
         assert_eq!(pulse.max_fps, Some(30.0));
         let alpha_mid = (pulse.easing)(0.25);
         assert!((0.45..=1.0).contains(&alpha_mid));
+
+        let spin = BonTheme::spin_anim();
+        assert_eq!(spin.duration, Duration::from_millis(900));
+        assert!(!spin.oneshot);
+        assert!(spin.synced, "spin_anim must be phase-locked via repeat_synced()");
+        assert!(((spin.easing)(0.5) - 0.5).abs() < 1e-5);
     }
 }

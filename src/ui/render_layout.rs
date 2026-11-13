@@ -285,7 +285,9 @@ impl Render for BonLoginApp {
                                             .ghost()
                                             .xsmall()
                                             .disabled(installing)
-                                            .label(SfSymbol::ARROW_CLOCKWISE)
+                                            .icon(IconName::RefreshCw)
+                                            .loading_icon(IconName::RefreshCw)
+                                            .loading(installing)
                                             .on_click(cx.listener(|app, _, _, cx| {
                                                 app.install_kernel_opts(true, cx);
                                             }))
@@ -1197,10 +1199,28 @@ impl Render for BonLoginApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_xs()
-                            .font_bold()
-                            .text_color(accent_color)
-                            .child(icon_str),
+                            .child(if is_loading {
+                                Icon::new(IconName::RefreshCw)
+                                    .size(px(13.))
+                                    .text_color(accent_color)
+                                    .with_animation(
+                                        "toast-loading-spin",
+                                        BonTheme::spin_anim(),
+                                        |this, delta| {
+                                            this.transform(Transformation::rotate(percentage(
+                                                delta,
+                                            )))
+                                        },
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .text_xs()
+                                    .font_bold()
+                                    .text_color(accent_color)
+                                    .child(icon_str)
+                                    .into_any_element()
+                            }),
                     )
                     .child(
                         div()
