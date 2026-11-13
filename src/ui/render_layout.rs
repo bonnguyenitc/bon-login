@@ -63,7 +63,7 @@ impl Render for BonLoginApp {
             .child(
                 h_flex()
                     .size_full()
-            // 1. GenLogin 3.0 Left Sidebar (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
+            // 1. Left Navigation Sidebar
             // ================================================================
             .child(
                 v_flex()
@@ -137,10 +137,9 @@ impl Render for BonLoginApp {
                                             )
                                             .child(
                                                 div()
-                                                    .text_color(BonTheme::text_muted())
-                                                    .text_size(px(9.5))
-                                                    .font_semibold()
-                                                    .child("STEALTH • CHROMIUM 148"),
+                                                    .text_color(BonTheme::text_secondary())
+                                                    .text_size(px(10.5))
+                                                    .child("Chromium 148 Stealth"),
                                             ),
                                     ),
                             )
@@ -201,20 +200,11 @@ impl Render for BonLoginApp {
                                         },
                                     ),
                             )
-                            // macOS Sidebar Navigation Section
+                            // Sidebar Navigation Items
                             .child(
                                 v_flex()
                                     .w_full()
                                     .gap_0p5()
-                                    .child(
-                                        div()
-                                            .px_2p5()
-                                            .pb_1()
-                                            .text_size(px(10.5))
-                                            .font_semibold()
-                                            .text_color(BonTheme::text_muted())
-                                            .child("WORKSPACE"),
-                                    )
                                     .child(sidebar_nav_item(
                                         "\u{100688}   Profiles",
                                         is_profiles_nav_active,
@@ -304,7 +294,7 @@ impl Render for BonLoginApp {
                     ),
             )
             // ================================================================
-            // 2. Main Workspace (GenLogin Flat Top Header + Active Screen)
+            // 2. Main Workspace (Top Command Bar + Active Screen)
             // ================================================================
             .child(
                 v_flex()
@@ -315,7 +305,7 @@ impl Render for BonLoginApp {
                     .py_4()
                     .gap_3p5()
                     .overflow_hidden()
-                    // GenLogin Top Header Bar (`Profiles` title on left, `[⚡ Quick add]` on right)
+                    // Top Command Bar
                     .child(
                         h_flex()
                             .id("workspace-header-bar")
@@ -331,12 +321,17 @@ impl Render for BonLoginApp {
                             .overflow_hidden()
                             .window_control_area(WindowControlArea::Drag)
                             .on_double_click(|_, window, _| window.titlebar_double_click())
-                            .child(
+                            .child({
+                                let running_now = self
+                                    .statuses
+                                    .values()
+                                    .filter(|st| matches!(st, ProfileStatus::Running(_)))
+                                    .count();
                                 h_flex()
                                     .flex_1()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .gap_4()
+                                    .gap_2p5()
                                     .items_center()
                                     .child(
                                         div()
@@ -346,7 +341,45 @@ impl Render for BonLoginApp {
                                             .text_color(BonTheme::text_primary())
                                             .child(page_title),
                                     )
-                            )
+                                    .children((active_view == WorkspaceView::Profiles).then(|| {
+                                        h_flex()
+                                            .px_2()
+                                            .py_0p5()
+                                            .gap_1p5()
+                                            .items_center()
+                                            .rounded_full()
+                                            .bg(if running_now > 0 {
+                                                BonTheme::success_bg()
+                                            } else {
+                                                BonTheme::bg_elevated()
+                                            })
+                                            .text_xs()
+                                            .font_semibold()
+                                            .text_color(if running_now > 0 {
+                                                BonTheme::success()
+                                            } else {
+                                                BonTheme::text_secondary()
+                                            })
+                                            .child(
+                                                div()
+                                                    .w(px(6.))
+                                                    .h(px(6.))
+                                                    .rounded_full()
+                                                    .bg(if running_now > 0 {
+                                                        BonTheme::success()
+                                                    } else {
+                                                        BonTheme::text_muted()
+                                                    }),
+                                            )
+                                            .child(if running_now > 0 {
+                                                format!("{running_now} Running • {total_count} Total")
+                                            } else if total_count == 1 {
+                                                "1 Profile".to_string()
+                                            } else {
+                                                format!("{total_count} Profiles")
+                                            })
+                                    }))
+                            })
                             .child(
                                 h_flex()
                                     .flex_shrink_0()
@@ -420,55 +453,179 @@ impl Render for BonLoginApp {
                             .flex_1()
                             .min_h_0()
                             .gap_3()
-                            // 1. macOS Segmented Control Bar (`Local (N)` | `Groups (N)`)
+                            // 1. Unified Subtab & Search Toolbar (`[Local | Groups | Trash]` on left, `Search + Actions` on right)
                             .child(
                                 h_flex()
                                     .w_full()
                                     .flex_shrink_0()
-                                    .gap_3()
+                                    .justify_between()
                                     .items_center()
+                                    .gap_3()
                                     .child(
                                         h_flex()
-                                            .p(px(3.))
-                                            .gap(px(2.))
-                                            .rounded_lg()
-                                            .bg(BonTheme::bg_well())
-                                            .border_1()
-                                            .border_color(BonTheme::border())
-                                            .child(genlogin_subtab_item(
-                                                "Local",
-                                                total_count,
-                                                sub_tab == ProfileSubTab::Local,
-                                                ProfileSubTab::Local,
-                                                cx,
-                                            ))
-                                            .child(genlogin_subtab_item(
-                                                "Groups",
-                                                group_count,
-                                                sub_tab == ProfileSubTab::Group,
-                                                ProfileSubTab::Group,
-                                                cx,
-                                            ))
-                                            .child(genlogin_subtab_item(
-                                                "Trash",
-                                                self.trashed_profiles.len(),
-                                                sub_tab == ProfileSubTab::Trash,
-                                                ProfileSubTab::Trash,
-                                                cx,
-                                            )),
+                                            .gap_2p5()
+                                            .items_center()
+                                            .child(
+                                                h_flex()
+                                                    .p(px(3.))
+                                                    .gap(px(2.))
+                                                    .rounded_lg()
+                                                    .bg(BonTheme::bg_well())
+                                                    .border_1()
+                                                    .border_color(BonTheme::border())
+                                                    .child(workspace_subtab_item(
+                                                        "Local",
+                                                        total_count,
+                                                        sub_tab == ProfileSubTab::Local,
+                                                        ProfileSubTab::Local,
+                                                        cx,
+                                                    ))
+                                                    .child(workspace_subtab_item(
+                                                        "Groups",
+                                                        group_count,
+                                                        sub_tab == ProfileSubTab::Group,
+                                                        ProfileSubTab::Group,
+                                                        cx,
+                                                    ))
+                                                    .child(workspace_subtab_item(
+                                                        "Trash",
+                                                        self.trashed_profiles.len(),
+                                                        sub_tab == ProfileSubTab::Trash,
+                                                        ProfileSubTab::Trash,
+                                                        cx,
+                                                    )),
+                                            )
+                                            .children((selected_group != "All").then(|| {
+                                                Button::new("clear-grp-filter")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .small()
+                                                    .label(format!(
+                                                        "{}  {selected_group}  {}",
+                                                        SfSymbol::FOLDER_FILL,
+                                                        SfSymbol::XMARK
+                                                    ))
+                                                    .on_click(cx.listener(|app, _, _, cx| {
+                                                        app.selected_group = "All".to_string();
+                                                        cx.notify();
+                                                    }))
+                                            })),
                                     )
-                                    .children((selected_group != "All").then(|| {
-                                        Button::new("clear-grp-filter")
-                                            .with_variant(BonTheme::outline_blue(cx))
-                                            .small()
-                                            .label(format!(
-                                                "{}  {selected_group}  {}",
-                                                SfSymbol::FOLDER_FILL,
-                                                SfSymbol::XMARK
-                                            ))
-                                            .on_click(cx.listener(|app, _, _, cx| {
-                                                app.selected_group = "All".to_string();
-                                                cx.notify();
+                                    .children((sub_tab == ProfileSubTab::Local).then(|| {
+                                        let app_imp_csv = app_entity.clone();
+                                        let app_imp_json = app_entity.clone();
+                                        let app_imp_zip = app_entity.clone();
+                                        let app_exp_csv = app_entity.clone();
+                                        let app_exp_json = app_entity.clone();
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .w(px(240.))
+                                                    .child(Input::new(&self.search_input)),
+                                            )
+                                            .child(
+                                                Button::new("top-clean-cache-btn")
+                                                    .with_variant(BonTheme::row_action(cx))
+                                                    .small()
+                                                    .label("\u{1002af}  Clean Cache")
+                                                    .on_click(cx.listener(|app, _, _, cx| {
+                                                        app.request_clean_checked_cache(cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("top-import-export-menu")
+                                                    .with_variant(BonTheme::row_action(cx))
+                                                    .small()
+                                                    .label(format!(
+                                                        "{}  Import / Export \u{25be}",
+                                                        SfSymbol::ARROW_UP_DOC
+                                                    ))
+                                                    .dropdown_menu_with_anchor(
+                                                        Anchor::TopRight,
+                                                        move |menu, _window, _cx| {
+                                                            let ic = app_imp_csv.clone();
+                                                            let ij = app_imp_json.clone();
+                                                            let iz = app_imp_zip.clone();
+                                                            let ec = app_exp_csv.clone();
+                                                            let ej = app_exp_json.clone();
+                                                            menu.min_w(px(195.))
+                                                                .item(
+                                                                    PopupMenuItem::new(
+                                                                        "\u{10023b}   Import Backup (.zip)…",
+                                                                    )
+                                                                    .on_click(
+                                                                        move |_, window, cx| {
+                                                                            iz.update(cx, |app, cx| {
+                                                                                app.open_import_backup_zip_modal(window, cx);
+                                                                            });
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .item(
+                                                                    PopupMenuItem::new(
+                                                                        "\u{10023b}   Import CSV…",
+                                                                    )
+                                                                    .on_click(
+                                                                        move |_, window, cx| {
+                                                                            ic.update(cx, |app, cx| {
+                                                                                app.pick_and_import_csv_ui(window, cx);
+                                                                            });
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .item(
+                                                                    PopupMenuItem::new(
+                                                                        "\u{10023b}   Import JSON…",
+                                                                    )
+                                                                    .on_click(
+                                                                        move |_, window, cx| {
+                                                                            ij.update(cx, |app, cx| {
+                                                                                app.pick_and_import_json_ui(window, cx);
+                                                                            });
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .separator()
+                                                                .item(
+                                                                    PopupMenuItem::new(
+                                                                        "\u{10023d}   Export CSV",
+                                                                    )
+                                                                    .on_click(
+                                                                        move |_, _, cx| {
+                                                                            ec.update(cx, |app, cx| {
+                                                                                app.export_profiles_csv_ui(cx);
+                                                                            });
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .item(
+                                                                    PopupMenuItem::new(
+                                                                        "\u{10023d}   Export All JSON",
+                                                                    )
+                                                                    .on_click(
+                                                                        move |_, _, cx| {
+                                                                            ej.update(cx, |app, cx| {
+                                                                                app.export_all_profiles_backup(cx);
+                                                                            });
+                                                                        },
+                                                                    ),
+                                                                )
+                                                        },
+                                                    ),
+                                            )
+                                            .children((!self.show_detail_drawer).then(|| {
+                                                Button::new("reopen-detail-drawer")
+                                                    .with_variant(BonTheme::row_action(cx))
+                                                    .small()
+                                                    .label(format!(
+                                                        "{}  Inspector",
+                                                        SfSymbol::SIDEBAR_RIGHT
+                                                    ))
+                                                    .on_click(cx.listener(|app, _, _, cx| {
+                                                        app.show_detail_drawer = true;
+                                                        cx.notify();
+                                                    }))
                                             }))
                                     })),
                             )
@@ -497,143 +654,7 @@ impl Render for BonLoginApp {
                                     .flex_1()
                                     .gap_2p5()
                                     .overflow_hidden()
-                                    // Search Input Row (`🔍 Search...`)
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .justify_between()
-                                            .items_center()
-                                            .child(
-                                                div()
-                                                    .w(px(270.))
-                                                    .child(Input::new(&self.search_input)),
-                                            )
-                                            .child(
-                                                h_flex()
-                                                    .gap_2()
-                                                    .items_center()
-                                                    .child(
-                                                        Button::new("top-clean-cache-btn")
-                                                            .with_variant(BonTheme::row_action(cx))
-                                                            .small()
-                                                            .label("\u{1002af}  Clean Cache")
-                                                            .on_click(cx.listener(
-                                                                |app, _, _, cx| {
-                                                                    app.request_clean_checked_cache(
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child({
-                                                        let app_imp_csv = app_entity.clone();
-                                                        let app_imp_json = app_entity.clone();
-                                                        let app_imp_zip = app_entity.clone();
-                                                        let app_exp_csv = app_entity.clone();
-                                                        let app_exp_json = app_entity.clone();
-                                                        Button::new("top-import-export-menu")
-                                                            .with_variant(BonTheme::row_action(cx))
-                                                            .small()
-                                                            .label(format!(
-                                                                "{}  Import / Export \u{25be}",
-                                                                SfSymbol::ARROW_UP_DOC
-                                                            ))
-                                                            .dropdown_menu_with_anchor(
-                                                                Anchor::TopRight,
-                                                                move |menu, _window, _cx| {
-                                                                    let ic = app_imp_csv.clone();
-                                                                    let ij = app_imp_json.clone();
-                                                                    let iz = app_imp_zip.clone();
-                                                                    let ec = app_exp_csv.clone();
-                                                                    let ej = app_exp_json.clone();
-                                                                    menu.min_w(px(195.))
-                                                                        .item(
-                                                                            PopupMenuItem::new(
-                                                                                "\u{10023b}   Import Backup (.zip)…",
-                                                                            )
-                                                                            .on_click(
-                                                                                move |_, window, cx| {
-                                                                                    iz.update(cx, |app, cx| {
-                                                                                        app.open_import_backup_zip_modal(window, cx);
-                                                                                    });
-                                                                                },
-                                                                            ),
-                                                                        )
-                                                                        .item(
-                                                                            PopupMenuItem::new(
-                                                                                "\u{10023b}   Import CSV…",
-                                                                            )
-                                                                            .on_click(
-                                                                                move |_, window, cx| {
-                                                                                    ic.update(cx, |app, cx| {
-                                                                                        app.pick_and_import_csv_ui(window, cx);
-                                                                                    });
-                                                                                },
-                                                                            ),
-                                                                        )
-                                                                        .item(
-                                                                            PopupMenuItem::new(
-                                                                                "\u{10023b}   Import JSON…",
-                                                                            )
-                                                                            .on_click(
-                                                                                move |_, window, cx| {
-                                                                                    ij.update(cx, |app, cx| {
-                                                                                        app.pick_and_import_json_ui(window, cx);
-                                                                                    });
-                                                                                },
-                                                                            ),
-                                                                        )
-                                                                        .separator()
-                                                                        .item(
-                                                                            PopupMenuItem::new(
-                                                                                "\u{10023d}   Export CSV",
-                                                                            )
-                                                                            .on_click(
-                                                                                move |_, _, cx| {
-                                                                                    ec.update(cx, |app, cx| {
-                                                                                        app.export_profiles_csv_ui(cx);
-                                                                                    });
-                                                                                },
-                                                                            ),
-                                                                        )
-                                                                        .item(
-                                                                            PopupMenuItem::new(
-                                                                                "\u{10023d}   Export All JSON",
-                                                                            )
-                                                                            .on_click(
-                                                                                move |_, _, cx| {
-                                                                                    ej.update(cx, |app, cx| {
-                                                                                        app.export_all_profiles_backup(cx);
-                                                                                    });
-                                                                                },
-                                                                            ),
-                                                                        )
-                                                                },
-                                                            )
-                                                    })
-                                                    .children((!self.show_detail_drawer).then(
-                                                        || {
-                                                            Button::new("reopen-detail-drawer")
-                                                                .with_variant(BonTheme::row_action(
-                                                                    cx,
-                                                                ))
-                                                                .small()
-                                                                .label(format!(
-                                                                    "{}  Detail",
-                                                                    SfSymbol::SIDEBAR_RIGHT
-                                                                ))
-                                                                .on_click(cx.listener(
-                                                                    |app, _, _, cx| {
-                                                                        app.show_detail_drawer =
-                                                                            true;
-                                                                        cx.notify();
-                                                                    },
-                                                                ))
-                                                        },
-                                                    )),
-                                            ),
-                                    )
-                                    // GenLogin Top Menu Bar (Batch Action Row below Search when profiles are checked, `docs/genlogin-3.0/assets/menu-bar_profile_top-menu-bar_01.png`)
+                                    // Contextual Batch Action Bar when profiles are checked
                                     .children((checked_count > 0).then(|| {
                                         h_flex()
                                             .w_full()
@@ -1094,7 +1115,7 @@ impl Render for BonLoginApp {
                                                 },
                                             )
                                     }))
-                                    // GenLogin Table + Right-Hand `Detail` Drawer
+                                    // Master Profile Roster + Right-Hand Inspector Drawer
                                     .child({
                                         let filtered_indices = self.filtered_profile_indices_rc();
                                         render_profile_table(self, filtered_indices, cx)
@@ -1209,7 +1230,7 @@ impl Render for BonLoginApp {
     }
 }
 
-fn genlogin_subtab_item(
+fn workspace_subtab_item(
     label: &'static str,
     count: usize,
     active: bool,

@@ -1946,6 +1946,39 @@ pub fn detail_summary_row(label: &'static str, value: String) -> Div {
         )
 }
 
+pub fn detail_summary_row_mono(label: &'static str, value: String) -> Div {
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .px_1()
+        .py_1()
+        .rounded_sm()
+        .border_b_1()
+        .border_color(BonTheme::border())
+        .justify_between()
+        .items_center()
+        .gap_2()
+        .overflow_hidden()
+        .hover(|s| s.bg(BonTheme::bg_hover()))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(BonTheme::text_secondary())
+                .child(label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_family(BonTheme::font_mono())
+                .text_xs()
+                .font_semibold()
+                .text_color(BonTheme::text_primary())
+                .child(value),
+        )
+}
+
 pub fn push_bookmark_from_inputs(
     list: &mut Vec<(String, String)>,
     name_input: &Entity<InputState>,

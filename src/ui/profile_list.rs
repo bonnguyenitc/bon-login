@@ -6,7 +6,9 @@ use gpui_kit::component::{
 use gpui_kit::*;
 use std::time::Duration;
 use crate::models::{Profile, ProfileStatus};
-use crate::ui::profile_modal::detail_summary_row as drawer_row;
+use crate::ui::profile_modal::{
+    detail_summary_row as drawer_row, detail_summary_row_mono as drawer_row_mono,
+};
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::{ActivePopupModal, BonLoginApp, PendingDeleteAction};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +87,7 @@ pub fn render_profile_table(
         .flex_1()
         .gap_0()
         .overflow_hidden()
-        // Left: GenLogin 3.0 Profiles Table + Pagination Footer
+        // Left: Master Profile Roster + Pagination Footer
         .child(
             v_flex()
                 .flex_1()
@@ -96,7 +98,7 @@ pub fn render_profile_table(
                 .border_1()
                 .border_color(BonTheme::border())
                 .overflow_hidden()
-                // GenLogin Table Header (`[☐] | ID ↓ | Name ↓ | Tags | Note | Proxy | Updated at ↓ | Status | [⚙]`)
+                // Table Header (`[☐] | ID ↓ | Name ↓ (flex) | Tags | Note | Proxy | Updated ↓ | Status | [⚙]`)
                 .child(
                     h_flex()
                         .w_full()
@@ -120,94 +122,94 @@ pub fn render_profile_table(
                                 app.toggle_check_all_filtered(cx);
                             }),
                         ))
-                                .children(cols.show_id.then(|| {
-                                    sortable_col_header(
-                                        "ID",
-                                        68.,
-                                        ProfileSortColumn::Id,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
-                                .children(cols.show_name.then(|| {
-                                    sortable_col_header(
-                                        "Name",
-                                        128.,
-                                        ProfileSortColumn::Name,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
-                                .children(cols.show_tags.then(|| {
-                                    sortable_col_header(
-                                        "Tags",
-                                        76.,
-                                        ProfileSortColumn::Tags,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
-                                .children(cols.show_notes.then(|| {
-                                    sortable_col_header(
-                                        "Note",
-                                        78.,
-                                        ProfileSortColumn::Notes,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
-                                .children(cols.show_proxy.then(|| {
-                                    sortable_col_header(
-                                        "Proxy",
-                                        96.,
-                                        ProfileSortColumn::Proxy,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
-                                .children(cols.show_updated.then(|| {
-                                    sortable_col_header(
-                                        "Updated",
-                                        84.,
-                                        ProfileSortColumn::Updated,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
-                                .children(cols.show_status.then(|| {
-                                    sortable_col_header(
-                                        "Status",
-                                        64.,
-                                        ProfileSortColumn::Status,
-                                        sort_col,
-                                        sort_asc,
-                                        cx,
-                                    )
-                                }))
+                        .children(cols.show_id.then(|| {
+                            sortable_col_header(
+                                "ID",
+                                Some(70.),
+                                ProfileSortColumn::Id,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .children(cols.show_name.then(|| {
+                            sortable_col_header(
+                                "Name",
+                                None,
+                                ProfileSortColumn::Name,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .children(cols.show_tags.then(|| {
+                            sortable_col_header(
+                                "Tags",
+                                Some(88.),
+                                ProfileSortColumn::Tags,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .children(cols.show_notes.then(|| {
+                            sortable_col_header(
+                                "Note",
+                                Some(96.),
+                                ProfileSortColumn::Notes,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .children(cols.show_proxy.then(|| {
+                            sortable_col_header(
+                                "Proxy",
+                                Some(136.),
+                                ProfileSortColumn::Proxy,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .children(cols.show_updated.then(|| {
+                            sortable_col_header(
+                                "Updated",
+                                Some(86.),
+                                ProfileSortColumn::Updated,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .children(cols.show_status.then(|| {
+                            sortable_col_header(
+                                "Status",
+                                Some(74.),
+                                ProfileSortColumn::Status,
+                                sort_col,
+                                sort_asc,
+                                cx,
+                            )
+                        }))
+                        .child(
+                            h_flex()
+                                .w(px(88.))
+                                .flex_shrink_0()
+                                .justify_end()
+                                .items_center()
                                 .child(
-                                    h_flex()
-                                        .flex_1()
-                                        .flex_shrink_0()
-                                        .justify_end()
-                                        .items_center()
-                                        .child(
-                                            Button::new("btn-col-settings-gear")
-                                                .ghost()
-                                                .small()
-                                                .label(SfSymbol::GEARSHAPE_FILL)
-                                                .on_click(cx.listener(|app, _, _, cx| {
-                                                    app.popup_modal =
-                                                        Some(ActivePopupModal::ColumnSettings);
-                                                    cx.notify();
-                                                })),
-                                        ),
+                                    Button::new("btn-col-settings-gear")
+                                        .ghost()
+                                        .small()
+                                        .label(SfSymbol::GEARSHAPE_FILL)
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.popup_modal =
+                                                Some(ActivePopupModal::ColumnSettings);
+                                            cx.notify();
+                                        })),
                                 ),
+                        ),
                 )
                 // Scrollable Profile Rows Body
                 // Scrollable Virtualized Profile Rows Body
@@ -296,7 +298,7 @@ pub fn render_profile_table(
                     .min_h_0()
                     .into_any_element()
                 })
-                // GenLogin Table Footer (`Profiles: N   < [1] >   25 / page`)
+                // Table Pagination Footer (`Profiles: N   < [1] >   25 / page`)
                 .child(
                     crate::ui::workspace_views::render_table_pagination_footer(
                         "profiles",
@@ -309,7 +311,7 @@ pub fn render_profile_table(
                     ),
                 ),
         )
-        // Right: GenLogin Collapsible `Detail` Drawer (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
+        // Right: Collapsible Profile Inspector Drawer
         .children(
             selected_profile.map(|prof| {
                 let pid_refresh = prof.id.clone();
@@ -334,85 +336,130 @@ pub fn render_profile_table(
                     .overflow_hidden()
                     .child(
                         v_flex()
-                            .w(px(285.))
+                            .w(px(304.))
                             .h_full()
                             .flex_shrink_0()
                             .p_4()
-                            .gap_2()
+                            .gap_2p5()
                             .rounded_xl()
                             .bg(BonTheme::bg_panel())
                             .border_1()
                             .border_color(BonTheme::border())
                             .overflow_hidden()
+                            // Inspector Header: Profile Name + Monospace Session ID + Close Button
                             .child(
-                        h_flex()
-                            .w_full()
-                            .pb_2p5()
-                            .border_b_1()
-                            .border_color(BonTheme::border())
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_bold()
-                                    .text_color(BonTheme::text_primary())
-                                    .child("Detail"),
+                                h_flex()
+                                    .w_full()
+                                    .pb_2()
+                                    .border_b_1()
+                                    .border_color(BonTheme::border())
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .truncate()
+                                                    .text_sm()
+                                                    .font_bold()
+                                                    .text_color(BonTheme::text_primary())
+                                                    .child(prof.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(BonTheme::font_mono())
+                                                    .text_size(px(11.))
+                                                    .text_color(BonTheme::text_muted())
+                                                    .child(match statuses.get(&prof.id) {
+                                                        Some(ProfileStatus::Running(info)) => {
+                                                            format!(
+                                                                "bon_{} • :{} LIVE",
+                                                                prof.short_id(),
+                                                                info.cdp_port
+                                                            )
+                                                        }
+                                                        _ => format!(
+                                                            "bon_{} • seed {}",
+                                                            prof.short_id(),
+                                                            prof.seed
+                                                        ),
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("close-detail-drawer")
+                                            .ghost()
+                                            .small()
+                                            .label(SfSymbol::XMARK)
+                                            .on_click(cx.listener(|app, _, _, cx| {
+                                                app.show_detail_drawer = false;
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
+                            // Primary Inspector Actions: [Edit Settings] + [↻ Reseed]
                             .child(
-                                Button::new("close-detail-drawer")
-                                    .ghost()
-                                    .small()
-                                    .label(SfSymbol::XMARK)
-                                    .on_click(cx.listener(|app, _, _, cx| {
-                                        app.show_detail_drawer = false;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    // Row 1: New fingerprint | ↻ Refresh
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .py_1p5()
-                            .border_b_1()
-                            .border_color(BonTheme::border())
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(BonTheme::text_secondary())
-                                    .child("New fingerprint"),
+                                h_flex()
+                                    .w_full()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .child(
+                                        div().flex_1().child(
+                                            Button::new("drawer-open-edit")
+                                                .w_full()
+                                                .with_variant(BonTheme::outline_blue(cx))
+                                                .small()
+                                                .label(format!(
+                                                    "{}  Edit Settings",
+                                                    SfSymbol::SLIDER_HORIZONTAL_3
+                                                ))
+                                                .on_click(cx.listener(
+                                                    move |app, _, window, cx| {
+                                                        app.open_edit_view(&pid_edit, window, cx);
+                                                    },
+                                                )),
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new("drawer-refresh-fp")
+                                            .with_variant(BonTheme::row_action(cx))
+                                            .small()
+                                            .label(format!("{}  Reseed", SfSymbol::ARROW_CLOCKWISE))
+                                            .on_click(cx.listener(move |app, _, window, cx| {
+                                                app.randomize_profile_seed(
+                                                    &pid_refresh,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
                             )
-                            .child(
-                                Button::new("drawer-refresh-fp")
-                                    .ghost()
-                                    .small()
-                                    .label(format!("{}  Refresh", SfSymbol::ARROW_CLOCKWISE))
-                                    .on_click(cx.listener(move |app, _, window, cx| {
-                                        app.randomize_profile_seed(&pid_refresh, window, cx);
-                                    })),
-                            ),
-                    )
-                    .child({
-                        let pid_totp = prof.id.clone();
-                        let pid_meta = prof.id.clone();
-                        let totp_opt = prof.current_totp();
-                        let tags_str = if prof.tags.is_empty() {
-                            "None".to_string()
-                        } else {
-                            prof.tags.join(", ")
-                        };
-                        v_flex()
-                            .id("detail-drawer-body")
-                            .w_full()
-                            .flex_1()
-                            .min_h_0()
-                            .gap_2()
-                            .overflow_y_scroll()
-                            .child(drawer_row("Profile name", prof.name.clone()))
-                            .child(drawer_row("Tags", tags_str))
+                            .child({
+                                let pid_totp = prof.id.clone();
+                                let pid_meta = prof.id.clone();
+                                let totp_opt = prof.current_totp();
+                                let tags_str = if prof.tags.is_empty() {
+                                    if prof.group_tag.trim().is_empty() {
+                                        "None".to_string()
+                                    } else {
+                                        prof.group_tag.clone()
+                                    }
+                                } else {
+                                    prof.tags.join(", ")
+                                };
+                                v_flex()
+                                    .id("detail-drawer-body")
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .gap_1p5()
+                                    .overflow_y_scroll()
+                                    .child(drawer_row("Group / Tags", tags_str))
                             .child({
                                 let pid_bm_edit = prof.id.clone();
                                 let pid_bm_click = prof.id.clone();
@@ -516,23 +563,14 @@ pub fn render_profile_table(
                                             })),
                                     )
                             }))
-                            .child(drawer_row(
-                                "Agent session",
-                                match statuses.get(&prof.id) {
-                                    Some(ProfileStatus::Running(info)) => {
-                                        format!("bon_{} (:{} LIVE)", prof.short_id(), info.cdp_port)
-                                    }
-                                    _ => format!("bon_{}", prof.short_id()),
-                                },
-                            ))
                             .child(drawer_row("Browser", prof.brand.as_cli_str().to_string()))
                             .child(reseed_drawer_row(
-                                "Browser version",
+                                "Version",
                                 prof.brand.version_for_seed(prof.seed).to_string(),
                                 flash_seed,
                             ))
                             .child(reseed_drawer_row(
-                                "OS",
+                                "OS Platform",
                                 format!(
                                     "{} ({})",
                                     prof.os_platform.label(),
@@ -540,42 +578,42 @@ pub fn render_profile_table(
                                 ),
                                 flash_seed,
                             ))
-                            .child(drawer_row("Proxy", proxy_str))
+                            .child(drawer_row_mono("Proxy", proxy_str))
                             .child(drawer_row("Timezone", tz_str))
                             .child(drawer_row(
-                                "Web RTC",
+                                "WebRTC Policy",
                                 if prof.proxy.is_some() {
-                                    "Forward".to_string()
+                                    "Proxy Tunnel (No UDP)".to_string()
                                 } else {
-                                    "Real".to_string()
+                                    "Direct".to_string()
                                 },
                             ))
-                            .child(drawer_row(
-                                "Screen Resolution",
+                            .child(drawer_row_mono(
+                                "Viewport",
                                 prof.window_size.replace(',', "×"),
                             ))
                             .child(reseed_drawer_row(
-                                "CPU / RAM",
+                                "Hardware",
                                 format!(
-                                    "{} Cores / {} GB",
+                                    "{} Cores • {} GB",
                                     prof.hardware_concurrency,
                                     Profile::device_memory_for_seed(prof.seed)
                                 ),
                                 flash_seed,
                             ))
                             .child(drawer_row(
-                                "Canvas",
-                                if prof.spoof_canvas { "Noise" } else { "Off" }.to_string(),
+                                "Canvas Spoof",
+                                if prof.spoof_canvas { "C++ Noise" } else { "Native" }.to_string(),
                             ))
                             .child(reseed_drawer_row(
-                                "WebGL",
+                                "WebGL Renderer",
                                 prof.os_platform
                                     .webgl_for_seed(prof.seed, prof.gpu_spoofing)
                                     .1
                                     .to_string(),
                                 flash_seed,
                             ))
-                            .child(drawer_row("Disk Usage", selected_disk_usage.to_string()))
+                            .child(drawer_row_mono("Disk Usage", selected_disk_usage.to_string()))
                             .child({
                                 let pid_clean = prof.id.clone();
                                 let pid_wipe = prof.id.clone();
@@ -591,116 +629,144 @@ pub fn render_profile_table(
                                     .as_ref()
                                     .and_then(|p| p.change_ip_url.as_ref())
                                     .is_some();
-                                h_flex()
-                                    .pt_3()
+                                v_flex()
+                                    .pt_2p5()
                                     .mt_1()
                                     .border_t_1()
                                     .border_color(BonTheme::border())
                                     .gap_1p5()
-                                    .flex_wrap()
-                                    .child(
-                                        Button::new("drawer-open-meta")
-                                            .with_variant(BonTheme::row_action(cx))
-                                            .small()
-                                            .label("\u{1002e2} Bookmarks / Tags / 2FA")
-                                            .on_click(cx.listener(move |app, _, window, cx| {
-                                                app.open_quick_meta_modal(
-                                                    Some(pid_meta.clone()),
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("drawer-open-flows")
-                                            .with_variant(BonTheme::row_action(cx))
-                                            .small()
-                                            .label("\u{100284} Agent Flows")
-                                            .on_click(cx.listener(move |app, _, window, cx| {
-                                                app.open_agent_flows_modal(
-                                                    Some(pid_flow.clone()),
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("drawer-clean-cache")
-                                            .with_variant(BonTheme::row_action(cx))
-                                            .small()
-                                            .disabled(is_prof_running)
-                                            .label("\u{1002af} Clean Cache")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.request_delete(
-                                                    PendingDeleteAction::CleanProfileCache(
-                                                        pid_clean.clone(),
-                                                    ),
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("drawer-wipe-data")
-                                            .with_variant(BonTheme::row_action(cx))
-                                            .small()
-                                            .disabled(is_prof_running)
-                                            .label("\u{100211} Wipe Data")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.request_delete(
-                                                    PendingDeleteAction::WipeProfile(
-                                                        pid_wipe.clone(),
-                                                    ),
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .children(has_proxy_rot.then(|| {
-                                        Button::new("drawer-rotate-proxy")
-                                            .with_variant(BonTheme::row_action(cx))
-                                            .small()
-                                            .label("\u{1002af} Rotate IP")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.rotate_profile_proxy_ip(&pid_rot, cx);
+                                    // Live Running Controls (only shown when active or proxy rotatable)
+                                    .children((is_prof_running || has_proxy_rot).then(|| {
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1p5()
+                                            .flex_wrap()
+                                            .children(is_prof_running.then(|| {
+                                                Button::new("drawer-focus-win")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .xsmall()
+                                                    .label("\u{1002ab} Focus")
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.focus_profile_browser(&pid_focus, cx);
+                                                    }))
+                                            }))
+                                            .children(is_prof_running.then(|| {
+                                                Button::new("drawer-human-type")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .xsmall()
+                                                    .label("\u{100a7c} Human Type")
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.type_clipboard_as_human(&pid_type, cx);
+                                                    }))
+                                            }))
+                                            .children(is_prof_running.then(|| {
+                                                Button::new("drawer-screenshot")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .xsmall()
+                                                    .label("\u{100241} Screenshot")
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.capture_profile_screenshot(
+                                                            &pid_shot, cx,
+                                                        );
+                                                    }))
+                                            }))
+                                            .children(has_proxy_rot.then(|| {
+                                                Button::new("drawer-rotate-proxy")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .xsmall()
+                                                    .label("\u{1002af} Rotate IP")
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.rotate_profile_proxy_ip(&pid_rot, cx);
+                                                    }))
                                             }))
                                     }))
-                                    .children(is_prof_running.then(|| {
-                                        Button::new("drawer-focus-win")
-                                            .with_variant(BonTheme::outline_blue(cx))
-                                            .small()
-                                            .label("\u{1002ab} Focus Window")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.focus_profile_browser(&pid_focus, cx);
-                                            }))
-                                    }))
-                                    .children(is_prof_running.then(|| {
-                                        Button::new("drawer-human-type")
-                                            .with_variant(BonTheme::outline_blue(cx))
-                                            .small()
-                                            .label("\u{100a7c} Human Type")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.type_clipboard_as_human(&pid_type, cx);
-                                            }))
-                                    }))
-                                    .children(is_prof_running.then(|| {
-                                        Button::new("drawer-screenshot")
-                                            .with_variant(BonTheme::outline_blue(cx))
-                                            .small()
-                                            .label("\u{100241} Screenshot")
-                                            .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.capture_profile_screenshot(&pid_shot, cx);
-                                            }))
-                                    }))
+                                    // Row 1: Quick Tools (Meta/2FA + Agent Flows)
                                     .child(
-                                        Button::new("drawer-open-edit")
-                                            .with_variant(BonTheme::outline_blue(cx))
-                                            .small()
-                                            .label(format!(
-                                                "{}  Edit Full Settings",
-                                                SfSymbol::SLIDER_HORIZONTAL_3
-                                            ))
-                                            .on_click(cx.listener(move |app, _, window, cx| {
-                                                app.open_edit_view(&pid_edit, window, cx);
-                                            })),
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1p5()
+                                            .child(
+                                                div().flex_1().child(
+                                                    Button::new("drawer-open-meta")
+                                                        .w_full()
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .xsmall()
+                                                        .label("\u{1002e2} Tags & 2FA")
+                                                        .on_click(cx.listener(
+                                                            move |app, _, window, cx| {
+                                                                app.open_quick_meta_modal(
+                                                                    Some(pid_meta.clone()),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                            )
+                                            .child(
+                                                div().flex_1().child(
+                                                    Button::new("drawer-open-flows")
+                                                        .w_full()
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .xsmall()
+                                                        .label("\u{100284} Agent Flows")
+                                                        .on_click(cx.listener(
+                                                            move |app, _, window, cx| {
+                                                                app.open_agent_flows_modal(
+                                                                    Some(pid_flow.clone()),
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                            ),
+                                    )
+                                    // Row 2: Storage Maintenance (Clean Cache + Destructive Wipe Data)
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1p5()
+                                            .child(
+                                                div().flex_1().child(
+                                                    Button::new("drawer-clean-cache")
+                                                        .w_full()
+                                                        .with_variant(BonTheme::row_action(cx))
+                                                        .xsmall()
+                                                        .disabled(is_prof_running)
+                                                        .label("\u{1002af} Clean Cache")
+                                                        .on_click(cx.listener(
+                                                            move |app, _, _, cx| {
+                                                                app.request_delete(
+                                                                    PendingDeleteAction::CleanProfileCache(
+                                                                        pid_clean.clone(),
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                            )
+                                            .child(
+                                                div().flex_1().child(
+                                                    Button::new("drawer-wipe-data")
+                                                        .w_full()
+                                                        .with_variant(BonTheme::outline_danger(cx))
+                                                        .xsmall()
+                                                        .disabled(is_prof_running)
+                                                        .label("\u{100211} Wipe Data")
+                                                        .on_click(cx.listener(
+                                                            move |app, _, _, cx| {
+                                                                app.request_delete(
+                                                                    PendingDeleteAction::WipeProfile(
+                                                                        pid_wipe.clone(),
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                            ),
                                     )
                             })
                     }),
@@ -709,7 +775,7 @@ pub fn render_profile_table(
                         "detail-drawer-spring",
                         SpringAnimation::new(BonTheme::snappy_spring()).to(show_detail_drawer),
                         |this, phase| {
-                            this.w(phase.interpolate_clamped(px(0.), px(285.)))
+                            this.w(phase.interpolate_clamped(px(0.), px(304.)))
                                 .ml(phase.interpolate_clamped(px(0.), px(16.)))
                                 .opacity(phase.0.clamp(0.0, 1.0))
                         },
@@ -743,7 +809,7 @@ fn reseed_drawer_row(
 
 fn sortable_col_header(
     label: &'static str,
-    width: f32,
+    width: Option<f32>,
     col: ProfileSortColumn,
     active_col: Option<ProfileSortColumn>,
     sort_asc: bool,
@@ -759,10 +825,14 @@ fn sortable_col_header(
     } else {
         SfSymbol::ARROW_DOWN
     };
-    h_flex()
-        .w(px(width))
-        .flex_shrink_0()
-        .justify_between()
+    let base = h_flex();
+    let sized = if let Some(w) = width {
+        base.w(px(w)).flex_shrink_0()
+    } else {
+        base.flex_1().min_w(px(140.))
+    };
+    sized
+        .gap_1()
         .items_center()
         .pr_1()
         .cursor_pointer()
@@ -779,15 +849,11 @@ fn sortable_col_header(
             }),
         )
         .child(label)
-        .child(
+        .children(is_active.then(|| {
             div()
-                .text_color(if is_active {
-                    BonTheme::accent()
-                } else {
-                    BonTheme::text_muted()
-                })
-                .child(arrow),
-        )
+                .text_color(BonTheme::accent())
+                .child(arrow)
+        }))
 }
 
 fn build_profile_popup_menu(
@@ -1067,8 +1133,8 @@ fn render_profile_row(
 
     let (badge_bg, badge_fg, state_title) = match &status {
         ProfileStatus::Stopped => (
-            BonTheme::success_bg(),
-            BonTheme::success(),
+            BonTheme::bg_elevated(),
+            BonTheme::text_secondary(),
             "Ready".to_string(),
         ),
         ProfileStatus::Starting => (
@@ -1077,8 +1143,8 @@ fn render_profile_row(
             "Starting".to_string(),
         ),
         ProfileStatus::Running(_) => (
-            BonTheme::info_bg(),
-            BonTheme::info(),
+            BonTheme::success_bg(),
+            BonTheme::success(),
             "Running".to_string(),
         ),
         ProfileStatus::Error => (
@@ -1104,13 +1170,8 @@ fn render_profile_row(
     div()
         .id(SharedString::from(format!("prof-row-{profile_id}")))
         .w_full()
-        .border_l_2()
         .border_b_1()
-        .border_color(if is_selected || is_checked {
-            BonTheme::accent()
-        } else {
-            BonTheme::border()
-        })
+        .border_color(BonTheme::border())
         .bg(if is_selected || is_checked {
             BonTheme::bg_selected()
         } else {
@@ -1118,7 +1179,7 @@ fn render_profile_row(
         })
         .hover(|s| {
             if is_selected || is_checked {
-                s.bg(rgba(0x0a84ff5c)).border_color(BonTheme::accent())
+                s.bg(rgba(0x0a84ff5c))
             } else {
                 s.bg(BonTheme::bg_hover())
             }
@@ -1158,9 +1219,10 @@ fn render_profile_row(
                 .children(cols.show_id.then(|| {
                     let pid_id_col = profile_id.clone();
                     div()
-                        .w(px(68.))
+                        .w(px(70.))
                         .flex_shrink_0()
                         .truncate()
+                        .font_family(BonTheme::font_mono())
                         .text_xs()
                         .cursor_pointer()
                         .text_color(if copied_id {
@@ -1186,8 +1248,8 @@ fn render_profile_row(
                 .children(cols.show_name.then(|| {
                     let (dot_border, dot_bg, _) = Profile::accent_color_for_seed(profile.seed);
                     h_flex()
-                        .w(px(128.))
-                        .flex_shrink_0()
+                        .flex_1()
+                        .min_w(px(140.))
                         .gap_1p5()
                         .items_center()
                         .overflow_hidden()
@@ -1219,7 +1281,7 @@ fn render_profile_row(
                     let first_tag = profile.tags.first().cloned();
                     let extra_count = profile.tags.len().saturating_sub(1);
                     h_flex()
-                        .w(px(76.))
+                        .w(px(88.))
                         .flex_shrink_0()
                         .gap_1()
                         .items_center()
@@ -1281,7 +1343,7 @@ fn render_profile_row(
                     let pid_totp = profile_id.clone();
                     let totp_opt = profile.current_totp();
                     h_flex()
-                        .w(px(78.))
+                        .w(px(96.))
                         .flex_shrink_0()
                         .gap_1()
                         .items_center()
@@ -1355,16 +1417,16 @@ fn render_profile_row(
                     let pid_proxy = profile_id.clone();
                     let has_proxy = profile.proxy.is_some();
                     div()
-                        .w(px(96.))
+                        .w(px(136.))
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
-                        .text_color(if profile.resolved_geo.is_some() {
+                        .text_color(if has_proxy && profile.resolved_geo.is_some() {
                             BonTheme::success()
                         } else if has_proxy {
                             BonTheme::text_primary()
                         } else {
-                            BonTheme::text_secondary()
+                            BonTheme::text_muted()
                         })
                         .hover(|s| s.text_color(BonTheme::accent()))
                         .on_mouse_down(
@@ -1383,7 +1445,7 @@ fn render_profile_row(
                 // Col 6: Updated (`17 hours ago`)
                 .children(cols.show_updated.then(|| {
                     div()
-                        .w(px(84.))
+                        .w(px(86.))
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
@@ -1423,7 +1485,7 @@ fn render_profile_row(
                                 }),
                             );
                     }
-                    div().w(px(64.)).flex_shrink_0().child(
+                    div().w(px(74.)).flex_shrink_0().child(
                         h_flex().child(if is_starting {
                             badge
                                 .with_animation(
@@ -1437,10 +1499,10 @@ fn render_profile_row(
                         }),
                     )
                 }))
-                // Rightmost Action Column: ONLY `[Start]` + `[⋯]` (100% GenLogin 3.0 layout!)
+                // Rightmost Action Column: `[Launch/Stop]` + `[⋯]`
                 .child(
                     h_flex()
-                        .flex_1()
+                        .w(px(88.))
                         .flex_shrink_0()
                         .justify_end()
                         .items_center()
@@ -1596,11 +1658,11 @@ pub fn render_trash_table(
                         .font_semibold()
                         .text_color(BonTheme::text_secondary())
                         .child(div().w(px(80.)).child("ID"))
-                        .child(div().w(px(180.)).child("Name"))
+                        .child(div().flex_1().min_w(px(160.)).child("Name"))
                         .child(div().w(px(130.)).child("Group / Tags"))
                         .child(div().w(px(150.)).child("Proxy"))
                         .child(div().w(px(140.)).child("Deleted"))
-                        .child(div().flex_1().flex().justify_end().child("Actions")),
+                        .child(div().w(px(190.)).flex_shrink_0().flex().justify_end().child("Actions")),
                 )
                 .child(if trashed.is_empty() {
                     v_flex()
@@ -1669,13 +1731,15 @@ pub fn render_trash_table(
                                             div()
                                                 .w(px(80.))
                                                 .truncate()
+                                                .font_family(BonTheme::font_mono())
                                                 .text_xs()
                                                 .text_color(BonTheme::text_secondary())
                                                 .child(short_id),
                                         )
                                         .child(
                                             div()
-                                                .w(px(180.))
+                                                .flex_1()
+                                                .min_w(px(160.))
                                                 .truncate()
                                                 .text_xs()
                                                 .font_semibold()
@@ -1708,7 +1772,8 @@ pub fn render_trash_table(
                                         )
                                         .child(
                                             h_flex()
-                                                .flex_1()
+                                                .w(px(190.))
+                                                .flex_shrink_0()
                                                 .justify_end()
                                                 .items_center()
                                                 .gap_2()

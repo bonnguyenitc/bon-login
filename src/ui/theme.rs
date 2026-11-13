@@ -89,6 +89,11 @@ impl BonTheme {
         rgb(0x8e8e93).into()
     }
 
+    /// macOS Monospace Font Family for tabular IDs, IPs, ports, seeds, and TOTP codes
+    pub const fn font_mono() -> &'static str {
+        "SF Mono"
+    }
+
     /// Apple System Blue (`#0A84FF`)
     pub fn accent() -> Hsla {
         rgb(0x0a84ff).into()

@@ -41,7 +41,7 @@ fn get_extension_icon(ext: &crate::models::BrowserExtension) -> Option<std::sync
     Some(image)
 }
 
-/// GenLogin 3.0 `Extensions` View (`docs/genlogin-3.0/assets/menu-bar_extensions_01.png`)
+/// Extensions Management View
 pub fn render_extensions_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
@@ -315,7 +315,7 @@ pub fn render_extensions_view(
         )
 }
 
-/// GenLogin 3.0 `Proxy management` View (`docs/genlogin-3.0/assets/menu-bar_proxy-manager-and-genproxy_proxy-management_01.png`, without GenProxy)
+/// Proxy Management View (`My Proxies` & `Free Proxies`)
 pub fn render_proxies_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
@@ -418,7 +418,7 @@ pub fn render_proxies_view(
         .gap_3()
         .overflow_hidden()
         .child(subtab_bar)
-        // 1. GenLogin Top Toolbar: `[+ Add proxy]` + `[All Tag ▾]` + `[↻]` ... `[Check proxy]`
+        // 1. Top Toolbar: `[+ Add proxy]` + `[All Tag ▾]` + `[↻]` ... `[Check proxy]`
         .child(
             h_flex()
                 .w_full()
@@ -545,7 +545,7 @@ pub fn render_proxies_view(
                         ),
                 ),
         )
-        // 2. GenLogin Selection Action Bar (`[✕] [Check] [Copy] [Delete]` — shown when 1+ proxies checked)
+        // 2. Selection Action Bar (`[✕] [Check] [Copy] [Delete]` — shown when 1+ proxies checked)
         .children((checked_count > 0).then(|| {
             h_flex()
                 .w_full()
@@ -617,7 +617,7 @@ pub fn render_proxies_view(
                     |this, delta| this.opacity(delta).mt(px((1.0 - delta) * -4.0)),
                 )
         }))
-        // 3. GenLogin Proxy Management Table (`[☐] | # | Name | Tag | Protocol support | Location / IP | Status | Profiles | Actions`)
+        // 3. Proxy Management Table (`[☐] | # | Name | Tag | Protocol support | Started at | Expired at | Status | Profiles | Actions`)
         .child(
             v_flex()
                 .w_full()
@@ -838,6 +838,7 @@ pub fn render_proxies_view(
                                                 .w(px(28.))
                                                 .flex_shrink_0()
                                                 .truncate()
+                                                .font_family(BonTheme::font_mono())
                                                 .text_xs()
                                                 .text_color(BonTheme::text_secondary())
                                                 .child(format!("{row_num}")),
@@ -878,6 +879,7 @@ pub fn render_proxies_view(
                                                                 .flex_1()
                                                                 .min_w_0()
                                                                 .truncate()
+                                                                .font_family(BonTheme::font_mono())
                                                                 .text_xs()
                                                                 .text_color(
                                                                     BonTheme::text_secondary(),
@@ -1784,6 +1786,7 @@ fn render_free_proxies_subtab_view(
                                                 .w(px(28.))
                                                 .flex_shrink_0()
                                                 .truncate()
+                                                .font_family(BonTheme::font_mono())
                                                 .text_xs()
                                                 .text_color(BonTheme::text_secondary())
                                                 .child(format!("{row_num}")),
@@ -1799,6 +1802,7 @@ fn render_free_proxies_subtab_view(
                                                     div()
                                                         .w_full()
                                                         .truncate()
+                                                        .font_family(BonTheme::font_mono())
                                                         .text_sm()
                                                         .font_semibold()
                                                         .text_color(BonTheme::text_primary())
@@ -2374,7 +2378,7 @@ pub(crate) fn render_proxy_pool_selector(app: &BonLoginApp, cx: &mut Context<Bon
         )
 }
 
-/// GenLogin 3.0 `Profiles -> Group` Sub-Tab View (`docs/genlogin-3.0/assets/menu-bar_profile_group_01.png`)
+/// `Profiles -> Groups` Sub-Tab View
 pub fn render_groups_subtab_view(
     app: &BonLoginApp,
     cx: &mut Context<BonLoginApp>,
