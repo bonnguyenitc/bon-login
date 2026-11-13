@@ -1022,6 +1022,7 @@ impl BonLoginApp {
         if let Ok(db) = self.db.lock() {
             let _ = db.upsert_profile(&p);
         }
+        self.reseed_flash_seed = Some(p.seed);
         self.reload_profiles();
         self.select_profile(profile_id, window, cx);
         self.banner_message = Some(format!("Reseeded '{}' -> #{}", p.name, p.seed));
@@ -1542,6 +1543,12 @@ impl BonLoginApp {
             }
             PendingDeleteAction::WipeProfile(id) => {
                 self.wipe_single_profile_data(&id, cx);
+            }
+            PendingDeleteAction::CleanProfileCache(id) => {
+                self.clean_single_profile_cache(&id, cx);
+            }
+            PendingDeleteAction::CleanCheckedCache => {
+                self.clean_checked_profiles_cache(cx);
             }
         }
     }
@@ -2868,6 +2875,7 @@ impl BonLoginApp {
         };
         if let Some((code, rem)) = prof.current_totp() {
             cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+            self.flash_copied_key(format!("totp:{profile_id}"), cx);
             if let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() {
                 let cdp_port = info.cdp_port;
                 let code_to_type = format!("{code}\n");
@@ -3243,12 +3251,39 @@ impl BonLoginApp {
         .detach();
     }
 
-    pub fn clean_all_or_checked_cache(&mut self, cx: &mut Context<Self>) {
-        let use_checked = !self.checked_profile_ids.is_empty();
+    pub fn request_clean_checked_cache(&mut self, cx: &mut Context<Self>) {
+        if self.checked_profile_ids.is_empty() {
+            self.banner_message =
+                Some("Select at least one profile to clean cache".to_string());
+            cx.notify();
+            return;
+        }
+        let has_stopped = self.checked_profile_ids.iter().any(|id| {
+            !matches!(
+                self.statuses.get(id),
+                Some(ProfileStatus::Running(_) | ProfileStatus::Starting)
+            )
+        });
+        if !has_stopped {
+            self.banner_message =
+                Some("Stop selected profile(s) before cleaning cache".to_string());
+            cx.notify();
+            return;
+        }
+        self.request_delete(PendingDeleteAction::CleanCheckedCache, cx);
+    }
+
+    pub fn clean_checked_profiles_cache(&mut self, cx: &mut Context<Self>) {
+        if self.checked_profile_ids.is_empty() {
+            self.banner_message =
+                Some("Select at least one profile to clean cache".to_string());
+            cx.notify();
+            return;
+        }
         let ids: Vec<String> = self
             .profiles
             .iter()
-            .filter(|p| !use_checked || self.checked_profile_ids.contains(&p.id))
+            .filter(|p| self.checked_profile_ids.contains(&p.id))
             .filter(|p| {
                 !matches!(
                     self.statuses.get(&p.id),
@@ -3999,13 +4034,32 @@ impl BonLoginApp {
         cx.notify();
     }
 
+    pub fn flash_copied_key(&mut self, key: String, cx: &mut Context<Self>) {
+        self.recently_copied_key = Some(key.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.recently_copied_key.as_deref() == Some(key.as_str()) {
+                    app.recently_copied_key = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn copy_profile_id(&mut self, profile_id: &str, cx: &mut Context<Self>) {
         let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id) else {
             return;
         };
         let short_id = prof.short_id();
+        let prof_name = prof.name.clone();
         cx.write_to_clipboard(ClipboardItem::new_string(short_id.clone()));
-        self.banner_message = Some(format!("Copied ID for '{}': {short_id}", prof.name));
+        self.flash_copied_key(format!("id:{profile_id}"), cx);
+        self.banner_message = Some(format!("Copied ID for '{prof_name}': {short_id}"));
         cx.notify();
     }
 
@@ -4493,5 +4547,143 @@ impl BonLoginApp {
             });
         })
         .detach();
+    }
+
+    pub fn cancel_profile_modal(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.modal_proxy_task.take() {
+            handle.abort();
+        }
+        self.modal = None;
+        if self.active_view == WorkspaceView::EditProfile {
+            self.active_view = WorkspaceView::Profiles;
+        }
+        cx.notify();
+    }
+
+    pub fn handle_escape_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.popup_modal.is_some() {
+            self.popup_modal = None;
+            cx.notify();
+            return;
+        }
+        if self.active_view == WorkspaceView::EditProfile {
+            self.cancel_profile_modal(cx);
+            return;
+        }
+        if !self.checked_profile_ids.is_empty() {
+            self.checked_profile_ids.clear();
+            cx.notify();
+            return;
+        }
+        if !self.checked_proxy_ids.is_empty() {
+            self.checked_proxy_ids.clear();
+            cx.notify();
+            return;
+        }
+        if !self.checked_free_keys.is_empty() {
+            self.checked_free_keys.clear();
+            cx.notify();
+            return;
+        }
+        window.blur(cx);
+    }
+
+    pub fn handle_close_window_or_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.popup_modal.is_some() {
+            self.popup_modal = None;
+            cx.notify();
+            return;
+        }
+        if self.active_view == WorkspaceView::EditProfile {
+            self.cancel_profile_modal(cx);
+            return;
+        }
+        window.remove_window();
+    }
+
+    pub fn focus_active_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.popup_modal = None;
+        if self.active_view == WorkspaceView::Proxies
+            && self.proxy_sub_tab == ProxySubTab::FreeProxies
+        {
+            let input = self.free_proxy_search_input.clone();
+            input.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        if self.active_view != WorkspaceView::Profiles {
+            self.active_view = WorkspaceView::Profiles;
+        }
+        if self.profile_sub_tab == ProfileSubTab::Group {
+            self.profile_sub_tab = ProfileSubTab::Local;
+        }
+        let input = self.search_input.clone();
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    pub fn refresh_workspace_shortcut(&mut self, cx: &mut Context<Self>) {
+        self.reload_profiles();
+        self.refresh_selected_disk_usage(cx);
+        self.banner_message = Some("Workspace synced".to_string());
+        cx.notify();
+    }
+
+    pub fn stop_all_running_profiles(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .statuses
+            .iter()
+            .filter_map(|(id, st)| {
+                matches!(st, ProfileStatus::Running(_) | ProfileStatus::Starting)
+                    .then(|| id.clone())
+            })
+            .collect();
+        if ids.is_empty() {
+            self.banner_message = Some("No running browser sessions".to_string());
+            cx.notify();
+            return;
+        }
+        let count = ids.len();
+        for id in ids {
+            self.stop_profile(&id, cx);
+        }
+        self.banner_message = Some(format!(
+            "Stopped {count} running browser session(s) (cookies flushed)"
+        ));
+        cx.notify();
+    }
+
+    pub fn launch_or_stop_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_profile_id.clone() else {
+            self.banner_message = Some("No profile selected".to_string());
+            cx.notify();
+            return;
+        };
+        if matches!(
+            self.statuses.get(&id),
+            Some(ProfileStatus::Running(_) | ProfileStatus::Starting)
+        ) {
+            self.stop_profile(&id, cx);
+        } else {
+            self.launch_profile(&id, cx);
+        }
+    }
+
+    pub fn copy_agent_cli_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_profile_id.clone() else {
+            self.banner_message = Some("No profile selected".to_string());
+            cx.notify();
+            return;
+        };
+        self.copy_agent_browser_cli(&id, cx);
+    }
+
+    pub fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_profile_id.clone() else {
+            self.banner_message = Some("No profile selected".to_string());
+            cx.notify();
+            return;
+        };
+        self.delete_profile(&id, window, cx);
     }
 }

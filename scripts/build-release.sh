@@ -61,6 +61,10 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
 </dict>
 </plist>
 EOF
@@ -68,6 +72,9 @@ EOF
 xattr -cr "${APP_DIR}" 2>/dev/null || true
 codesign --force --deep --sign - "${APP_DIR}" >/dev/null
 
+if [ -L "${HOME}/.local/bin/${BIN_NAME}" ] || [ -f "${HOME}/.local/bin/${BIN_NAME}" ]; then
+  ln -sf "$(pwd)/${OUT_DIR}/${BIN_NAME}" "${HOME}/.local/bin/${BIN_NAME}"
+fi
 BIN_SIZE=$(du -sh "${OUT_DIR}/${BIN_NAME}" | awk '{print $1}')
 APP_SIZE=$(du -sh "${APP_DIR}" | awk '{print $1}')
 echo "==> Done!"

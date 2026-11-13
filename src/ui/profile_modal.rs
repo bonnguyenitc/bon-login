@@ -539,34 +539,33 @@ pub fn render_edit_profile_view(
                                         .pt_2()
                                         .border_t_1()
                                         .border_color(BonTheme::border())
-                                        .gap_2()
-                                        .children(
-                                            [
-                                                (ProfileEditorTab::Overview, "Overview"),
-                                                (ProfileEditorTab::Network, "Network"),
-                                                (ProfileEditorTab::Location, "Location"),
-                                                (ProfileEditorTab::Hardware, "Hardware"),
-                                                (ProfileEditorTab::Bookmarks, "Bookmarks"),
-                                                (ProfileEditorTab::Cookies, "Cookies"),
-                                            ]
-                                            .into_iter()
-                                            .map(|(tab, lbl)| {
-                                                Button::new(SharedString::from(format!(
-                                                    "prof-tab-{lbl}"
-                                                )))
-                                                .small()
-                                                .with_variant(BonTheme::toggle_pill(
-                                                    cx,
-                                                    active_tab == tab,
-                                                ))
-                                                .label(lbl)
-                                                .on_click(cx.listener(move |app, _, _, cx| {
-                                                    if let Some(m) = app.modal.as_mut() {
-                                                        m.active_tab = tab;
-                                                        cx.notify();
-                                                    }
-                                                }))
-                                            }),
+                                        .child(
+                                            h_flex()
+                                                .p(px(3.))
+                                                .gap(px(2.))
+                                                .rounded_lg()
+                                                .bg(BonTheme::bg_well())
+                                                .border_1()
+                                                .border_color(BonTheme::border())
+                                                .children(
+                                                    [
+                                                        (ProfileEditorTab::Overview, "Overview"),
+                                                        (ProfileEditorTab::Network, "Network"),
+                                                        (ProfileEditorTab::Location, "Location"),
+                                                        (ProfileEditorTab::Hardware, "Hardware"),
+                                                        (ProfileEditorTab::Bookmarks, "Bookmarks"),
+                                                        (ProfileEditorTab::Cookies, "Cookies"),
+                                                    ]
+                                                    .into_iter()
+                                                    .map(|(tab, lbl)| {
+                                                        editor_tab_item(
+                                                            tab,
+                                                            lbl,
+                                                            active_tab == tab,
+                                                            cx,
+                                                        )
+                                                    }),
+                                                ),
                                         ),
                                 ),
                         )
@@ -942,11 +941,6 @@ pub fn render_edit_profile_view(
                                                 ),
                                         )
                                 })
-                                .with_animation(
-                                    "prof-tab-overview-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
-                                )
                                 .into_any_element(),
 
                             ProfileEditorTab::Network => v_flex()
@@ -1307,11 +1301,6 @@ pub fn render_edit_profile_view(
                                                 .child("Forward / Non-Proxied UDP Locked"),
                                         ),
                                 )
-                                .with_animation(
-                                    "prof-tab-network-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
-                                )
                                 .into_any_element(),
 
                             ProfileEditorTab::Location => v_flex()
@@ -1436,11 +1425,6 @@ pub fn render_edit_profile_view(
                                                 ),
                                         )
                                 }))
-                                .with_animation(
-                                    "prof-tab-location-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
-                                )
                                 .into_any_element(),
 
                             ProfileEditorTab::Hardware => v_flex()
@@ -1589,11 +1573,6 @@ pub fn render_edit_profile_view(
                                                         })),
                                                 ),
                                         ),
-                                )
-                                .with_animation(
-                                    "prof-tab-hardware-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
                                 )
                                 .into_any_element(),
 
@@ -1775,11 +1754,6 @@ pub fn render_edit_profile_view(
                                         ))
                                         .child(Textarea::new(&modal.cookies_input).w_full()),
                                 )
-                                .with_animation(
-                                    "prof-tab-cookies-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
-                                )
                                 .into_any_element(),
                             ProfileEditorTab::Bookmarks => v_flex()
                                 .w_full()
@@ -1790,11 +1764,6 @@ pub fn render_edit_profile_view(
                                 .border_1()
                                 .border_color(BonTheme::border())
                                 .child(render_modal_bookmarks_section(modal, &bookmarks_parsed, true, cx))
-                                .with_animation(
-                                    "prof-tab-bookmarks-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
-                                )
                                 .into_any_element(),
                         }),
                 )
@@ -1890,6 +1859,58 @@ pub fn render_edit_profile_view(
                             webgl_renderer_preview.to_string(),
                         )),
                 ),
+        )
+}
+
+fn editor_tab_item(
+    tab: ProfileEditorTab,
+    label: &'static str,
+    active: bool,
+    cx: &mut Context<BonLoginApp>,
+) -> impl IntoElement + use<> {
+    h_flex()
+        .id(SharedString::from(format!("prof-tab-{label}")))
+        .px_3()
+        .py_1()
+        .items_center()
+        .cursor_pointer()
+        .rounded_md()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |app, _, _, cx| {
+                if let Some(m) = app.modal.as_mut() {
+                    m.active_tab = tab;
+                    cx.notify();
+                }
+            }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(if active {
+                    rgb(0xffffff).into()
+                } else {
+                    BonTheme::text_secondary()
+                })
+                .child(label),
+        )
+        .with_spring(
+            SharedString::from(format!("prof-tab-spring-{label}")),
+            SpringAnimation::new(BonTheme::snappy_spring()).to(active),
+            move |this, phase| {
+                this.bg(phase.interpolate_clamped(
+                    Hsla::from(rgba(0x00000000)),
+                    BonTheme::accent(),
+                ))
+                .hover(move |s| {
+                    if active {
+                        s.bg(rgb(0x2997ff))
+                    } else {
+                        s.bg(BonTheme::bg_hover())
+                    }
+                })
+            },
         )
 }
 

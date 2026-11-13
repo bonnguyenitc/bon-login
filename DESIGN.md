@@ -12,23 +12,26 @@ BonLogin is an **Operate-mode** macOS desktop workbench built in 100% Pure Rust 
 
 ## 2. Color Tokens (`src/ui/theme.rs` — `BonTheme`)
 
-| Token | Hex | Role |
+| Token | Hex / Value | Role |
 |---|---|---|
-| `BonTheme::bg_canvas()` | `#090A0F` | Deepest application window canvas |
-| `BonTheme::bg_panel()` | `#0F1117` | Primary surface for Master Roster & Right Inspector panes |
-| `BonTheme::bg_elevated()` | `#161922` | Table headers, inspector headers, and spec cards |
-| `BonTheme::bg_selected()` | `#1A1F2E` | Active selected row background in Master Roster |
-| `BonTheme::bg_well()` | `#07080C` | Recessed monospace output well for `agent-browser` & Cookie JSON |
-| `BonTheme::border()` | `#212634` | `1px` structural hairline divider |
-| `BonTheme::border_active()` | `#3B4668` | Highlighted `1px` border on selected row and active CDP card |
-| `BonTheme::text_primary()` | `#F3F5F8` | Primary high-contrast body and heading ink |
-| `BonTheme::text_secondary()` | `#949DB2` | Cool-tinted slate secondary copy and form labels |
-| `BonTheme::text_muted()` | `#636C82` | Technical metadata, IDs (`bon_<id8>`), and column headers |
-| `BonTheme::accent()` | `#6366F1` | Precision Indigo for group badges and active controls |
-| `BonTheme::success()` | `#10B981` | Running session indicator, verified GeoIP exit node, Kernel ready |
-| `BonTheme::warning()` | `#F59E0B` | Starting tunnel / GeoIP resolution in progress / Kernel missing |
-| `BonTheme::danger()` | `#EF4444` | Fail-Closed proxy block & Stop session trigger |
-
+| `BonTheme::bg_canvas()` | `#1C1C1E` | macOS `systemBackground` Dark Mode window canvas |
+| `BonTheme::bg_sidebar()` | `rgba(22, 22, 25, 0.84)` | Translucent vibrancy left navigation sidebar |
+| `BonTheme::bg_panel()` | `#242427` | `secondarySystemGroupedBackground` for tables & Detail Drawer |
+| `BonTheme::bg_elevated()` | `#2C2C30` | `tertiarySystemBackground` for table headers, cards & controls |
+| `BonTheme::bg_selected()` | `rgba(10, 132, 255, 0.28)` | Active selected / checked row surface |
+| `BonTheme::bg_hover()` | `rgba(255, 255, 255, 0.05)` | Subtle row & control hover highlight |
+| `BonTheme::bg_well()` | `#151517` | Recessed segmented control track & monospace code well |
+| `BonTheme::border()` | `rgba(255, 255, 255, 0.09)` | `1px` specular hairline divider |
+| `BonTheme::border_control()` | `rgba(255, 255, 255, 0.22)` | Checkbox and control bezel border |
+| `BonTheme::border_active()` | `rgba(10, 132, 255, 0.65)` | Active focus & modal card highlight border |
+| `BonTheme::text_primary()` | `#F5F5F7` | Primary high-contrast body and heading ink |
+| `BonTheme::text_secondary()` | `#AEAEB2` | `systemGray2` secondary copy and form labels |
+| `BonTheme::text_muted()` | `#8E8E93` | `systemGray` WCAG AA caption, IDs (`bon_<id8>`), and column headers |
+| `BonTheme::accent()` | `#0A84FF` | Apple System Blue for active tabs, checkboxes, and primary CTAs |
+| `BonTheme::success()` | `#30D158` | Apple System Green for Ready/Live proxy status & copy confirmation |
+| `BonTheme::info()` | `#64D2FF` | Apple System Cyan for Running browser sessions & active checks |
+| `BonTheme::warning()` | `#FF9F0A` | Apple System Orange for Starting tunnel / Engine missing |
+| `BonTheme::danger()` | `#FF453A` | Apple System Red for Fail-Closed proxy block & Stop session trigger |
 ---
 
 ## 3. Spatial Architecture & Topology (`src/ui/mod.rs`)
@@ -69,3 +72,17 @@ BonLogin is an **Operate-mode** macOS desktop workbench built in 100% Pure Rust 
 - **Elevation:** Declared once via `1px` hairline borders (`BonTheme::border()`) and surface luminance steps (`bg_canvas` $\rightarrow$ `bg_panel` $\rightarrow$ `bg_elevated`), never fuzzy drop shadows or thick side borders.
 - **Status Indicators:** Drawn with crisp `6px` geometric status dots (`rounded_full()`) paired with semantic pill badges—never emoji or inconsistent Unicode glyphs.
 - **Heading Discipline:** No uppercase kickers or eyebrows above headings; section titles and table headers speak directly in `text_xs font_semibold`.
+
+---
+
+## 5. Motion & Animation System (`src/ui/theme.rs` — Emil Kowalski Philosophy)
+
+| Token | Specification | Usage |
+|---|---|---|
+| `BonTheme::snappy_spring()` | `SpringConfig::new(420.0, 38.0, 1.0)` ($\omega_0 \approx 20.5$, $\zeta \approx 0.93$) | Interruptible velocity-preserving spring for sidebar nav pills, segmented subtabs (`Local \| Groups \| Trash`, `My Proxies \| Free Proxies`), 6-tab Profile Editor pills, checkboxes, extension switches, and bidirectional `Detail` Drawer (`0px <-> 285px`) reveal |
+| `BonTheme::ui_enter_anim()` | `140ms` `ease_out_quint()` | Crisp entrance for centered popup modals (`+10px` vertical lift + separate backdrop alpha interpolation), contextual batch action bars (`-4px -> 0px` slide), and stable-ID floating toast notifications |
+| `BonTheme::status_pulse_anim()` | `1200ms` `pulsating_between(0.45, 1.0)` + `.repeat_synced()` + `.with_max_fps(30.0)` | Phase-locked 30fps breathing pulse shared across all `Starting` and `Checking...` status badges |
+
+- **100+/day Navigation Rule:** Switching top-level views (`⌘1`–`⌘3`), subtabs, editor tabs, or selecting profile rows in the table is **instant** (`0ms` container opacity blanking); only the active pill indicator springs smoothly.
+- **Virtualized Identity Rule:** Every spring or animation inside `uniform_list` (`Profiles`, `My Proxies`, `Free Proxies`) is keyed by the item's stable identity (`profile_id`, `pid`, `endpoint_key()`), never by viewport slot index.
+- **Accessibility (`cx.reduce_motion()`):** Respected automatically by GPUI's `AnimationElement` and `SpringAnimationElement`, snapping oneshot animations and springs to their target state without scheduling redundant frames.

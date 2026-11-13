@@ -70,7 +70,7 @@ impl Render for BonLoginApp {
                     .w(px(218.))
                     .h_full()
                     .flex_shrink_0()
-                    .pt(px(44.))
+                    .pt_0()
                     .pb_3p5()
                     .px_3()
                     .justify_between()
@@ -80,8 +80,22 @@ impl Render for BonLoginApp {
                     .child(
                         v_flex()
                             .w_full()
-                            .gap_3p5()
-                            // BonLogin Brand Header under macOS Traffic Lights
+                            .gap_0()
+                            // Native macOS Titlebar Drag Strip above Sidebar Logo
+                            .child(
+                                div()
+                                    .id("sidebar-titlebar-drag")
+                                    .w_full()
+                                    .h(px(44.))
+                                    .flex_shrink_0()
+                                    .window_control_area(WindowControlArea::Drag)
+                                    .on_double_click(|_, window, _| window.titlebar_double_click()),
+                            )
+                            .child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_3p5()
+                                    // BonLogin Brand Header under macOS Traffic Lights
                             .child(
                                 h_flex()
                                     .px_1p5()
@@ -146,13 +160,6 @@ impl Render for BonLoginApp {
                                     } else {
                                         BonTheme::border()
                                     })
-                                    .hover(|s| {
-                                        if is_creating_profile {
-                                            s.bg(rgb(0x2997ff))
-                                        } else {
-                                            s.bg(rgb(0x36363b)).border_color(BonTheme::border_active())
-                                        }
-                                    })
                                     .text_xs()
                                     .font_semibold()
                                     .text_color(BonTheme::text_primary())
@@ -178,11 +185,19 @@ impl Render for BonLoginApp {
                                         "sidebar-create-prof-spring",
                                         SpringAnimation::new(BonTheme::snappy_spring())
                                             .to(is_creating_profile),
-                                        |this, phase| {
+                                        move |this, phase| {
                                             this.bg(phase.interpolate_clamped(
                                                 BonTheme::bg_elevated(),
                                                 BonTheme::accent(),
                                             ))
+                                            .hover(move |s| {
+                                                if is_creating_profile {
+                                                    s.bg(rgb(0x2997ff))
+                                                } else {
+                                                    s.bg(rgb(0x36363b))
+                                                        .border_color(BonTheme::border_active())
+                                                }
+                                            })
                                         },
                                     ),
                             )
@@ -218,6 +233,7 @@ impl Render for BonLoginApp {
                                         WorkspaceView::Extensions,
                                         cx,
                                     )),
+                                    ),
                             ),
                     )
                     // Sidebar Footer: Engine Status Pill
@@ -302,6 +318,7 @@ impl Render for BonLoginApp {
                     // GenLogin Top Header Bar (`Profiles` title on left, `[⚡ Quick add]` on right)
                     .child(
                         h_flex()
+                            .id("workspace-header-bar")
                             .w_full()
                             .min_w_0()
                             .flex_shrink_0()
@@ -312,6 +329,8 @@ impl Render for BonLoginApp {
                             .items_center()
                             .gap_3()
                             .overflow_hidden()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_double_click(|_, window, _| window.titlebar_double_click())
                             .child(
                                 h_flex()
                                     .flex_1()
@@ -454,21 +473,9 @@ impl Render for BonLoginApp {
                                     })),
                             )
                             .child(if sub_tab == ProfileSubTab::Group {
-                                render_groups_subtab_view(self, cx)
-                                    .with_animation(
-                                        "subtab-groups-enter",
-                                        BonTheme::ui_enter_anim(),
-                                        |this, delta| this.opacity(delta),
-                                    )
-                                    .into_any_element()
+                                render_groups_subtab_view(self, cx).into_any_element()
                             } else if sub_tab == ProfileSubTab::Trash {
-                                render_trash_table(self, cx)
-                                    .with_animation(
-                                        "subtab-trash-enter",
-                                        BonTheme::ui_enter_anim(),
-                                        |this, delta| this.opacity(delta),
-                                    )
-                                    .into_any_element()
+                                render_trash_table(self, cx).into_any_element()
                             } else {
                                 let checked_count = self.checked_profile_ids.len();
                                 let checked_running_count = self
@@ -512,64 +519,98 @@ impl Render for BonLoginApp {
                                                             .label("\u{1002af}  Clean Cache")
                                                             .on_click(cx.listener(
                                                                 |app, _, _, cx| {
-                                                                    app.clean_all_or_checked_cache(
+                                                                    app.request_clean_checked_cache(
                                                                         cx,
                                                                     );
                                                                 },
                                                             )),
                                                     )
-                                                    .child(
-                                                        Button::new("top-import-csv-btn")
+                                                    .child({
+                                                        let app_imp_csv = app_entity.clone();
+                                                        let app_imp_json = app_entity.clone();
+                                                        let app_imp_zip = app_entity.clone();
+                                                        let app_exp_csv = app_entity.clone();
+                                                        let app_exp_json = app_entity.clone();
+                                                        Button::new("top-import-export-menu")
                                                             .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("\u{10023b}  Import CSV")
-                                                            .on_click(cx.listener(
-                                                                |app, _, window, cx| {
-                                                                    app.pick_and_import_csv_ui(
-                                                                        window, cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("top-export-csv-btn")
-                                                            .with_variant(BonTheme::row_action(cx))
-                                                            .small()
-                                                            .label("\u{10023d}  Export CSV")
-                                                            .on_click(cx.listener(
-                                                                |app, _, _, cx| {
-                                                                    app.export_profiles_csv_ui(cx);
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("top-import-json-btn")
-                                                            .with_variant(BonTheme::row_action(cx))
-                                                            .small()
-                                                            .label("\u{10023b}  Import JSON")
-                                                            .on_click(cx.listener(
-                                                                |app, _, window, cx| {
-                                                                    app.pick_and_import_json_ui(
-                                                                        window, cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("top-import-zip-btn")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
+                                                            .label(format!(
+                                                                "{}  Import / Export \u{25be}",
+                                                                SfSymbol::ARROW_UP_DOC
                                                             ))
-                                                            .small()
-                                                            .label("\u{10023b}  Import .zip")
-                                                            .on_click(cx.listener(
-                                                                |app, _, window, cx| {
-                                                                    app.open_import_backup_zip_modal(
-                                                                        window, cx,
-                                                                    );
+                                                            .dropdown_menu_with_anchor(
+                                                                Anchor::TopRight,
+                                                                move |menu, _window, _cx| {
+                                                                    let ic = app_imp_csv.clone();
+                                                                    let ij = app_imp_json.clone();
+                                                                    let iz = app_imp_zip.clone();
+                                                                    let ec = app_exp_csv.clone();
+                                                                    let ej = app_exp_json.clone();
+                                                                    menu.min_w(px(195.))
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023b}   Import Backup (.zip)…",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    iz.update(cx, |app, cx| {
+                                                                                        app.open_import_backup_zip_modal(window, cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023b}   Import CSV…",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    ic.update(cx, |app, cx| {
+                                                                                        app.pick_and_import_csv_ui(window, cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023b}   Import JSON…",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    ij.update(cx, |app, cx| {
+                                                                                        app.pick_and_import_json_ui(window, cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .separator()
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023d}   Export CSV",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    ec.update(cx, |app, cx| {
+                                                                                        app.export_profiles_csv_ui(cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{10023d}   Export All JSON",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    ej.update(cx, |app, cx| {
+                                                                                        app.export_all_profiles_backup(cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
                                                                 },
-                                                            )),
-                                                    )
+                                                            )
+                                                    })
                                                     .children((!self.show_detail_drawer).then(
                                                         || {
                                                             Button::new("reopen-detail-drawer")
@@ -578,7 +619,7 @@ impl Render for BonLoginApp {
                                                                 ))
                                                                 .small()
                                                                 .label(format!(
-                                                                    "{}  Show Detail Panel",
+                                                                    "{}  Detail",
                                                                     SfSymbol::SIDEBAR_RIGHT
                                                                 ))
                                                                 .on_click(cx.listener(
@@ -594,15 +635,46 @@ impl Render for BonLoginApp {
                                     )
                                     // GenLogin Top Menu Bar (Batch Action Row below Search when profiles are checked, `docs/genlogin-3.0/assets/menu-bar_profile_top-menu-bar_01.png`)
                                     .children((checked_count > 0).then(|| {
-                                        v_flex()
+                                        h_flex()
                                             .w_full()
-                                            .gap_1p5()
+                                            .px_2p5()
+                                            .py_1p5()
+                                            .rounded_lg()
+                                            .bg(BonTheme::bg_elevated())
+                                            .border_1()
+                                            .border_color(BonTheme::border())
+                                            .justify_between()
+                                            .items_center()
+                                            .gap_2()
+                                            // Left: Selection Pill + Lifecycle + Grouped Actions
                                             .child(
                                                 h_flex()
-                                                    .w_full()
-                                                    .gap_2()
+                                                    .gap_1p5()
                                                     .flex_wrap()
                                                     .items_center()
+                                                    // 1. Selection counter + clear
+                                                    .child(
+                                                        Button::new("batch-clear-sel")
+                                                            .ghost()
+                                                            .small()
+                                                            .label(format!(
+                                                                "{checked_count} selected  {}",
+                                                                SfSymbol::XMARK
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.checked_profile_ids.clear();
+                                                                    cx.notify();
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(1.))
+                                                            .h(px(16.))
+                                                            .bg(BonTheme::border()),
+                                                    )
+                                                    // 2. Lifecycle: Start / Stop
                                                     .children((checked_stopped_count > 0).then(
                                                         || {
                                                             Button::new("batch-launch-sel")
@@ -611,13 +683,8 @@ impl Render for BonLoginApp {
                                                                 )
                                                                 .small()
                                                                 .label(format!(
-                                                                    "{}  Start {checked_stopped_count} profile{}",
+                                                                    "{}  Start ({checked_stopped_count})",
                                                                     SfSymbol::PLAY_FILL,
-                                                                    if checked_stopped_count == 1 {
-                                                                        ""
-                                                                    } else {
-                                                                        "s"
-                                                                    }
                                                                 ))
                                                                 .on_click(cx.listener(
                                                                     |app, _, _, cx| {
@@ -636,13 +703,8 @@ impl Render for BonLoginApp {
                                                                 )
                                                                 .small()
                                                                 .label(format!(
-                                                                    "{}  Stop {checked_running_count} profile{}",
+                                                                    "{}  Stop ({checked_running_count})",
                                                                     SfSymbol::STOP_FILL,
-                                                                    if checked_running_count == 1 {
-                                                                        ""
-                                                                    } else {
-                                                                        "s"
-                                                                    }
                                                                 ))
                                                                 .on_click(cx.listener(
                                                                     |app, _, _, cx| {
@@ -653,65 +715,19 @@ impl Render for BonLoginApp {
                                                                 ))
                                                         },
                                                     ))
-                                                    .children((checked_running_count > 0).then(
-                                                        || {
-                                                            Button::new("batch-arrange-sel")
-                                                                .with_variant(
-                                                                    BonTheme::outline_blue(cx),
-                                                                )
-                                                                .small()
-                                                                .label(format!(
-                                                                    "{}  Arrange {checked_running_count}",
-                                                                    SfSymbol::PC
-                                                                ))
-                                                                .on_click(cx.listener(
-                                                                    |app, _, _, cx| {
-                                                                        app.popup_modal = Some(
-                                                                            ActivePopupModal::ArrangeWindows,
-                                                                        );
-                                                                        cx.notify();
-                                                                    },
-                                                                ))
-                                                        },
-                                                    ))
-                                                    .children((checked_running_count > 0).then(
-                                                        || {
-                                                            Button::new("batch-sync-clip")
-                                                                .with_variant(
-                                                                    BonTheme::outline_blue(cx),
-                                                                )
-                                                                .small()
-                                                                .label("\u{1002e6}  Sync Clipboard")
-                                                                .on_click(cx.listener(
-                                                                    |app, _, _, cx| {
-                                                                        app.sync_clipboard_to_checked_running(cx);
-                                                                    },
-                                                                ))
-                                                        },
-                                                    ))
-                                                    .children((checked_running_count > 0).then(
-                                                        || {
-                                                            Button::new("batch-sync-totp")
-                                                                .with_variant(
-                                                                    BonTheme::outline_blue(cx),
-                                                                )
-                                                                .small()
-                                                                .label("\u{1003a0}  Broadcast 2FA")
-                                                                .on_click(cx.listener(
-                                                                    |app, _, _, cx| {
-                                                                        app.broadcast_totp_to_checked_running(cx);
-                                                                    },
-                                                                ))
-                                                        },
-                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .w(px(1.))
+                                                            .h(px(16.))
+                                                            .bg(BonTheme::border()),
+                                                    )
+                                                    // 3. Organization & Metadata
                                                     .child(
                                                         Button::new("batch-assign-grp-btn")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
+                                                            .with_variant(BonTheme::row_action(cx))
                                                             .small()
                                                             .label(format!(
-                                                                "{}  Assign to group",
+                                                                "{}  Group",
                                                                 SfSymbol::FOLDER_FILL
                                                             ))
                                                             .on_click(cx.listener(
@@ -723,103 +739,14 @@ impl Render for BonLoginApp {
                                                                 },
                                                             )),
                                                     )
-                                                    // (Only real batch actions shown)
-                                                    .child(
-                                                        Button::new("batch-reseed-sel")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
-                                                            .small()
-                                                            .label(format!(
-                                                                "{}  Reseed",
-                                                                SfSymbol::ARROW_CLOCKWISE
-                                                            ))
-                                                            .on_click(cx.listener(
-                                                                |app, _, window, cx| {
-                                                                    app.reseed_checked_profiles(
-                                                                        window, cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("batch-check-proxy-sel")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
-                                                            .small()
-                                                            .label(format!(
-                                                                "{}  Check proxy",
-                                                                SfSymbol::CHECKMARK_SHIELD
-                                                            ))
-                                                            .on_click(cx.listener(
-                                                                |app, _, _, cx| {
-                                                                    app.check_proxies_for_checked(
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("batch-rotate-proxy-sel")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
-                                                            .small()
-                                                            .label("\u{1002af}  Rotate IP")
-                                                            .on_click(cx.listener(
-                                                                |app, _, _, cx| {
-                                                                    app.rotate_proxies_for_checked(
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("batch-update-proxy-btn")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
-                                                            .small()
-                                                            .label(format!(
-                                                                "{}  Update proxy",
-                                                                SfSymbol::ARROW_TRIANGLE_2_CIRCLEPATH
-                                                            ))
-                                                            .on_click(cx.listener(
-                                                                |app, _, _, cx| {
-                                                                    app.popup_modal = Some(
-                                                                        ActivePopupModal::UpdateProxy,
-                                                                    );
-                                                                    cx.notify();
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(
-                                                        Button::new("batch-update-profiles-btn")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
-                                                            .small()
-                                                            .label(format!(
-                                                                "{}  Update profiles",
-                                                                SfSymbol::SLIDER_HORIZONTAL_3
-                                                            ))
-                                                            .on_click(cx.listener(
-                                                                |app, _, _, cx| {
-                                                                    app.popup_modal = Some(
-                                                                        ActivePopupModal::UpdateProfiles,
-                                                                    );
-                                                                    cx.notify();
-                                                                },
-                                                            )),
-                                                    )
                                                     .child(
                                                         Button::new("batch-tags-note-btn")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
+                                                            .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("\u{1002e2}  Tags, Bookmarks & Note")
+                                                            .label(format!(
+                                                                "{}  Tags & Note",
+                                                                SfSymbol::TAG_FILL
+                                                            ))
                                                             .on_click(cx.listener(
                                                                 |app, _, window, cx| {
                                                                     app.open_quick_meta_modal(
@@ -828,44 +755,243 @@ impl Render for BonLoginApp {
                                                                 },
                                                             )),
                                                     )
-                                                    .child(
-                                                        Button::new("batch-cookie-robot-btn")
-                                                            .with_variant(BonTheme::outline_blue(
-                                                                cx,
-                                                            ))
+                                                    // 4. Proxy Dropdown (`Check proxy`, `Rotate IP`, `Update proxy`)
+                                                    .child({
+                                                        let app_chk = app_entity.clone();
+                                                        let app_rot = app_entity.clone();
+                                                        let app_upd = app_entity.clone();
+                                                        Button::new("batch-check-proxy-sel")
+                                                            .with_variant(BonTheme::row_action(cx))
                                                             .small()
-                                                            .label("\u{1002e6}  Cookie Robot")
-                                                            .on_click(cx.listener(
-                                                                |app, _, window, cx| {
-                                                                    app.open_cookie_robot_modal(
-                                                                        None, window, cx,
-                                                                    );
+                                                            .label(format!(
+                                                                "{}  Proxy \u{25be}",
+                                                                SfSymbol::CHECKMARK_SHIELD
+                                                            ))
+                                                            .dropdown_menu_with_anchor(
+                                                                Anchor::TopLeft,
+                                                                move |menu, _window, _cx| {
+                                                                    let c1 = app_chk.clone();
+                                                                    let c2 = app_rot.clone();
+                                                                    let c3 = app_upd.clone();
+                                                                    menu.min_w(px(185.))
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Check Proxy",
+                                                                                    SfSymbol::CHECKMARK_SHIELD
+                                                                                ),
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    c1.update(cx, |app, cx| {
+                                                                                        app.check_proxies_for_checked(cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{1002af}   Rotate IP",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    c2.update(cx, |app, cx| {
+                                                                                        app.rotate_proxies_for_checked(cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .separator()
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Update Proxy…",
+                                                                                    SfSymbol::SLIDER_HORIZONTAL_3
+                                                                                ),
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    c3.update(cx, |app, cx| {
+                                                                                        app.popup_modal = Some(
+                                                                                            ActivePopupModal::UpdateProxy,
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
                                                                 },
-                                                            )),
-                                                    )
-                                                    .child(
+                                                            )
+                                                    })
+                                                    // 5. Fingerprint & Config Dropdown (`Update profiles`, `Reseed`)
+                                                    .child({
+                                                        let app_upd_prof = app_entity.clone();
+                                                        let app_reseed = app_entity.clone();
+                                                        Button::new("batch-update-profiles-btn")
+                                                            .with_variant(BonTheme::row_action(cx))
+                                                            .small()
+                                                            .label(format!(
+                                                                "{}  Fingerprint \u{25be}",
+                                                                SfSymbol::SLIDER_HORIZONTAL_3
+                                                            ))
+                                                            .dropdown_menu_with_anchor(
+                                                                Anchor::TopLeft,
+                                                                move |menu, _window, _cx| {
+                                                                    let u1 = app_upd_prof.clone();
+                                                                    let r1 = app_reseed.clone();
+                                                                    menu.min_w(px(195.))
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Update OS / Hardware…",
+                                                                                    SfSymbol::SLIDER_HORIZONTAL_3
+                                                                                ),
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    u1.update(cx, |app, cx| {
+                                                                                        app.popup_modal = Some(
+                                                                                            ActivePopupModal::UpdateProfiles,
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Reseed Fingerprint",
+                                                                                    SfSymbol::ARROW_CLOCKWISE
+                                                                                ),
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    r1.update(cx, |app, cx| {
+                                                                                        app.reseed_checked_profiles(window, cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                },
+                                                            )
+                                                    })
+                                                    // 6. Automation & Live Browser Dropdown (`Run Flow`, `Cookie Robot`, `Arrange`, `Sync Clipboard`, `Broadcast 2FA`)
+                                                    .child({
+                                                        let app_flow = app_entity.clone();
+                                                        let app_robot = app_entity.clone();
+                                                        let app_arr = app_entity.clone();
+                                                        let app_clip = app_entity.clone();
+                                                        let app_totp = app_entity.clone();
+                                                        let has_running = checked_running_count > 0;
                                                         Button::new("batch-run-flow-btn")
                                                             .with_variant(BonTheme::outline_blue(
                                                                 cx,
                                                             ))
                                                             .small()
-                                                            .label("\u{100284}  Run Flow")
-                                                            .on_click(cx.listener(
-                                                                |app, _, window, cx| {
-                                                                    app.open_agent_flows_modal(
-                                                                        None, window, cx,
-                                                                    );
+                                                            .label(format!(
+                                                                "{}  Automate \u{25be}",
+                                                                SfSymbol::BOLT_FILL
+                                                            ))
+                                                            .dropdown_menu_with_anchor(
+                                                                Anchor::TopLeft,
+                                                                move |menu, _window, _cx| {
+                                                                    let f1 = app_flow.clone();
+                                                                    let rb = app_robot.clone();
+                                                                    let ar = app_arr.clone();
+                                                                    let cl = app_clip.clone();
+                                                                    let tp = app_totp.clone();
+                                                                    menu.min_w(px(210.))
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Run Agent Flow…",
+                                                                                    SfSymbol::PLAY_FILL
+                                                                                ),
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    f1.update(cx, |app, cx| {
+                                                                                        app.open_agent_flows_modal(None, window, cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{1002e6}   Cookie Robot (Warm-up)…",
+                                                                            )
+                                                                            .on_click(
+                                                                                move |_, window, cx| {
+                                                                                    rb.update(cx, |app, cx| {
+                                                                                        app.open_cookie_robot_modal(None, window, cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .separator()
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Arrange Windows ({checked_running_count})",
+                                                                                    SfSymbol::PC
+                                                                                ),
+                                                                            )
+                                                                            .disabled(!has_running)
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    ar.update(cx, |app, cx| {
+                                                                                        app.popup_modal = Some(
+                                                                                            ActivePopupModal::ArrangeWindows,
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{100241}   Sync Clipboard to Running",
+                                                                            )
+                                                                            .disabled(!has_running)
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    cl.update(cx, |app, cx| {
+                                                                                        app.sync_clipboard_to_checked_running(cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                "\u{1003a0}   Broadcast 2FA to Running",
+                                                                            )
+                                                                            .disabled(!has_running)
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    tp.update(cx, |app, cx| {
+                                                                                        app.broadcast_totp_to_checked_running(cx);
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
                                                                 },
-                                                            )),
-                                                    )
+                                                            )
+                                                    }),
+                                            )
+                                            // Right: Overflow Copy/Export + Direct Trash Button
+                                            .child(
+                                                h_flex()
+                                                    .gap_1p5()
+                                                    .flex_shrink_0()
+                                                    .items_center()
                                                     .child({
                                                         let app_ids = app_entity.clone();
                                                         let app_names = app_entity.clone();
                                                         let app_zip = app_entity.clone();
                                                         let app_exp = app_entity.clone();
-                                                        let app_del = app_entity.clone();
                                                         Button::new("batch-more-dots")
-                                                            .ghost()
+                                                            .with_variant(BonTheme::row_action(cx))
                                                             .small()
                                                             .label(SfSymbol::ELLIPSIS)
                                                             .dropdown_menu_with_anchor(
@@ -875,7 +1001,6 @@ impl Render for BonLoginApp {
                                                                     let a2 = app_names.clone();
                                                                     let az = app_zip.clone();
                                                                     let a3 = app_exp.clone();
-                                                                    let a4 = app_del.clone();
                                                                     menu.min_w(px(190.))
                                                                         .item(
                                                                             PopupMenuItem::new(
@@ -894,7 +1019,7 @@ impl Render for BonLoginApp {
                                                                         )
                                                                         .item(
                                                                             PopupMenuItem::new(
-                                                                                "\u{100241}   Copy names",
+                                                                                "\u{100241}   Copy Names",
                                                                             )
                                                                             .on_click(
                                                                                 move |_, _, cx| {
@@ -907,6 +1032,7 @@ impl Render for BonLoginApp {
                                                                                 },
                                                                             ),
                                                                         )
+                                                                        .separator()
                                                                         .item(
                                                                             PopupMenuItem::new(
                                                                                 "\u{10023d}   Export Backup (.zip)",
@@ -937,36 +1063,35 @@ impl Render for BonLoginApp {
                                                                                 },
                                                                             ),
                                                                         )
-                                                                        .separator()
-                                                                        .item(
-                                                                            PopupMenuItem::new(
-                                                                                format!(
-                                                                                    "{}   Move to Trash ({checked_count})",
-                                                                                    SfSymbol::TRASH
-                                                                                ),
-                                                                            )
-                                                                            .on_click(
-                                                                                move |_, _, cx| {
-                                                                                    a4.update(
-                                                                                        cx,
-                                                                                        |app, cx| {
-                                                                                            app.request_delete(
-                                                                                                PendingDeleteAction::CheckedProfiles,
-                                                                                                cx,
-                                                                                            );
-                                                                                        },
-                                                                                    );
-                                                                                },
-                                                                            ),
-                                                                        )
                                                                 },
                                                             )
-                                                    }),
+                                                    })
+                                                    .child(
+                                                        Button::new("batch-trash-sel")
+                                                            .with_variant(
+                                                                BonTheme::outline_danger(cx),
+                                                            )
+                                                            .small()
+                                                            .label(format!(
+                                                                "{}  Trash",
+                                                                SfSymbol::TRASH
+                                                            ))
+                                                            .on_click(cx.listener(
+                                                                |app, _, _, cx| {
+                                                                    app.request_delete(
+                                                                        PendingDeleteAction::CheckedProfiles,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    ),
                                             )
                                             .with_animation(
                                                 "batch-action-bar-enter",
                                                 BonTheme::ui_enter_anim(),
-                                                |this, delta| this.opacity(delta),
+                                                |this, delta| {
+                                                    this.opacity(delta).mt(px((1.0 - delta) * -4.0))
+                                                },
                                             )
                                     }))
                                     // GenLogin Table + Right-Hand `Detail` Drawer
@@ -974,21 +1099,12 @@ impl Render for BonLoginApp {
                                         let filtered_indices = self.filtered_profile_indices_rc();
                                         render_profile_table(self, filtered_indices, cx)
                                     })
-                                    .with_animation(
-                                        "subtab-local-enter",
-                                        BonTheme::ui_enter_anim(),
-                                        |this, delta| this.opacity(delta),
-                                    )
                                     .into_any_element()
                             })
                             .into_any_element(),
-                        WorkspaceView::Proxies => render_proxies_view(self, cx)
-                            .with_animation(
-                                "view-proxies-enter",
-                                BonTheme::ui_enter_anim(),
-                                |this, delta| this.opacity(delta),
-                            )
-                            .into_any_element(),
+                        WorkspaceView::Proxies => {
+                            render_proxies_view(self, cx).into_any_element()
+                        }
                         WorkspaceView::EditProfile => {
                             if let Some(modal) = self.modal.as_ref() {
                                 render_edit_profile_view(
@@ -998,23 +1114,14 @@ impl Render for BonLoginApp {
                                     &self.saved_proxies,
                                     cx,
                                 )
-                                .with_animation(
-                                    "view-edit-profile-enter",
-                                    BonTheme::ui_enter_anim(),
-                                    |this, delta| this.opacity(delta),
-                                )
                                 .into_any_element()
                             } else {
                                 div().child("No profile loaded").into_any_element()
                             }
                         }
-                        WorkspaceView::Extensions => render_extensions_view(self, cx)
-                            .with_animation(
-                                "view-extensions-enter",
-                                BonTheme::ui_enter_anim(),
-                                |this, delta| this.opacity(delta),
-                            )
-                            .into_any_element(),
+                        WorkspaceView::Extensions => {
+                            render_extensions_view(self, cx).into_any_element()
+                        }
                     }),
             )
             )
@@ -1035,7 +1142,7 @@ impl Render for BonLoginApp {
                 } else {
                     (BonTheme::success(), BonTheme::success_bg(), SfSymbol::CHECKMARK_CIRCLE_FILL)
                 };
-                let banner_id = SharedString::from(format!("toast-banner-{msg}"));
+                let banner_id = SharedString::from("toast-banner-container");
                 h_flex()
                     .id(banner_id.clone())
                     .absolute()
@@ -1093,8 +1200,7 @@ impl Render for BonLoginApp {
                     )
                     .with_animation(
                         banner_id,
-                        Animation::new(Duration::from_millis(160))
-                            .with_easing(ease_out_quint()),
+                        BonTheme::ui_enter_anim(),
                         |this, delta| {
                             this.opacity(delta).bottom(px(12.0 + delta * 8.0))
                         },
@@ -1117,13 +1223,6 @@ fn genlogin_subtab_item(
         .items_center()
         .cursor_pointer()
         .rounded_md()
-        .hover(|s| {
-            if active {
-                s.bg(rgb(0x2997ff))
-            } else {
-                s.bg(BonTheme::bg_hover())
-            }
-        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app, _, _, cx| {
@@ -1164,11 +1263,18 @@ fn genlogin_subtab_item(
         .with_spring(
             SharedString::from(format!("subtab-spring-{label}")),
             SpringAnimation::new(BonTheme::snappy_spring()).to(active),
-            |this, phase| {
+            move |this, phase| {
                 this.bg(phase.interpolate_clamped(
                     rgba(0x00000000).into(),
                     BonTheme::accent(),
                 ))
+                .hover(move |s| {
+                    if active {
+                        s.bg(rgb(0x2997ff))
+                    } else {
+                        s.bg(BonTheme::bg_hover())
+                    }
+                })
             },
         )
 }
@@ -1185,13 +1291,6 @@ fn sidebar_nav_item(
         .py_1p5()
         .rounded_lg()
         .cursor_pointer()
-        .hover(|s| {
-            if active {
-                s.bg(rgb(0x2997ff))
-            } else {
-                s.bg(BonTheme::bg_hover())
-            }
-        })
         .items_center()
         .on_mouse_down(
             MouseButton::Left,
@@ -1215,11 +1314,18 @@ fn sidebar_nav_item(
         .with_spring(
             SharedString::from(format!("nav-spring-{label}")),
             SpringAnimation::new(BonTheme::snappy_spring()).to(active),
-            |this, phase| {
+            move |this, phase| {
                 this.bg(phase.interpolate_clamped(
                     Hsla::from(rgba(0x00000000)),
                     BonTheme::accent(),
                 ))
+                .hover(move |s| {
+                    if active {
+                        s.bg(rgb(0x2997ff))
+                    } else {
+                        s.bg(BonTheme::bg_hover())
+                    }
+                })
             },
         )
 }

@@ -37,6 +37,56 @@ use crate::ui::workspace_views::{
 };
 use crate::ui::theme::{BonTheme, SfSymbol};
 
+
+gpui_kit::actions!(
+    bonlogin,
+    [
+        QuitApp,
+        CloseWindowOrModal,
+        MinimizeWindow,
+        ZoomWindow,
+        NewProfileAction,
+        QuickAddAction,
+        FocusSearchAction,
+        RefreshWorkspaceAction,
+        ArrangeWindowsAction,
+        OpenFlowsAction,
+        ToggleDetailDrawerAction,
+        SwitchToProfilesAction,
+        SwitchToProxiesAction,
+        SwitchToExtensionsAction,
+        StopAllProfilesAction,
+        LaunchOrStopSelectedAction,
+        CopyAgentCliSelectedAction,
+        DeleteSelectedAction,
+    ]
+);
+
+pub fn window_bounds_to_saved(wb: WindowBounds) -> crate::db::SavedWindowBounds {
+    let (b, maximized) = match wb {
+        WindowBounds::Windowed(b) => (b, false),
+        WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => (b, true),
+    };
+    crate::db::SavedWindowBounds {
+        x: f32::from(b.origin.x),
+        y: f32::from(b.origin.y),
+        width: f32::from(b.size.width),
+        height: f32::from(b.size.height),
+        maximized,
+    }
+}
+
+pub fn saved_to_window_bounds(saved: crate::db::SavedWindowBounds) -> WindowBounds {
+    let b = Bounds::new(
+        point(px(saved.x), px(saved.y)),
+        size(px(saved.width), px(saved.height)),
+    );
+    if saved.maximized {
+        WindowBounds::Maximized(b)
+    } else {
+        WindowBounds::Windowed(b)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceView {
     Profiles,
@@ -125,6 +175,8 @@ pub enum PendingDeleteAction {
     Tag(String),
     Extension(String),
     WipeProfile(String),
+    CleanProfileCache(String),
+    CleanCheckedCache,
 }
 pub struct BonLoginApp {
     pub db: Arc<Mutex<Database>>,
@@ -220,6 +272,8 @@ pub struct BonLoginApp {
     proxy_indices_cache: std::cell::RefCell<Option<(u64, String, std::rc::Rc<[usize]>)>>,
     pub banner_message: Option<String>,
     banner_timer_for: Option<String>,
+    pub recently_copied_key: Option<String>,
+    pub reseed_flash_seed: Option<u32>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -255,7 +309,7 @@ impl BonLoginApp {
         let kernel_info = locate_chromium_kernel();
 
         let search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("\u{1002ab}  Search..."));
+            cx.new(|cx| InputState::new(window, cx).placeholder("\u{1002ab}  Search... (⌘F)"));
 
         let batch_prefix_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -359,6 +413,20 @@ impl BonLoginApp {
                     cx.notify();
                 }
             }
+        });
+        let mut last_saved_bounds: Option<crate::db::SavedWindowBounds> = None;
+        let bounds_sub = cx.observe_window_bounds(window, move |this, window, _cx| {
+            let Some(cur) = window_bounds_to_saved(window.window_bounds()).validated() else {
+                return;
+            };
+            if last_saved_bounds == Some(cur) {
+                return;
+            }
+            last_saved_bounds = Some(cur);
+            let root = this.workspace_root.clone();
+            this.tokio_handle.spawn_blocking(move || {
+                let _ = crate::db::save_window_bounds_in(&root, cur);
+            });
         });
 
         let monitor_sup = supervisor.clone();
@@ -529,7 +597,9 @@ impl BonLoginApp {
             proxy_indices_cache: std::cell::RefCell::new(None),
             banner_message: None,
             banner_timer_for: None,
-            _subscriptions: vec![search_sub, free_search_sub],
+            recently_copied_key: None,
+            reseed_flash_seed: None,
+            _subscriptions: vec![search_sub, free_search_sub, bounds_sub],
         }
     }
 

@@ -5,7 +5,6 @@ use gpui_kit::component::{
     *,
 };
 use gpui_kit::*;
-use std::time::Duration;
 use crate::models::{BrowserBrand, PlatformType, ProxyProtocol};
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::{
@@ -380,13 +379,7 @@ pub fn render_proxies_view(
             .gap_3()
             .overflow_hidden()
             .child(subtab_bar)
-            .child(
-                render_free_proxies_subtab_view(app, cx).with_animation(
-                    "subtab-free-proxies-enter",
-                    BonTheme::ui_enter_anim(),
-                    |this, delta| this.opacity(delta),
-                ),
-            );
+            .child(render_free_proxies_subtab_view(app, cx));
     }
     let _ = total_proxies;
     let proxy_groups = app.distinct_proxy_groups_with_counts();
@@ -621,7 +614,7 @@ pub fn render_proxies_view(
                 .with_animation(
                     "pmgr-batch-bar-enter",
                     BonTheme::ui_enter_anim(),
-                    |this, delta| this.opacity(delta),
+                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * -4.0)),
                 )
         }))
         // 3. GenLogin Proxy Management Table (`[☐] | # | Name | Tag | Protocol support | Location / IP | Status | Profiles | Actions`)
@@ -968,13 +961,7 @@ pub fn render_proxies_view(
                                                                 SharedString::from(format!(
                                                                     "proxy-chk-pulse-{pid}"
                                                                 )),
-                                                                Animation::new(
-                                                                    Duration::from_millis(1100),
-                                                                )
-                                                                .repeat()
-                                                                .with_easing(pulsating_between(
-                                                                    0.4, 1.0,
-                                                                )),
+                                                                BonTheme::status_pulse_anim(),
                                                                 |this, alpha| this.opacity(alpha),
                                                             )
                                                             .into_any_element()
@@ -1193,13 +1180,6 @@ fn proxy_subtab_item(
         .items_center()
         .cursor_pointer()
         .rounded_md()
-        .hover(|s| {
-            if active {
-                s.bg(rgb(0x2997ff))
-            } else {
-                s.bg(BonTheme::bg_hover())
-            }
-        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |app, _, _, cx| {
@@ -1239,11 +1219,18 @@ fn proxy_subtab_item(
         .with_spring(
             SharedString::from(format!("proxy-subtab-spring-{label}")),
             SpringAnimation::new(BonTheme::snappy_spring()).to(active),
-            |this, phase| {
+            move |this, phase| {
                 this.bg(phase.interpolate_clamped(
                     rgba(0x00000000).into(),
                     BonTheme::accent(),
                 ))
+                .hover(move |s| {
+                    if active {
+                        s.bg(rgb(0x2997ff))
+                    } else {
+                        s.bg(BonTheme::bg_hover())
+                    }
+                })
             },
         )
 }
@@ -1534,7 +1521,7 @@ fn render_free_proxies_subtab_view(
                 .with_animation(
                     "fp-batch-bar-enter",
                     BonTheme::ui_enter_anim(),
-                    |this, delta| this.opacity(delta),
+                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * -4.0)),
                 )
         }))
         // 3. Free Proxies Table (`[☐] | # | Proxy (IP:Port) | Protocol | Country / ISP | Source | Status | Actions`)
@@ -1671,6 +1658,8 @@ fn render_free_proxies_subtab_view(
                                 let row_num = page_start + row_ix + 1;
                                 let key = fp.endpoint_key();
                                 let key_chk = key.clone();
+                                let key_chk_id = key.clone();
+                                let key_pulse_id = key.clone();
                                 let key_check_btn = key.clone();
                                 let key_save_btn = key.clone();
                                 let key_menu_save = key.clone();
@@ -1782,7 +1771,7 @@ fn render_free_proxies_subtab_view(
                                             }
                                         })
                                         .child(BonTheme::checkbox(
-                                            format!("fp-row-chk-{row_num}"),
+                                            format!("fp-row-chk-spring-{key_chk_id}"),
                                             is_checked,
                                             if is_checked { SfSymbol::CHECKMARK } else { "" },
                                             BonTheme::bg_elevated(),
@@ -1910,15 +1899,9 @@ fn render_free_proxies_subtab_view(
                                                         badge
                                                             .with_animation(
                                                                 SharedString::from(format!(
-                                                                    "fp-chk-pulse-{row_num}"
+                                                                    "fp-chk-pulse-{key_pulse_id}"
                                                                 )),
-                                                                Animation::new(
-                                                                    Duration::from_millis(1100),
-                                                                )
-                                                                .repeat()
-                                                                .with_easing(pulsating_between(
-                                                                    0.4, 1.0,
-                                                                )),
+                                                                BonTheme::status_pulse_anim(),
                                                                 |this, alpha| this.opacity(alpha),
                                                             )
                                                             .into_any_element()

@@ -58,6 +58,8 @@ pub fn render_profile_table(
     let show_detail_drawer = app.show_detail_drawer;
     let selected_profile_id = app.selected_profile_id.as_deref();
     let selected_disk_usage = app.selected_disk_usage.as_str();
+    let recently_copied_key = app.recently_copied_key.clone();
+    let reseed_flash_seed = app.reseed_flash_seed;
     let all_checked = !filtered_indices.is_empty()
         && filtered_indices
             .iter()
@@ -81,7 +83,7 @@ pub fn render_profile_table(
     h_flex()
         .w_full()
         .flex_1()
-        .gap_4()
+        .gap_0()
         .overflow_hidden()
         // Left: GenLogin 3.0 Profiles Table + Pagination Footer
         .child(
@@ -248,6 +250,7 @@ pub fn render_profile_table(
                         indices_for_list.len(),
                         cx.processor(move |app, range: std::ops::Range<usize>, _window, cx| {
                             let selected_id = app.selected_profile_id.as_deref();
+                            let copied_key = app.recently_copied_key.as_deref();
                             let cols = app.col_vis;
                             let mut items = Vec::with_capacity(range.len());
                             for row_ix in range {
@@ -266,12 +269,20 @@ pub fn render_profile_table(
                                 let is_checked = app.checked_profile_ids.contains(&profile.id);
                                 let is_checking_proxy =
                                     app.profile_aux_tasks.contains_key(&profile.id);
+                                let copied_id = copied_key
+                                    .and_then(|k| k.strip_prefix("id:"))
+                                    == Some(profile.id.as_str());
+                                let copied_totp = copied_key
+                                    .and_then(|k| k.strip_prefix("totp:"))
+                                    == Some(profile.id.as_str());
                                 items.push(render_profile_row(
                                     profile,
                                     status,
                                     is_selected,
                                     is_checked,
                                     is_checking_proxy,
+                                    copied_id,
+                                    copied_totp,
                                     cols,
                                     cx,
                                 ));
@@ -300,7 +311,7 @@ pub fn render_profile_table(
         )
         // Right: GenLogin Collapsible `Detail` Drawer (`docs/genlogin-3.0/assets/menu-bar_profile_cloud-vs-local_01.png`)
         .children(
-            selected_profile.filter(|_| show_detail_drawer).map(|prof| {
+            selected_profile.map(|prof| {
                 let pid_refresh = prof.id.clone();
                 let pid_edit = prof.id.clone();
                 let proxy_str = match &prof.proxy {
@@ -312,19 +323,28 @@ pub fn render_profile_table(
                     .clone()
                     .or_else(|| prof.resolved_geo.as_ref().map(|g| g.timezone.clone()))
                     .unwrap_or_else(|| "Auto (Based on IP)".to_string());
-                let content_anim_id = SharedString::from(format!("detail-seed-{}", prof.seed));
-                v_flex()
-                    .w(px(285.))
+                let flash_seed = reseed_flash_seed.filter(|&s| s == prof.seed);
+                let drawer_copied_totp = recently_copied_key
+                    .as_deref()
+                    .and_then(|k| k.strip_prefix("totp:"))
+                    == Some(prof.id.as_str());
+                div()
                     .h_full()
                     .flex_shrink_0()
-                    .p_4()
-                    .gap_2()
-                    .rounded_xl()
-                    .bg(BonTheme::bg_panel())
-                    .border_1()
-                    .border_color(BonTheme::border())
                     .overflow_hidden()
                     .child(
+                        v_flex()
+                            .w(px(285.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .p_4()
+                            .gap_2()
+                            .rounded_xl()
+                            .bg(BonTheme::bg_panel())
+                            .border_1()
+                            .border_color(BonTheme::border())
+                            .overflow_hidden()
+                            .child(
                         h_flex()
                             .w_full()
                             .pb_2p5()
@@ -470,13 +490,27 @@ pub fn render_profile_table(
                                     )
                                     .child(
                                         Button::new("drawer-copy-totp")
-                                            .with_variant(BonTheme::outline_blue(cx))
+                                            .with_variant(if drawer_copied_totp {
+                                                BonTheme::success_cta(cx)
+                                            } else {
+                                                BonTheme::outline_blue(cx)
+                                            })
                                             .xsmall()
-                                            .label(format!(
-                                                "{} {} {} ({rem}s)", SfSymbol::LOCK_FILL,
-                                                &code[..3],
-                                                &code[3..]
-                                            ))
+                                            .label(if drawer_copied_totp {
+                                                format!(
+                                                    "{} Copied {} {}",
+                                                    SfSymbol::CHECKMARK,
+                                                    &code[..3],
+                                                    &code[3..]
+                                                )
+                                            } else {
+                                                format!(
+                                                    "{} {} {} ({rem}s)",
+                                                    SfSymbol::LOCK_FILL,
+                                                    &code[..3],
+                                                    &code[3..]
+                                                )
+                                            })
                                             .on_click(cx.listener(move |app, _, _, cx| {
                                                 app.copy_profile_totp(&pid_totp, cx);
                                             })),
@@ -492,17 +526,19 @@ pub fn render_profile_table(
                                 },
                             ))
                             .child(drawer_row("Browser", prof.brand.as_cli_str().to_string()))
-                            .child(drawer_row(
+                            .child(reseed_drawer_row(
                                 "Browser version",
                                 prof.brand.version_for_seed(prof.seed).to_string(),
+                                flash_seed,
                             ))
-                            .child(drawer_row(
+                            .child(reseed_drawer_row(
                                 "OS",
                                 format!(
                                     "{} ({})",
                                     prof.os_platform.label(),
                                     prof.os_platform.os_version_for_seed(prof.seed)
                                 ),
+                                flash_seed,
                             ))
                             .child(drawer_row("Proxy", proxy_str))
                             .child(drawer_row("Timezone", tz_str))
@@ -518,24 +554,26 @@ pub fn render_profile_table(
                                 "Screen Resolution",
                                 prof.window_size.replace(',', "×"),
                             ))
-                            .child(drawer_row(
+                            .child(reseed_drawer_row(
                                 "CPU / RAM",
                                 format!(
                                     "{} Cores / {} GB",
                                     prof.hardware_concurrency,
                                     Profile::device_memory_for_seed(prof.seed)
                                 ),
+                                flash_seed,
                             ))
                             .child(drawer_row(
                                 "Canvas",
                                 if prof.spoof_canvas { "Noise" } else { "Off" }.to_string(),
                             ))
-                            .child(drawer_row(
+                            .child(reseed_drawer_row(
                                 "WebGL",
                                 prof.os_platform
                                     .webgl_for_seed(prof.seed, prof.gpu_spoofing)
                                     .1
                                     .to_string(),
+                                flash_seed,
                             ))
                             .child(drawer_row("Disk Usage", selected_disk_usage.to_string()))
                             .child({
@@ -593,7 +631,12 @@ pub fn render_profile_table(
                                             .disabled(is_prof_running)
                                             .label("\u{1002af} Clean Cache")
                                             .on_click(cx.listener(move |app, _, _, cx| {
-                                                app.clean_single_profile_cache(&pid_clean, cx);
+                                                app.request_delete(
+                                                    PendingDeleteAction::CleanProfileCache(
+                                                        pid_clean.clone(),
+                                                    ),
+                                                    cx,
+                                                );
                                             })),
                                     )
                                     .child(
@@ -660,19 +703,42 @@ pub fn render_profile_table(
                                             })),
                                     )
                             })
-                            .with_animation(
-                                content_anim_id,
-                                BonTheme::ui_enter_anim(),
-                                |this, delta| this.opacity(delta),
-                            )
-                    })
-                    .with_animation(
-                        "detail-drawer-panel",
-                        BonTheme::ui_enter_anim(),
-                        |this, delta| this.opacity(delta),
+                    }),
+                    )
+                    .with_spring(
+                        "detail-drawer-spring",
+                        SpringAnimation::new(BonTheme::snappy_spring()).to(show_detail_drawer),
+                        |this, phase| {
+                            this.w(phase.interpolate_clamped(px(0.), px(285.)))
+                                .ml(phase.interpolate_clamped(px(0.), px(16.)))
+                                .opacity(phase.0.clamp(0.0, 1.0))
+                        },
                     )
             }),
         )
+}
+
+fn reseed_drawer_row(
+    label: &'static str,
+    value: String,
+    flash_seed: Option<u32>,
+) -> AnyElement {
+    let row = drawer_row(label, value);
+    if let Some(seed) = flash_seed {
+        row.with_animation(
+            SharedString::from(format!("reseed-row-{label}-{seed}")),
+            Animation::new(Duration::from_millis(280)).with_easing(ease_out_quint()),
+            |this, delta| {
+                this.bg(AnimationPhase(delta).interpolate_clamped(
+                    BonTheme::accent_subtle(),
+                    Hsla::from(rgba(0x00000000)),
+                ))
+            },
+        )
+        .into_any_element()
+    } else {
+        row.into_any_element()
+    }
 }
 
 fn sortable_col_header(
@@ -804,6 +870,7 @@ fn build_profile_popup_menu(
         );
     }
     menu = menu
+        .separator()
         .item(
             PopupMenuItem::new("\u{1002ab}   Focus Browser Window")
                 .disabled(!is_running)
@@ -840,8 +907,9 @@ fn build_profile_popup_menu(
                     });
                 }),
         );
-    menu.item(
-        PopupMenuItem::new("\u{1002e6}   Cookie Robot (Warm-up)").on_click(move |_, window, cx| {
+    menu.separator()
+        .item(
+            PopupMenuItem::new("\u{1002e6}   Cookie Robot (Warm-up)").on_click(move |_, window, cx| {
             let pid = pid_robot.clone();
             app_robot.update(cx, |app, cx| {
                 app.open_cookie_robot_modal(Some(pid), window, cx);
@@ -872,6 +940,7 @@ fn build_profile_popup_menu(
             });
         }),
     )
+    .separator()
     .item(
         PopupMenuItem::new("\u{10023b}   Import cookies").on_click(
             move |_, window, cx| {
@@ -899,25 +968,7 @@ fn build_profile_popup_menu(
                 });
             }),
     )
-    .item(
-        PopupMenuItem::new("\u{1002af}   Clean Disk Cache")
-            .disabled(is_busy)
-            .on_click(move |_, _, cx| {
-                app_clean.update(cx, |app, cx| {
-                    app.clean_single_profile_cache(&pid_clean, cx);
-                });
-            }),
-    )
-    .item(
-        PopupMenuItem::new("\u{100211}   Wipe Browser Data")
-            .disabled(is_busy)
-            .on_click(move |_, _, cx| {
-                let pid = pid_wipe.clone();
-                app_wipe.update(cx, |app, cx| {
-                    app.request_delete(PendingDeleteAction::WipeProfile(pid), cx);
-                });
-            }),
-    )
+    .separator()
     .item(
         PopupMenuItem::new("\u{100add}   Clone (1-click)")
             .on_click(move |_, window, cx| {
@@ -953,6 +1004,27 @@ fn build_profile_popup_menu(
     )
     .separator()
     .item(
+        PopupMenuItem::new("\u{1002af}   Clean Disk Cache")
+            .disabled(is_busy)
+            .on_click(move |_, _, cx| {
+                let pid = pid_clean.clone();
+                app_clean.update(cx, |app, cx| {
+                    app.request_delete(PendingDeleteAction::CleanProfileCache(pid), cx);
+                });
+            }),
+    )
+    .item(
+        PopupMenuItem::new("\u{100211}   Wipe Browser Data")
+            .disabled(is_busy)
+            .on_click(move |_, _, cx| {
+                let pid = pid_wipe.clone();
+                app_wipe.update(cx, |app, cx| {
+                    app.request_delete(PendingDeleteAction::WipeProfile(pid), cx);
+                });
+            }),
+    )
+    .separator()
+    .item(
         PopupMenuItem::new(format!("{}   Move to Trash", SfSymbol::TRASH))
             .disabled(is_busy)
             .on_click(move |_, _, cx| {
@@ -970,6 +1042,8 @@ fn render_profile_row(
     is_selected: bool,
     is_checked: bool,
     is_checking_proxy: bool,
+    copied_id: bool,
+    copied_totp: bool,
     cols: ColumnVisibility,
     cx: &mut Context<BonLoginApp>,
 ) -> AnyElement {
@@ -1089,7 +1163,11 @@ fn render_profile_row(
                         .truncate()
                         .text_xs()
                         .cursor_pointer()
-                        .text_color(BonTheme::text_primary())
+                        .text_color(if copied_id {
+                            BonTheme::success()
+                        } else {
+                            BonTheme::text_primary()
+                        })
                         .hover(|s| s.text_color(BonTheme::accent()))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1098,7 +1176,11 @@ fn render_profile_row(
                                 app.copy_profile_id(&pid_id_col, cx);
                             }),
                         )
-                        .child(numeric_id)
+                        .child(if copied_id {
+                            format!("{} {numeric_id}", SfSymbol::CHECKMARK)
+                        } else {
+                            numeric_id
+                        })
                 }))
                 // Col 2: Name (`🔵 wheel-die`)
                 .children(cols.show_name.then(|| {
@@ -1209,12 +1291,24 @@ fn render_profile_row(
                                 .px_1()
                                 .py(px(1.))
                                 .rounded_sm()
-                                .bg(rgba(0xa855f726))
+                                .bg(if copied_totp {
+                                    BonTheme::success_bg()
+                                } else {
+                                    rgba(0xa855f726).into()
+                                })
                                 .border_1()
-                                .border_color(rgb(0xc084fc))
+                                .border_color(if copied_totp {
+                                    BonTheme::success()
+                                } else {
+                                    rgb(0xc084fc).into()
+                                })
                                 .text_size(px(10.5))
                                 .font_semibold()
-                                .text_color(rgb(0xc084fc))
+                                .text_color(if copied_totp {
+                                    BonTheme::success()
+                                } else {
+                                    rgb(0xc084fc).into()
+                                })
                                 .hover(|s| s.bg(rgba(0xa855f744)))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1223,7 +1317,9 @@ fn render_profile_row(
                                         app.copy_profile_totp(&pid_totp, cx);
                                     }),
                                 )
-                                .child(if has_note {
+                                .child(if copied_totp {
+                                    format!("{} {code}", SfSymbol::CHECKMARK)
+                                } else if has_note {
                                     "2FA".to_string()
                                 } else {
                                     format!("{} {code}", SfSymbol::LOCK_FILL)
@@ -1332,9 +1428,7 @@ fn render_profile_row(
                             badge
                                 .with_animation(
                                     SharedString::from(format!("prof-status-pulse-{profile_id}")),
-                                    Animation::new(Duration::from_millis(1400))
-                                        .repeat()
-                                        .with_easing(pulsating_between(0.48, 1.0)),
+                                    BonTheme::status_pulse_anim(),
                                     |this, alpha| this.opacity(alpha),
                                 )
                                 .into_any_element()

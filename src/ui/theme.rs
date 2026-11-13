@@ -46,6 +46,14 @@ impl BonTheme {
         Animation::new(Duration::from_millis(140)).with_easing(ease_out_quint())
     }
 
+    /// Phase-locked 30fps breathing pulse (`1200ms`, alpha `0.45..1.0`) for Starting/Checking badges
+    pub fn status_pulse_anim() -> Animation {
+        Animation::new(Duration::from_millis(1200))
+            .repeat_synced()
+            .with_max_fps(30.0)
+            .with_easing(pulsating_between(0.45, 1.0))
+    }
+
     /// macOS Recessed Segmented Control Track / Code Well (`#151517`)
     pub fn bg_well() -> Hsla {
         rgb(0x151517).into()
@@ -231,7 +239,6 @@ impl BonTheme {
             } else {
                 Self::border_control()
             })
-            .hover(|s| s.border_color(Self::accent()))
             .text_xs()
             .font_bold()
             .text_color(rgb(0xffffff))
@@ -245,6 +252,7 @@ impl BonTheme {
                         .border_color(
                             phase.interpolate_clamped(Self::border_control(), Self::accent()),
                         )
+                        .hover(|s| s.border_color(Self::accent()))
                 },
             )
     }
@@ -294,4 +302,32 @@ impl SfSymbol {
     pub const SIDEBAR_RIGHT: &'static str = "\u{1003db}";
     pub const LOCK_FILL: &'static str = "\u{1003a0}";
     pub const BOOKMARK_FILL: &'static str = "\u{10025f}";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BonTheme, Duration};
+
+    #[test]
+    fn test_motion_tokens_invariants() {
+        let spring = BonTheme::snappy_spring();
+        let (omega, zeta) = spring.canonical();
+        assert!(omega > 15.0 && omega < 30.0);
+        assert!(zeta > 0.9 && zeta <= 1.0, "snappy_spring must be near-critically damped");
+
+        let enter = BonTheme::ui_enter_anim();
+        assert_eq!(enter.duration, Duration::from_millis(140));
+        assert!(enter.oneshot);
+        assert!(((enter.easing)(0.0) - 0.0).abs() < 1e-5);
+        assert!(((enter.easing)(1.0) - 1.0).abs() < 1e-5);
+        assert!((enter.easing)(0.25) > 0.70, "ease_out_quint starts fast");
+
+        let pulse = BonTheme::status_pulse_anim();
+        assert_eq!(pulse.duration, Duration::from_millis(1200));
+        assert!(!pulse.oneshot);
+        assert!(pulse.synced, "status_pulse_anim must be phase-locked via repeat_synced()");
+        assert_eq!(pulse.max_fps, Some(30.0));
+        let alpha_mid = (pulse.easing)(0.25);
+        assert!((0.45..=1.0).contains(&alpha_mid));
+    }
 }

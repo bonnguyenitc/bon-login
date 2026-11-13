@@ -100,6 +100,68 @@ pub fn read_saved_cookies_in(root_dir: &Path, short_id: &str) -> Option<String> 
         .filter(|s| !s.trim().is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedWindowBounds {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl SavedWindowBounds {
+    pub fn validated(self) -> Option<Self> {
+        if !self.x.is_finite()
+            || !self.y.is_finite()
+            || !self.width.is_finite()
+            || !self.height.is_finite()
+            || self.width < 400.0
+            || self.height < 300.0
+            || !(-4000.0..=8000.0).contains(&self.x)
+            || !(-2000.0..=6000.0).contains(&self.y)
+        {
+            return None;
+        }
+        Some(Self {
+            x: self.x,
+            y: self.y,
+            width: self.width.clamp(980.0, 6000.0),
+            height: self.height.clamp(620.0, 4000.0),
+            maximized: self.maximized,
+        })
+    }
+}
+
+pub fn load_window_bounds_in(root_dir: &Path) -> Option<SavedWindowBounds> {
+    let raw = std::fs::read_to_string(root_dir.join("window_bounds.json")).ok()?;
+    serde_json::from_str::<SavedWindowBounds>(&raw)
+        .ok()
+        .and_then(SavedWindowBounds::validated)
+}
+
+pub fn save_window_bounds_in(root_dir: &Path, bounds: SavedWindowBounds) -> anyhow::Result<()> {
+    let Some(valid) = bounds.validated() else {
+        return Ok(());
+    };
+    let _ = std::fs::create_dir_all(root_dir);
+    let target = root_dir.join("window_bounds.json");
+    let tmp = root_dir.join(format!(
+        ".window_bounds.{}.{}.tmp",
+        std::process::id(),
+        unix_now()
+    ));
+    let json = serde_json::to_vec(&valid)?;
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&json)?;
+        let _ = file.sync_all();
+    }
+    std::fs::rename(&tmp, &target)?;
+    Ok(())
+}
+
 fn apply_fast_pragmas(conn: &Connection) {
     let _ = conn.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -1944,5 +2006,53 @@ mod tests {
         crate::flows::save_flow_to_path(&fl_path, &mut fl).unwrap();
         assert!(db.delete_flow("temp_flow").unwrap());
         assert!(!db.delete_flow("temp_flow").unwrap());
+    }
+
+    #[test]
+    fn test_window_bounds_atomic_persistence_and_validation() {
+        let db = Workspace::open_in_memory().unwrap();
+        let root = db.root_dir();
+        assert_eq!(load_window_bounds_in(root), None);
+
+        let saved = SavedWindowBounds {
+            x: 120.0,
+            y: 80.0,
+            width: 1480.0,
+            height: 880.0,
+            maximized: false,
+        };
+        save_window_bounds_in(root, saved).unwrap();
+        assert_eq!(load_window_bounds_in(root), Some(saved));
+
+        // Undersized dimensions clamp up to the minimum desktop layout size
+        let small = SavedWindowBounds {
+            x: 40.0,
+            y: 40.0,
+            width: 600.0,
+            height: 450.0,
+            maximized: true,
+        };
+        save_window_bounds_in(root, small).unwrap();
+        assert_eq!(
+            load_window_bounds_in(root),
+            Some(SavedWindowBounds {
+                x: 40.0,
+                y: 40.0,
+                width: 980.0,
+                height: 620.0,
+                maximized: true,
+            })
+        );
+
+        // Off-screen / NaN values are rejected without overwriting valid saved bounds
+        let invalid = SavedWindowBounds {
+            x: f32::NAN,
+            y: 0.0,
+            width: 1200.0,
+            height: 800.0,
+            maximized: false,
+        };
+        save_window_bounds_in(root, invalid).unwrap();
+        assert_eq!(load_window_bounds_in(root).unwrap().width, 980.0);
     }
 }

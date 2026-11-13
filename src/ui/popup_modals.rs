@@ -1314,6 +1314,40 @@ pub fn render_popup_modal(
                         "Yes, wipe data",
                     )
                 }
+                PendingDeleteAction::CleanProfileCache(id) => {
+                    let name = app
+                        .profiles
+                        .iter()
+                        .find(|p| &p.id == id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "this profile".to_string());
+                    (
+                        "Clean profile cache?",
+                        format!(
+                            "Clean disk & shader cache for '{name}'? Cookies & login sessions are kept."
+                        ),
+                        "Yes, clean cache",
+                    )
+                }
+                PendingDeleteAction::CleanCheckedCache => {
+                    let stopped_count = app
+                        .checked_profile_ids
+                        .iter()
+                        .filter(|id| {
+                            !matches!(
+                                app.statuses.get(*id),
+                                Some(super::ProfileStatus::Running(_) | super::ProfileStatus::Starting)
+                            )
+                        })
+                        .count();
+                    (
+                        "Clean cache for selected profiles?",
+                        format!(
+                            "Clean disk & shader cache for {stopped_count} selected profile(s)? Cookies & sessions are kept."
+                        ),
+                        "Yes, clean cache",
+                    )
+                }
             };
             v_flex()
                 .w(px(420.))
@@ -2680,7 +2714,6 @@ pub fn render_popup_modal(
         .top_0()
         .left_0()
         .size_full()
-        .bg(rgba(0x00000080))
         .flex()
         .items_center()
         .justify_center()
@@ -2697,13 +2730,18 @@ pub fn render_popup_modal(
             .with_animation(
                 modal_anim_id,
                 BonTheme::ui_enter_anim(),
-                |this, delta| this.opacity(delta),
+                |this, delta| this.opacity(delta).mt(px((1.0 - delta) * 10.0)),
             ),
         )
         .with_animation(
             backdrop_anim_id,
             BonTheme::ui_enter_anim(),
-            |this, delta| this.opacity(delta),
+            |this, delta| {
+                this.bg(AnimationPhase(delta).interpolate_clamped(
+                    Hsla::from(rgba(0x00000000)),
+                    Hsla::from(rgba(0x00000080)),
+                ))
+            },
         )
         .into_any_element()
 }
