@@ -325,61 +325,46 @@ pub fn render_proxies_view(
     let free_total = app.free_proxies.len();
     let free_live = app.live_free_proxies_count();
 
-    let subtab_bar = h_flex()
-        .w_full()
-        .flex_shrink_0()
-        .justify_between()
+    let subtab_left = h_flex()
+        .gap_2p5()
         .items_center()
-        .gap_3()
         .child(
             h_flex()
-                .gap_3()
-                .items_center()
-                .child(
-                    h_flex()
-                        .p(px(3.))
-                        .gap(px(2.))
-                        .rounded_lg()
-                        .bg(BonTheme::bg_well())
-                        .border_1()
-                        .border_color(BonTheme::border())
-                        .child(proxy_subtab_item(
-                            "My Proxies",
-                            total_proxies,
-                            proxy_sub_tab == ProxySubTab::MyProxies,
-                            ProxySubTab::MyProxies,
-                            cx,
-                        ))
-                        .child(proxy_subtab_item(
-                            "Free Proxies",
-                            free_total,
-                            proxy_sub_tab == ProxySubTab::FreeProxies,
-                            ProxySubTab::FreeProxies,
-                            cx,
-                        )),
-                )
-                .children((free_live > 0).then(|| {
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .bg(BonTheme::success_bg())
-                        .text_xs()
-                        .font_semibold()
-                        .text_color(BonTheme::success())
-                        .child(format!("● {free_live} Live Free Ready"))
-                })),
-        );
+                .p(px(3.))
+                .gap(px(2.))
+                .rounded_lg()
+                .bg(BonTheme::bg_well())
+                .border_1()
+                .border_color(BonTheme::border())
+                .child(proxy_subtab_item(
+                    "My Proxies",
+                    total_proxies,
+                    proxy_sub_tab == ProxySubTab::MyProxies,
+                    ProxySubTab::MyProxies,
+                    cx,
+                ))
+                .child(proxy_subtab_item(
+                    "Free Proxies",
+                    free_total,
+                    proxy_sub_tab == ProxySubTab::FreeProxies,
+                    ProxySubTab::FreeProxies,
+                    cx,
+                )),
+        )
+        .children((free_live > 0).then(|| {
+            div()
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .bg(BonTheme::success_bg())
+                .text_xs()
+                .font_semibold()
+                .text_color(BonTheme::success())
+                .child(format!("● {free_live} Live Free Ready"))
+        }));
 
     if proxy_sub_tab == ProxySubTab::FreeProxies {
-        return v_flex()
-            .w_full()
-            .flex_1()
-            .min_h_0()
-            .gap_3()
-            .overflow_hidden()
-            .child(subtab_bar)
-            .child(render_free_proxies_subtab_view(app, cx));
+        return render_free_proxies_subtab_view(app, subtab_left, cx);
     }
     let _ = total_proxies;
     let proxy_groups = app.distinct_proxy_groups_with_counts();
@@ -417,11 +402,11 @@ pub fn render_proxies_view(
         .min_h_0()
         .gap_3()
         .overflow_hidden()
-        .child(subtab_bar)
-        // 1. Top Toolbar: `[+ Add proxy]` + `[All Tag ▾]` + `[↻]` ... `[Check proxy]`
+        // 1. Unified Subtab & Proxy Toolbar: `[My Proxies | Free Proxies]` + `[+ Add proxy]` + `[All Tag ▾]` ... `[Check proxy]`
         .child(
             h_flex()
                 .w_full()
+                .flex_shrink_0()
                 .justify_between()
                 .items_center()
                 .gap_2()
@@ -429,6 +414,8 @@ pub fn render_proxies_view(
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .child(subtab_left)
+                        .child(div().w(px(1.)).h(px(18.)).bg(BonTheme::border()))
                         .child(
                             Button::new("pmgr-open-add-modal")
                                 .with_variant(BonTheme::primary_cta(cx))
@@ -1239,6 +1226,7 @@ fn proxy_subtab_item(
 
 fn render_free_proxies_subtab_view(
     app: &BonLoginApp,
+    subtab_left: Div,
     cx: &mut Context<BonLoginApp>,
 ) -> Div {
     let total_free = app.free_proxies.len();
@@ -1299,27 +1287,104 @@ fn render_free_proxies_subtab_view(
         .min_h_0()
         .gap_3()
         .overflow_hidden()
-        // 1. Free Proxies Search & Discovery Toolbar
+        // 1. Unified Subtab & Primary Actions Bar (`[My Proxies | Free Proxies]` ... `[Refresh Sources] [Scan Live] [+ Save Live]`)
         .child(
             h_flex()
                 .w_full()
+                .flex_shrink_0()
                 .justify_between()
                 .items_center()
                 .gap_2()
-                .flex_wrap()
+                .child(subtab_left)
                 .child(
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .flex_wrap()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("fp-fetch-feeds")
+                                .with_variant(BonTheme::row_action(cx))
+                                .small()
+                                .disabled(is_fetching)
+                                .label(if is_fetching {
+                                    "Fetching...".to_string()
+                                } else {
+                                    format!("{}  Refresh Sources", SfSymbol::ARROW_CLOCKWISE)
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.fetch_free_proxies(cx);
+                                })),
+                        )
+                        .child(if is_verifying {
+                            Button::new("fp-stop-scan")
+                                .with_variant(BonTheme::outline_danger(cx))
+                                .small()
+                                .label(format!("{}  Stop Scan", SfSymbol::STOP_FILL))
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.stop_verifying_free_proxies(cx);
+                                }))
+                        } else {
+                            Button::new("fp-scan-live")
+                                .with_variant(BonTheme::outline_blue(cx))
+                                .small()
+                                .disabled(filtered_indices.is_empty() || is_fetching)
+                                .label(if checked_count > 0 {
+                                    format!(
+                                        "{}  Scan Selected ({checked_count})",
+                                        SfSymbol::BOLT_FILL
+                                    )
+                                } else {
+                                    format!("{}  Scan Live (24)", SfSymbol::BOLT_FILL)
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.verify_filtered_free_proxies(24, cx);
+                                }))
+                        })
+                        .child(
+                            Button::new("fp-save-live-or-sel")
+                                .with_variant(BonTheme::primary_cta(cx))
+                                .small()
+                                .disabled(checked_count == 0 && live_count == 0)
+                                .label(if checked_count > 0 {
+                                    format!("{}  Save Selected ({checked_count})", SfSymbol::PLUS)
+                                } else {
+                                    format!("{}  Save Live ({live_count})", SfSymbol::PLUS)
+                                })
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.save_selected_or_live_free_proxies(cx);
+                                })),
+                        ),
+                ),
+        )
+        // 2. Search & Filter Bar (`[Search]` `[All | SOCKS5 | HTTP/SSL]` `[All Countries ▾]` `[✓ Live Only]`)
+        .child(
+            h_flex()
+                .w_full()
+                .flex_shrink_0()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
+                        .items_center()
                         .child(
                             div()
-                                .w(px(260.))
+                                .w(px(280.))
+                                .flex_shrink_0()
                                 .child(Input::new(&app.free_proxy_search_input)),
                         )
                         .child(
                             h_flex()
-                                .gap_1()
+                                .p(px(2.))
+                                .gap(px(2.))
+                                .rounded_md()
+                                .bg(BonTheme::bg_well())
+                                .border_1()
+                                .border_color(BonTheme::border())
+                                .flex_shrink_0()
                                 .items_center()
                                 .child(
                                     Button::new("fp-proto-all")
@@ -1416,116 +1481,46 @@ fn render_free_proxies_subtab_view(
                                 })),
                         ),
                 )
-                .child(
+                .child(if checked_count > 0 {
                     h_flex()
-                        .gap_2()
+                        .flex_shrink_0()
+                        .gap_1p5()
                         .items_center()
                         .child(
-                            Button::new("fp-fetch-feeds")
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(BonTheme::accent())
+                                .child(format!("{checked_count} selected")),
+                        )
+                        .child(
+                            Button::new("fp-batch-copy")
                                 .with_variant(BonTheme::row_action(cx))
                                 .small()
-                                .disabled(is_fetching)
-                                .label(if is_fetching {
-                                    "Fetching...".to_string()
-                                } else {
-                                    format!("{}  Refresh Sources", SfSymbol::ARROW_CLOCKWISE)
-                                })
+                                .label(format!("{}  Copy", SfSymbol::DOC_ON_DOC))
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.fetch_free_proxies(cx);
+                                    app.copy_checked_free_proxies(cx);
                                 })),
                         )
-                        .child(if is_verifying {
-                            Button::new("fp-stop-scan")
-                                .with_variant(BonTheme::outline_danger(cx))
-                                .small()
-                                .label(format!("{}  Stop Scan", SfSymbol::STOP_FILL))
-                                .on_click(cx.listener(|app, _, _, cx| {
-                                    app.stop_verifying_free_proxies(cx);
-                                }))
-                        } else {
-                            Button::new("fp-scan-live")
-                                .with_variant(BonTheme::outline_blue(cx))
-                                .small()
-                                .disabled(filtered_indices.is_empty() || is_fetching)
-                                .label(if checked_count > 0 {
-                                    format!("{}  Scan Selected ({checked_count})", SfSymbol::BOLT_FILL)
-                                } else {
-                                    format!("{}  Scan Live (24)", SfSymbol::BOLT_FILL)
-                                })
-                                .on_click(cx.listener(|app, _, _, cx| {
-                                    app.verify_filtered_free_proxies(24, cx);
-                                }))
-                        })
                         .child(
-                            Button::new("fp-save-live-or-sel")
-                                .with_variant(BonTheme::primary_cta(cx))
+                            Button::new("fp-clear-sel")
+                                .with_variant(BonTheme::row_action(cx))
                                 .small()
-                                .disabled(checked_count == 0 && live_count == 0)
-                                .label(if checked_count > 0 {
-                                    format!("{}  Save Selected ({checked_count})", SfSymbol::PLUS)
-                                } else {
-                                    format!("{}  Save Live ({live_count})", SfSymbol::PLUS)
-                                })
+                                .label(SfSymbol::XMARK)
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.save_selected_or_live_free_proxies(cx);
+                                    app.clear_checked_free_proxies(cx);
                                 })),
-                        ),
-                ),
-        )
-        // 2. Selection Action Bar when 1+ free proxies checked
-        .children((checked_count > 0).then(|| {
-            h_flex()
-                .w_full()
-                .gap_2()
-                .items_center()
-                .child(
-                    Button::new("fp-clear-sel")
-                        .with_variant(BonTheme::outline_blue(cx))
-                        .small()
-                        .label(SfSymbol::XMARK)
-                        .on_click(cx.listener(|app, _, _, cx| {
-                            app.clear_checked_free_proxies(cx);
-                        })),
-                )
-                .child(
-                    Button::new("fp-batch-check")
-                        .with_variant(BonTheme::outline_blue(cx))
-                        .small()
-                        .label("Check Selected")
-                        .on_click(cx.listener(|app, _, _, cx| {
-                            app.verify_filtered_free_proxies(40, cx);
-                        })),
-                )
-                .child(
-                    Button::new("fp-batch-save")
-                        .with_variant(BonTheme::success_cta(cx))
-                        .small()
-                        .label("Save to My Proxies (#free)")
-                        .on_click(cx.listener(|app, _, _, cx| {
-                            app.save_selected_or_live_free_proxies(cx);
-                        })),
-                )
-                .child(
-                    Button::new("fp-batch-copy")
-                        .with_variant(BonTheme::primary_cta(cx))
-                        .small()
-                        .label("Copy")
-                        .on_click(cx.listener(|app, _, _, cx| {
-                            app.copy_checked_free_proxies(cx);
-                        })),
-                )
-                .child(
+                        )
+                        .into_any_element()
+                } else {
                     div()
+                        .flex_shrink_0()
                         .text_xs()
-                        .text_color(BonTheme::text_secondary())
-                        .child(format!("{checked_count} selected")),
-                )
-                .with_animation(
-                    "fp-batch-bar-enter",
-                    BonTheme::ui_enter_anim(),
-                    |this, delta| this.opacity(delta).mt(px((1.0 - delta) * -4.0)),
-                )
-        }))
+                        .text_color(BonTheme::text_muted())
+                        .child(format!("Showing {filtered_len} of {total_free}"))
+                        .into_any_element()
+                }),
+        )
         // 3. Free Proxies Table (`[☐] | # | Proxy (IP:Port) | Protocol | Country / ISP | Source | Status | Actions`)
         .child(
             v_flex()

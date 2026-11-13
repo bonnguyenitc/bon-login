@@ -523,16 +523,8 @@ pub fn render_edit_profile_view(
                                                         })
                                                 })
                                         })
-                                        .child(
-                                            Button::new("edit-save-inline")
-                                                .with_variant(BonTheme::primary_cta(cx))
-                                                .label(cta_label)
-                                                .on_click(cx.listener(|app, _, window, cx| {
-                                                    app.save_modal_profile(window, cx);
-                                                })),
-                                        ),
                                 )
-                                // GenLogin 5-Tab Bar: Overview | Network | Location | Hardware | Cookies
+                                // 6-Tab Segmented Bar: Overview | Network | Location | Hardware | Bookmarks | Cookies
                                 .child(
                                     h_flex()
                                         .w_full()
@@ -1767,11 +1759,11 @@ pub fn render_edit_profile_view(
                                 .into_any_element(),
                         }),
                 )
-                // Right Column: GenLogin 3.0 `Detail` Live Summary Table (`menu-bar_profile_create-profile_01.png`)
+                // Right Column: Live Fingerprint Summary Table
                 .child(
                     v_flex()
                         .id("edit-profile-detail-col")
-                        .w(px(290.))
+                        .w(px(296.))
                         .max_h_full()
                         .min_h_0()
                         .flex_shrink_0()
@@ -1790,7 +1782,7 @@ pub fn render_edit_profile_view(
                                 .text_sm()
                                 .font_bold()
                                 .text_color(BonTheme::text_primary())
-                                .child("Detail"),
+                                .child("Live Fingerprint Summary"),
                         )
                         .child(detail_summary_row("Profile Name", name_preview))
                         .child(detail_summary_row("Group", group_preview))
@@ -1803,7 +1795,7 @@ pub fn render_edit_profile_view(
                             format!("{} ({os_ver_preview})", os_platform.label()),
                         ))
                         .child(detail_summary_row("User Agent", ua_preview))
-                        .child(detail_summary_row(
+                        .child(detail_summary_row_mono(
                             "Screen Resolution",
                             win_size.replace(',', "×"),
                         ))
@@ -1814,7 +1806,7 @@ pub fn render_edit_profile_view(
                         .child(detail_summary_row("Start URL", url_preview))
                         .child(detail_summary_row("Bookmarks", bookmarks_detail_str))
                         .child(detail_summary_row("Cookies", cookies_detail_str))
-                        .child(detail_summary_row("Proxy", proxy_detail_str))
+                        .child(detail_summary_row_mono("Proxy", proxy_detail_str))
                         .child(detail_summary_row(
                             "WebRTC",
                             if proxy_mode == ProxyEditMode::Direct {

@@ -45,7 +45,7 @@ impl Render for BonLoginApp {
             WorkspaceView::Proxies => "Proxy management",
             WorkspaceView::EditProfile => {
                 if is_editing_existing {
-                    "Setting Profile"
+                    "Edit Profile"
                 } else {
                     "Create Profile"
                 }

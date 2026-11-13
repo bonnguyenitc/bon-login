@@ -61,7 +61,7 @@ pub struct AgentFlowsModalState {
     pub vars_input: Entity<InputState>,
 }
 
-/// Renders the active GenLogin 3.0 Popup Modal overlay (`Quickly add profiles`, `Column Settings`, `Assign to group`, `Add group`, `Update proxy`, `Update profiles`)
+/// Renders the active Popup Modal overlay
 pub fn render_popup_modal(
     modal_kind: ActivePopupModal,
     app: &BonLoginApp,
@@ -69,7 +69,7 @@ pub fn render_popup_modal(
 ) -> AnyElement {
     let anim_key = modal_kind.anim_key();
     let card = match modal_kind {
-        // 1. GenLogin `Quickly add profiles` (`docs/genlogin-3.0/assets/menu-bar_profile_create-profile_02.png`)
+        // 1. `Quickly add profiles`
         ActivePopupModal::QuickAdd => {
             v_flex()
                 .w(px(520.))
@@ -78,7 +78,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -166,7 +166,7 @@ pub fn render_popup_modal(
                 )
         }
 
-        // 2. GenLogin `Column Settings` (`docs/genlogin-3.0/assets/menu-bar_profile_profile-column-settings_01.png`)
+        // 2. `Column Settings`
         ActivePopupModal::ColumnSettings => {
             let cols = app.col_vis;
             v_flex()
@@ -176,7 +176,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .gap_2p5()
@@ -324,22 +324,25 @@ pub fn render_popup_modal(
                         .pt_3()
                         .border_t_1()
                         .border_color(BonTheme::border())
-                        .justify_end()
+                        .justify_between()
+                        .items_center()
                         .gap_2()
                         .child(
-                            Button::new("cs-cancel")
-                                .ghost()
+                            Button::new("cs-reset-default")
+                                .with_variant(BonTheme::row_action(cx))
                                 .small()
-                                .label("Cancel")
+                                .label("Reset Default")
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.close_popup_modal(cx);
+                                    app.col_vis =
+                                        crate::ui::profile_list::ColumnVisibility::default();
+                                    cx.notify();
                                 })),
                         )
                         .child(
                             Button::new("cs-apply")
                                 .with_variant(BonTheme::primary_cta(cx))
                                 .small()
-                                .label("Apply")
+                                .label("Done")
                                 .on_click(cx.listener(|app, _, _, cx| {
                                     app.close_popup_modal(cx);
                                 })),
@@ -347,7 +350,7 @@ pub fn render_popup_modal(
                 )
         }
 
-        // 3. GenLogin `Assign to group` (`docs/genlogin-3.0/assets/menu-bar_profile_group_04.png`)
+        // 3. `Assign to group`
         ActivePopupModal::AssignGroup => {
             let groups = app.distinct_groups_with_counts();
             v_flex()
@@ -357,7 +360,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -433,7 +436,7 @@ pub fn render_popup_modal(
                 )
         }
 
-        // 4. GenLogin `Add group` (`docs/genlogin-3.0/assets/menu-bar_profile_group_02.png`)
+        // 4. `Add group`
         ActivePopupModal::AddGroup => v_flex()
             .w(px(380.))
             .p_5()
@@ -441,7 +444,7 @@ pub fn render_popup_modal(
             .rounded_lg()
             .bg(BonTheme::bg_elevated())
             .border_1()
-            .border_color(BonTheme::border_active())
+            .border_color(BonTheme::border())
             .child(
                 h_flex()
                     .w_full()
@@ -473,16 +476,32 @@ pub fn render_popup_modal(
                     .child(Input::new(&app.batch_move_group_input)),
             )
             .child(
-                h_flex().child(
-                    Button::new("addg-submit")
-                        .with_variant(BonTheme::primary_cta(cx))
-                        .small()
-                        .label("Add")
-                        .on_click(cx.listener(|app, _, window, cx| {
-                            app.popup_modal = None;
-                            app.create_group_from_modal(window, cx);
-                        })),
-                ),
+                h_flex()
+                    .w_full()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(BonTheme::border())
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("addg-cancel")
+                            .with_variant(BonTheme::row_action(cx))
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.close_popup_modal(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("addg-submit")
+                            .with_variant(BonTheme::primary_cta(cx))
+                            .small()
+                            .label("Add")
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.popup_modal = None;
+                                app.create_group_from_modal(window, cx);
+                            })),
+                    ),
             ),
 
 
@@ -494,7 +513,7 @@ pub fn render_popup_modal(
             .rounded_lg()
             .bg(BonTheme::bg_elevated())
             .border_1()
-            .border_color(BonTheme::border_active())
+            .border_color(BonTheme::border())
             .child(
                 h_flex()
                     .w_full()
@@ -529,21 +548,37 @@ pub fn render_popup_modal(
                     .child(Input::new(&app.new_tag_input)),
             )
             .child(
-                h_flex().child(
-                    Button::new("addt-submit")
-                        .with_variant(BonTheme::primary_cta(cx))
-                        .small()
-                        .label("Add")
-                        .on_click(cx.listener(move |app, _, window, cx| {
-                            if app.create_tag_from_modal(window, cx) {
-                                app.popup_modal =
-                                    return_to_add_proxy.then_some(ActivePopupModal::AddProxy);
-                                cx.notify();
-                            }
-                        })),
-                ),
+                h_flex()
+                    .w_full()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(BonTheme::border())
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("addt-cancel")
+                            .with_variant(BonTheme::row_action(cx))
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.close_popup_modal(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("addt-submit")
+                            .with_variant(BonTheme::primary_cta(cx))
+                            .small()
+                            .label("Add")
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                if app.create_tag_from_modal(window, cx) {
+                                    app.popup_modal =
+                                        return_to_add_proxy.then_some(ActivePopupModal::AddProxy);
+                                    cx.notify();
+                                }
+                            })),
+                    ),
             ),
-        // 5. GenLogin `Update proxy` (`docs/genlogin-3.0/assets/menu-bar_profile_create-profile_setting-profile_network_update-proxy_02.png`)
+        // 5. `Update proxy`
         ActivePopupModal::UpdateProxy => {
             let checked_names: Vec<String> = app
                 .profiles
@@ -560,7 +595,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -682,7 +717,7 @@ pub fn render_popup_modal(
                 )
         }
 
-        // 6. GenLogin `Update profiles` (`docs/genlogin-3.0/assets/menu-bar_profile_update-profiles_02.png`)
+        // 6. `Update profiles`
         ActivePopupModal::UpdateProfiles => {
             v_flex()
                 .w(px(560.))
@@ -691,7 +726,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -770,7 +805,7 @@ pub fn render_popup_modal(
                 )
         }
 
-        // 7. GenLogin `Add Proxy` (`docs/genlogin-3.0/assets/menu-bar_proxy-manager-and-genproxy_proxy-management_02.png`)
+        // 7. `Add Proxy`
         ActivePopupModal::AddProxy => {
             let proxy_groups = app.distinct_proxy_groups_with_counts();
             let add_proto = app.proxy_add_protocol;
@@ -781,7 +816,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -1044,7 +1079,7 @@ pub fn render_popup_modal(
             .rounded_lg()
             .bg(BonTheme::bg_elevated())
             .border_1()
-            .border_color(BonTheme::border_active())
+            .border_color(BonTheme::border())
             .child(
                 h_flex()
                     .w_full()
@@ -1139,7 +1174,7 @@ pub fn render_popup_modal(
                             })),
                     ),
             ),
-        // 10. GenLogin `Input URL Extension` Modal (`docs/genlogin-3.0/assets/menu-bar_extensions_06.png`)
+        // 10. `Input URL Extension` Modal
         ActivePopupModal::InputUrlExtension => {
             let busy = app.downloading_ext;
             v_flex()
@@ -1149,7 +1184,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -1356,7 +1391,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -1474,7 +1509,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -1629,7 +1664,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -1945,7 +1980,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -2070,7 +2105,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -2163,7 +2198,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -2244,7 +2279,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
@@ -2395,7 +2430,7 @@ pub fn render_popup_modal(
                 .rounded_lg()
                 .bg(BonTheme::bg_elevated())
                 .border_1()
-                .border_color(BonTheme::border_active())
+                .border_color(BonTheme::border())
                 .child(
                     h_flex()
                         .w_full()
