@@ -29,7 +29,7 @@ use crate::ui::profile_list::{
 };
 use crate::ui::popup_modals::{
     AgentFlowsModalState, CloneProfileModalState, CookieRobotModalState, EditProxyModalState,
-    ImportBackupZipModalState, QuickMetaModalState, render_popup_modal,
+    ImportBackupZipModalState, QuickMetaModalState, SynchronizerModalState, render_popup_modal,
 };
 use crate::ui::profile_modal::{ProfileModalState, ProxyEditMode, render_edit_profile_view};
 use crate::ui::workspace_views::{
@@ -116,6 +116,51 @@ pub enum PaginatedTable {
     FreeProxies,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ArrangePrefs {
+    pub display_idx: usize,
+    pub preset_idx: Option<usize>,
+    pub custom_size: String,
+}
+
+impl Default for ArrangePrefs {
+    fn default() -> Self {
+        Self {
+            display_idx: 0,
+            preset_idx: Some(0),
+            custom_size: "960,600".to_string(),
+        }
+    }
+}
+
+impl ArrangePrefs {
+    pub fn load_in(root_dir: &std::path::Path) -> Self {
+        std::fs::read_to_string(root_dir.join("arrange_prefs.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_in(&self, root_dir: &std::path::Path) {
+        let Ok(json) = serde_json::to_vec_pretty(self) else {
+            return;
+        };
+        let tmp = root_dir.join(format!(
+            ".arrange_prefs.{}.{}.tmp",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        if let Ok(mut f) = std::fs::File::create(&tmp) {
+            use std::io::Write;
+            if f.write_all(&json).is_ok() && f.sync_all().is_ok() {
+                let _ = std::fs::rename(&tmp, root_dir.join("arrange_prefs.json"));
+                return;
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 #[derive(Clone)]
 pub enum ActivePopupModal {
     QuickAdd,
@@ -136,6 +181,7 @@ pub enum ActivePopupModal {
     AgentFlows(AgentFlowsModalState),
     CloneProfile(CloneProfileModalState),
     EditProxy(EditProxyModalState),
+    Synchronizer(SynchronizerModalState),
 }
 
 impl ActivePopupModal {
@@ -159,6 +205,7 @@ impl ActivePopupModal {
             Self::AgentFlows(_) => "AgentFlows",
             Self::CloneProfile(_) => "CloneProfile",
             Self::EditProxy(_) => "EditProxy",
+            Self::Synchronizer(_) => "Synchronizer",
         }
     }
 }
@@ -248,6 +295,8 @@ pub struct BonLoginApp {
     pub batch_os: PlatformType,
     pub batch_brand: BrowserBrand,
     pub arrange_display_idx: usize,
+    pub arrange_preset_idx: Option<usize>,
+    pub saved_arrange_prefs: ArrangePrefs,
     pub arrange_size_input: Entity<InputState>,
     pub saved_flows: Vec<crate::flows::AgentFlow>,
     pub http_api_task: Option<tokio::task::AbortHandle>,
@@ -354,10 +403,12 @@ impl BonLoginApp {
             InputState::new(window, cx).placeholder("Path to .CRX or .ZIP file (or click Upload file to browse)")
         });
 
+        let saved_arrange_prefs = ArrangePrefs::load_in(&workspace_root);
+        let init_arrange_size = saved_arrange_prefs.custom_size.clone();
         let arrange_size_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Width,Height (e.g. 960,600)")
-                .default_value("960,600")
+                .placeholder("Width,Height (e.g. 487,474)")
+                .default_value(init_arrange_size)
         });
         let saved_flows = db.list_flows();
         let selected_disk_usage = "0 B".to_string();
@@ -582,7 +633,9 @@ impl BonLoginApp {
             batch_count_input,
             batch_os: PlatformType::MacOS,
             batch_brand: BrowserBrand::Chrome,
-            arrange_display_idx: 0,
+            arrange_display_idx: saved_arrange_prefs.display_idx,
+            arrange_preset_idx: saved_arrange_prefs.preset_idx,
+            saved_arrange_prefs,
             arrange_size_input,
             saved_flows,
             http_api_task: None,

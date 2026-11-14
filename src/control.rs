@@ -523,10 +523,15 @@ pub fn tile_window_targets(
     win_h: i32,
 ) -> (usize, usize, i32, i32) {
     let total = targets.len();
+    let (mon_x, mon_y, mon_w, mon_h) = mon_rect;
+    let (win_w, win_h) = if win_w <= 0 || win_h <= 0 {
+        crate::launcher::auto_fit_window_size(mon_w, mon_h, total)
+    } else {
+        (win_w, win_h)
+    };
     if total == 0 {
         return (0, 0, win_w, win_h);
     }
-    let (mon_x, mon_y, mon_w, mon_h) = mon_rect;
     let placements = compute_tile_work_area_bounds(mon_x, mon_y, mon_w, mon_h, win_w, win_h, total);
     let (applied_w, applied_h) = placements
         .first()
@@ -534,29 +539,28 @@ pub fn tile_window_targets(
         .unwrap_or((win_w, win_h));
     let pairs: Vec<_> = targets.iter().zip(placements.iter()).collect();
     let arranged = parallel_map(&pairs, |((port, ws_url), (l, t, w, h))| {
-        cdp_set_window_bounds(*port, ws_url, *l, *t, *w, *h).is_ok()
+        crate::launcher::cdp_set_window_bounds_quiet(*port, ws_url, *l, *t, *w, *h).is_ok()
     })
     .into_iter()
     .filter(|&ok| ok)
     .count();
+    #[cfg(target_os = "macos")]
+    {
+        let (cols, rows, _, _) =
+            crate::launcher::compute_tile_grid_dims(mon_w, mon_h, applied_w, applied_h, total);
+        let per_layer = (cols * rows).max(1);
+        if total > per_layer {
+            for ((port, _), (l, t, w, h)) in pairs[per_layer..].iter().rev() {
+                crate::launcher::macos_post_winbounds_notification(*port, *l, *t, *w, *h, true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        for ((port, _), (l, t, w, h)) in pairs.iter().take(per_layer) {
+            crate::launcher::macos_post_winbounds_notification(*port, *l, *t, *w, *h, true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
     (arranged, total, applied_w, applied_h)
-}
-
-pub fn arrange_running_windows_on_display_in(
-    root_dir: &Path,
-    profiles: &[Profile],
-    display_idx: usize,
-    win_w: i32,
-    win_h: i32,
-) -> (usize, usize, i32, i32) {
-    let targets: Vec<(u16, String)> =
-        parallel_map(profiles, |p| probe_live_runtime_in(root_dir, &p.id))
-            .into_iter()
-            .flatten()
-            .map(|rt| (rt.cdp_port, rt.ws_url))
-            .collect();
-    let mon_rect = macos_display_rect(display_idx);
-    tile_window_targets(&targets, mon_rect, win_w, win_h)
 }
 
 
@@ -594,14 +598,16 @@ fn print_cli_help() {
            bon-login type <id|name> <text...>                            Human-type text into focused input via CDP (bypass paste block)\n  \
            bon-login totp <id|name> [--type]                             Generate 6-digit 2FA code (and optionally type into browser)\n  \
            bon-login screenshot <id|name> [--out <file>]                 Capture PNG screenshot of running profile via CDP\n  \
+           bon-login preflight <id|name|--group <g>|--all> [--open]      Generate zero-bandwidth Stealth & Proxy Health Preflight Card\n  \
            bon-login broadcast <open|type|totp> [val] [--group <g>]      Sync navigation/typing/2FA across running profiles\n  \
+           bon-login synchronizer <master> [followers...|--group <g>] [--tile] [--duration <s>] Live 1-to-N mouse/key/scroll/URL mirror\n  \
            bon-login serve [--port <19820>]                              Start local HTTP JSON control plane for n8n/Python/agents\n  \
            bon-login agent <id|name> [--record <flow>] <ab args...>      Run agent-browser (auto-records DOM steps)\n\n\
          AGENT FLOW PLAYBOOKS (`bon-login flow ...`):\n  \
            bon-login flow list                                           List saved DOM flows & required {{vars}}\n  \
            bon-login flow show <flow_name>                               Show steps & locators of a saved flow\n  \
            bon-login flow save <flow_name> <id|name> [--var k=literal]   Save profile's recent agent steps as reusable flow\n  \
-           bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v] [--from-step <n>]\n  \
+           bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v] [--csv <file>] [--concurrency <n>] [--from-step <n>]\n  \
            bon-login flow heal <flow_name> <step_idx> <id|name> <ab args...>  Self-heal broken step & update flow\n  \
            bon-login flow step <flow_name> <step_idx> <optional|required|delete>\n  \
            bon-login flow history <id|name> [--clear]                    Inspect or clear auto-recorded profile steps\n  \
@@ -763,7 +769,9 @@ pub fn try_run_cli() -> Option<Result<()>> {
             "type" | "human-type" => run_type_cli(&args[1..]),
             "totp" | "2fa" => run_totp_cli(&args[1..]),
             "screenshot" | "shot" => run_screenshot_cli(&args[1..]),
+            "preflight" | "start-page" => run_preflight_cli(&args[1..]),
             "broadcast" | "multi" => run_broadcast_cli(&args[1..]),
+            "synchronizer" | "sync-input" | "mirror" => run_synchronizer_cli(&args[1..]),
             "serve" | "server" => cli_tokio_handle().block_on(run_serve_cli(&args[1..])),
             "agent" | "ab" => run_agent_cli(&args[1..]),
             "flow" | "flows" => run_flow_subcommand(&args[1..]),
@@ -2430,25 +2438,56 @@ fn run_kernel_subcommand(args: &[String]) -> Result<()> {
 }
 
 fn run_arrange_cli(args: &[String]) -> Result<()> {
+    let db = crate::db::Database::open_default()?;
+    let mut prefs = crate::ui::ArrangePrefs::load_in(db.root_dir());
     let raw_size = args
         .windows(2)
-        .find_map(|w| (w[0] == "--size" || w[0] == "-s").then_some(w[1].as_str()))
-        .unwrap_or("960,600");
-    let display_num: usize = args
-        .windows(2)
-        .find_map(|w| {
-            (w[0] == "--display" || w[0] == "--monitor" || w[0] == "-d")
-                .then(|| w[1].parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(1)
-        .max(1);
-    let (win_w, win_h) =
-        parse_window_size(raw_size).ok_or_else(|| anyhow!("Invalid --size '{raw_size}' (use W,H)"))?;
-    let db = crate::db::Database::open_default()?;
+        .find_map(|w| (w[0] == "--size" || w[0] == "-s").then_some(w[1].as_str()));
+    let cli_display = args.windows(2).find_map(|w| {
+        (w[0] == "--display" || w[0] == "--monitor" || w[0] == "-d")
+            .then(|| w[1].parse::<usize>().ok())
+            .flatten()
+    });
+    let display_num = cli_display.unwrap_or(prefs.display_idx + 1).max(1);
+    let disp_idx = display_num - 1;
+    let mon_rect = macos_display_rect(disp_idx);
+    let (_, _, mon_w, mon_h) = mon_rect;
     let profiles = db.list_profiles()?;
+    let root = db.root_dir();
+    let targets: Vec<(u16, String)> =
+        parallel_map(&profiles, |p| probe_live_runtime_in(root, &p.id))
+            .into_iter()
+            .flatten()
+            .map(|rt| (rt.cdp_port, rt.ws_url))
+            .collect();
+    let presets = crate::ui::BonLoginApp::arrange_presets_for_monitor(mon_w, mon_h, targets.len());
+
+    let (win_w, win_h) = match raw_size {
+        Some("auto" | "AUTO") => {
+            prefs.preset_idx = Some(0);
+            (0, 0)
+        }
+        Some(s) => {
+            let (w, h) = parse_window_size(s)
+                .ok_or_else(|| anyhow!("Invalid --size '{s}' (use W,H or auto)"))?;
+            prefs.preset_idx = presets
+                .iter()
+                .position(|(_, pw, ph)| *pw == w && *ph == h);
+            prefs.custom_size = format!("{w},{h}");
+            (w, h)
+        }
+        None => match prefs.preset_idx {
+            Some(0) => (0, 0),
+            Some(idx) if idx < presets.len() => (presets[idx].1, presets[idx].2),
+            _ => parse_window_size(&prefs.custom_size).unwrap_or((0, 0)),
+        },
+    };
+    if cli_display.is_some() || raw_size.is_some() {
+        prefs.display_idx = disp_idx;
+        prefs.save_in(root);
+    }
     let (arranged, total_running, applied_w, applied_h) =
-        arrange_running_windows_on_display_in(db.root_dir(), &profiles, display_num - 1, win_w, win_h);
+        tile_window_targets(&targets, mon_rect, win_w, win_h);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -2542,6 +2581,40 @@ fn run_screenshot_cli(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_preflight_cli(args: &[String]) -> Result<()> {
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let (targets, _) = select_profiles_by_target(&profiles, args).map_err(|_| {
+        anyhow!("Usage: bon-login preflight <id|name|--group <g>|--all> [--open]")
+    })?;
+    let do_open = args.iter().any(|a| a == "--open" || a == "-o");
+    let mut items = Vec::with_capacity(targets.len());
+    for p in &targets {
+        let user_data_dir = db.profile_user_data_dir(&p.id)?;
+        let url = write_profile_preflight_card(p, &user_data_dir, None);
+        let mut navigated = false;
+        if let Some(rt) = db.probe_live_runtime(&p.id) {
+            navigated = cdp_navigate_page(rt.cdp_port, &url).is_ok();
+        } else if do_open {
+            let info = ensure_profile_launched_via_supervisor(&db, p)?;
+            navigated = cdp_navigate_page(info.cdp_port, &url).is_ok();
+        }
+        items.push(serde_json::json!({
+            "ok": true,
+            "short_id": p.short_id(),
+            "name": p.name,
+            "url": url,
+            "navigated": navigated,
+        }));
+    }
+    if items.len() == 1 {
+        println!("{}", serde_json::to_string_pretty(&items[0])?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    }
+    Ok(())
+}
+
 fn run_broadcast_cli(args: &[String]) -> Result<()> {
     let op = args
         .first()
@@ -2595,6 +2668,140 @@ fn run_broadcast_cli(args: &[String]) -> Result<()> {
             "op": op,
             "succeeded": ok_count,
             "total_running": running.len(),
+        }))?
+    );
+    Ok(())
+}
+
+fn run_synchronizer_cli(args: &[String]) -> Result<()> {
+    let master_q = args.first().ok_or_else(|| {
+        anyhow!(
+            "Usage: bon-login synchronizer <master_id|name> [follower1,follower2...|--group <g>] [--tile] [--duration <secs>]"
+        )
+    })?;
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let master_prof = find_profile_by_query(&profiles, master_q)?.clone();
+    let master_rt = db.probe_live_runtime(&master_prof.id).ok_or_else(|| {
+        anyhow!(
+            "Master profile '{}' (bon_{}) is not running",
+            master_prof.name,
+            master_prof.short_id()
+        )
+    })?;
+
+    let mut group_filter: Option<String> = None;
+    let mut explicit_followers: Vec<String> = Vec::new();
+    let mut do_tile = false;
+    let mut duration_secs: Option<u64> = None;
+    let mut idx = 1;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--group" | "-g" => {
+                group_filter = args.get(idx + 1).cloned();
+                idx += 2;
+            }
+            "--tile" | "--arrange" => {
+                do_tile = true;
+                idx += 1;
+            }
+            "--duration" | "-d" => {
+                duration_secs = args.get(idx + 1).and_then(|s| s.parse::<u64>().ok());
+                idx += 2;
+            }
+            "--all" | "all" => {
+                idx += 1;
+            }
+            tok if !tok.starts_with('-') => {
+                for part in tok.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    explicit_followers.push(part.to_string());
+                }
+                idx += 1;
+            }
+            _ => idx += 1,
+        }
+    }
+
+    let mut follower_pairs: Vec<(Profile, RuntimeInfo)> = Vec::new();
+    if !explicit_followers.is_empty() {
+        for q in &explicit_followers {
+            let fp = find_profile_by_query(&profiles, q)?.clone();
+            if fp.id == master_prof.id {
+                continue;
+            }
+            let rt = db.probe_live_runtime(&fp.id).ok_or_else(|| {
+                anyhow!("Follower profile '{}' (bon_{}) is not running", fp.name, fp.short_id())
+            })?;
+            if !follower_pairs.iter().any(|(x, _)| x.id == fp.id) {
+                follower_pairs.push((fp, rt));
+            }
+        }
+    } else {
+        for p in &profiles {
+            if p.id == master_prof.id {
+                continue;
+            }
+            if group_filter
+                .as_deref()
+                .is_some_and(|g| !p.group_tag.eq_ignore_ascii_case(g))
+            {
+                continue;
+            }
+            if let Some(rt) = db.probe_live_runtime(&p.id) {
+                follower_pairs.push((p.clone(), rt));
+            }
+        }
+    }
+
+    if follower_pairs.is_empty() {
+        bail!("No running follower profiles found to synchronize with '{}'", master_prof.name);
+    }
+
+    if do_tile {
+        let mut tile_targets = vec![(master_rt.cdp_port, master_rt.ws_url.clone())];
+        for (_, rt) in &follower_pairs {
+            tile_targets.push((rt.cdp_port, rt.ws_url.clone()));
+        }
+        let mon_rect = macos_display_rect(0);
+        let (_, _, mw, mh) = mon_rect;
+        let (aw, ah) = crate::launcher::auto_fit_window_size(mw, mh, tile_targets.len());
+        let _ = tile_window_targets(&tile_targets, mon_rect, aw, ah);
+    }
+
+    let follower_short_ids: Vec<String> =
+        follower_pairs.iter().map(|(p, _)| p.short_id()).collect();
+    let follower_ports: Vec<u16> = follower_pairs.iter().map(|(_, rt)| rt.cdp_port).collect();
+
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(secs) = duration_secs.filter(|&s| s > 0) {
+        let flag_timer = stop_flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            flag_timer.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    } else {
+        eprintln!(
+            "Synchronizer active: Master bon_{} (: {}) -> {} follower(s) {:?}. Press Ctrl+C to stop...",
+            master_prof.short_id(),
+            master_rt.cdp_port,
+            follower_short_ids.len(),
+            follower_short_ids
+        );
+    }
+
+    let mirrored = run_multi_profile_synchronizer_loop(
+        master_rt.cdp_port,
+        &follower_ports,
+        &stop_flag,
+        None,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "master_short_id": master_prof.short_id(),
+            "followers": follower_short_ids,
+            "mirrored_events": mirrored,
         }))?
     );
     Ok(())
@@ -2798,7 +3005,7 @@ impl ControlEngine {
                 })
             }
             ("POST", "/arrange") => {
-                let (w, h) = parse_window_size(body).unwrap_or((960, 600));
+                let (w, h) = parse_window_size(body).unwrap_or((0, 0));
                 let engine = self.clone();
                 tokio::task::spawn_blocking(move || {
                     let profiles = engine
@@ -2832,6 +3039,107 @@ impl ControlEngine {
                         serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
                     )
                 })
+            }
+            ("GET", "/synchronizer") => {
+                let st = current_synchronizer_status();
+                (
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "synchronizer": st,
+                    })
+                    .to_string(),
+                )
+            }
+            ("POST", "/synchronizer/stop") => {
+                let st = stop_background_synchronizer();
+                self.notify_mutation();
+                (
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "synchronizer": st,
+                    })
+                    .to_string(),
+                )
+            }
+            ("POST", "/synchronizer/start") => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                let master_q = parsed
+                    .get("master")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| body.trim());
+                if master_q.is_empty() {
+                    return (
+                        400,
+                        serde_json::json!({"ok": false, "error": "Missing 'master' profile identifier"})
+                            .to_string(),
+                    );
+                }
+                let master_prof = match self.lookup_profile(master_q) {
+                    Ok(p) => p,
+                    Err(resp) => return resp,
+                };
+                let Some(master_rt) = self.supervisor.live_info(&master_prof.id) else {
+                    return (
+                        409,
+                        serde_json::json!({"ok": false, "error": "Master profile is not running"})
+                            .to_string(),
+                    );
+                };
+                let profiles = self
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.list_profiles().ok())
+                    .unwrap_or_default();
+                let explicit_ids: Vec<String> = parsed
+                    .get("followers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(ToString::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut followers: Vec<(String, u16)> = Vec::new();
+                if !explicit_ids.is_empty() {
+                    for fq in &explicit_ids {
+                        if let Ok(fp) = find_profile_by_query(&profiles, fq)
+                            && fp.id != master_prof.id
+                            && let Some(rt) = self.supervisor.live_info(&fp.id)
+                        {
+                            followers.push((fp.short_id(), rt.cdp_port));
+                        }
+                    }
+                } else {
+                    for p in &profiles {
+                        if p.id != master_prof.id
+                            && let Some(rt) = self.supervisor.live_info(&p.id)
+                        {
+                            followers.push((p.short_id(), rt.cdp_port));
+                        }
+                    }
+                }
+                match start_background_synchronizer(
+                    master_prof.short_id(),
+                    master_rt.cdp_port,
+                    followers,
+                ) {
+                    Ok(st) => {
+                        self.notify_mutation();
+                        (
+                            200,
+                            serde_json::json!({"ok": true, "synchronizer": st}).to_string(),
+                        )
+                    }
+                    Err(e) => (
+                        400,
+                        serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                    ),
+                }
             }
             ("POST", p_path) if p_path.starts_with("/profiles/") => {
                 let rest = &p_path["/profiles/".len()..];
@@ -3081,6 +3389,31 @@ impl ControlEngine {
                         )
                         .await
                     }
+                    "preflight" => {
+                        let root_dir = self.supervisor.root_dir().to_path_buf();
+                        let live_rt = self.supervisor.live_info(&profile.id);
+                        let sid = profile.short_id();
+                        let prof_cl = profile.clone();
+                        Self::run_blocking_json(
+                            500,
+                            move || {
+                                let udir = profile_user_data_dir_in(&root_dir, &prof_cl.id)?;
+                                let url = write_profile_preflight_card(&prof_cl, &udir, None);
+                                let navigated = live_rt
+                                    .is_some_and(|rt| cdp_navigate_page(rt.cdp_port, &url).is_ok());
+                                Ok((sid, url, navigated))
+                            },
+                            |(short_id, url, navigated)| {
+                                serde_json::json!({
+                                    "ok": true,
+                                    "short_id": short_id,
+                                    "url": url,
+                                    "navigated": navigated,
+                                })
+                            },
+                        )
+                        .await
+                    }
                     _ => (
                         404,
                         serde_json::json!({"ok": false, "error": "Unknown profile action"})
@@ -3267,8 +3600,12 @@ pub const CONTROL_HTTP_ENDPOINTS: &[&str] = &[
     "POST /profiles/:id/type",
     "POST /profiles/:id/totp",
     "POST /profiles/:id/screenshot",
+    "POST /profiles/:id/preflight",
     "POST /profiles/:id/flow/:flow_name",
     "POST /arrange",
+    "GET /synchronizer",
+    "POST /synchronizer/start",
+    "POST /synchronizer/stop",
 ];
 
 async fn run_serve_cli(args: &[String]) -> Result<()> {
@@ -3487,7 +3824,7 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
         "run" | "replay" => {
             let flow_raw = rest.first().ok_or_else(|| {
                 anyhow!(
-                    "Usage: bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v ...] [--from-step <n>]"
+                    "Usage: bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v ...] [--csv <file>] [--concurrency <n>] [--from-step <n>]"
                 )
             })?;
             let flow_name = sanitize_flow_name(flow_raw)?;
@@ -3499,18 +3836,41 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             let (targets, consumed) =
                 select_profiles_by_target(&profiles, &rest[1..]).map_err(|_| {
                     anyhow!(
-                        "Usage: bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v ...] [--from-step <n>]"
+                        "Usage: bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v ...] [--csv <file>] [--concurrency <n>] [--from-step <n>]"
                     )
                 })?;
 
             let mut cli_vars: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            let mut csv_rows: Vec<std::collections::HashMap<String, String>> = Vec::new();
+            let mut concurrency: usize = 1;
             let mut from_step: usize = 0;
             let mut idx = 1 + consumed;
             while idx < rest.len() {
                 if let Some(((k, v), step)) = parse_var_flag(rest, idx) {
                     cli_vars.insert(k, v);
                     idx += step;
+                } else if matches!(rest[idx].as_str(), "--csv" | "--csv-file") {
+                    let csv_path = rest
+                        .get(idx + 1)
+                        .ok_or_else(|| anyhow!("Missing CSV file path after {}", rest[idx]))?;
+                    let raw_csv = if Path::new(csv_path).is_file() {
+                        std::fs::read_to_string(csv_path)
+                            .with_context(|| format!("Failed to read CSV file '{csv_path}'"))?
+                    } else {
+                        csv_path.clone()
+                    };
+                    csv_rows = parse_flow_csv_rows(&raw_csv)?;
+                    idx += 2;
+                } else if matches!(rest[idx].as_str(), "--concurrency" | "--jobs" | "-j") {
+                    let raw_c = rest
+                        .get(idx + 1)
+                        .ok_or_else(|| anyhow!("Missing integer after {}", rest[idx]))?;
+                    concurrency = raw_c
+                        .parse::<usize>()
+                        .with_context(|| format!("Invalid --concurrency integer '{raw_c}'"))?
+                        .clamp(1, 32);
+                    idx += 2;
                 } else if matches!(rest[idx].as_str(), "--from-step" | "--from") {
                     let raw_n = rest
                         .get(idx + 1)
@@ -3524,36 +3884,89 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                 }
             }
 
-            let mut profile_results = Vec::new();
-            let mut any_failed = false;
+            let workers = concurrency.min(targets.len().max(1));
+            let root_dir = db.root_dir().to_path_buf();
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let slots: Vec<std::sync::Mutex<Option<(bool, serde_json::Value)>>> = (0..targets.len())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
 
-            for profile in &targets {
-                let short_id = profile.short_id();
-                let info = ensure_profile_launched_via_supervisor(&db, profile)?;
-                let report = replay_flow_steps_in(
-                    db.root_dir(),
-                    &flow_name,
-                    profile,
-                    &info.ws_url,
-                    &cli_vars,
-                    from_step,
-                )?;
-                if let Some(fail) = report.failure {
-                    any_failed = true;
-                    profile_results.push(serde_json::json!({
-                        "ok": false,
-                        "profile_short_id": short_id,
-                        "profile_name": profile.name,
-                        "executed_steps": report.executed_steps,
-                        "failure": fail,
-                    }));
-                } else {
-                    profile_results.push(serde_json::json!({
-                        "ok": true,
-                        "profile_short_id": short_id,
-                        "profile_name": profile.name,
-                        "executed_steps": report.executed_steps,
-                    }));
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        let Ok(worker_db) = crate::db::Database::open_at(&root_dir) else {
+                            return;
+                        };
+                        loop {
+                            let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= targets.len() {
+                                break;
+                            }
+                            let profile = &targets[i];
+                            let short_id = profile.short_id();
+                            let row_vars =
+                                resolve_profile_csv_vars(profile, i, &csv_rows, &cli_vars);
+                            let item = match ensure_profile_launched_via_supervisor(&worker_db, profile)
+                                .and_then(|info| {
+                                    replay_flow_steps_in(
+                                        &root_dir,
+                                        &flow_name,
+                                        profile,
+                                        &info.ws_url,
+                                        &row_vars,
+                                        from_step,
+                                    )
+                                }) {
+                                Ok(report) => {
+                                    if let Some(fail) = report.failure {
+                                        (
+                                            false,
+                                            serde_json::json!({
+                                                "ok": false,
+                                                "profile_short_id": short_id,
+                                                "profile_name": profile.name,
+                                                "executed_steps": report.executed_steps,
+                                                "failure": fail,
+                                            }),
+                                        )
+                                    } else {
+                                        (
+                                            true,
+                                            serde_json::json!({
+                                                "ok": true,
+                                                "profile_short_id": short_id,
+                                                "profile_name": profile.name,
+                                                "executed_steps": report.executed_steps,
+                                            }),
+                                        )
+                                    }
+                                }
+                                Err(e) => (
+                                    false,
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "profile_short_id": short_id,
+                                        "profile_name": profile.name,
+                                        "error": e.to_string(),
+                                    }),
+                                ),
+                            };
+                            if let Ok(mut guard) = slots[i].lock() {
+                                *guard = Some(item);
+                            }
+                        }
+                    });
+                }
+            });
+
+            let mut profile_results = Vec::with_capacity(targets.len());
+            let mut any_failed = false;
+            for slot in slots {
+                if let Some((ok, val)) = slot.into_inner().ok().flatten() {
+                    if !ok {
+                        any_failed = true;
+                    }
+                    profile_results.push(val);
                 }
             }
 
@@ -3563,6 +3976,8 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                 serde_json::json!({
                     "ok": !any_failed,
                     "flow": flow_name,
+                    "concurrency": workers,
+                    "csv_rows": csv_rows.len(),
                     "results": profile_results,
                 })
             };

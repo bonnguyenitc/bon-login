@@ -59,6 +59,15 @@ pub struct AgentFlowsModalState {
     pub expanded_flow_name: Option<String>,
     pub save_name_input: Entity<InputState>,
     pub vars_input: Entity<InputState>,
+    pub csv_input: Entity<InputState>,
+    pub concurrency: usize,
+}
+
+#[derive(Clone)]
+pub struct SynchronizerModalState {
+    pub master_id: Option<String>,
+    pub follower_ids: std::collections::HashSet<String>,
+    pub auto_tile: bool,
 }
 
 /// Renders the active Popup Modal overlay
@@ -1474,32 +1483,35 @@ pub fn render_popup_modal(
             let usable_w = mon_w.max(500);
             let usable_h = mon_h.max(360);
             let target_count = app.running_targets_for_arrange().len();
-            let auto_n = target_count.max(1);
-            let auto_cols = (auto_n as f32).sqrt().ceil().max(1.0) as i32;
-            let auto_rows = ((auto_n as i32 + auto_cols - 1) / auto_cols).max(1);
-            let presets: Vec<(String, i32, i32)> = vec![
-                (
-                    format!("Auto Fit ({auto_n})"),
-                    (usable_w / auto_cols).max(500),
-                    (usable_h / auto_rows).max(360),
-                ),
-                ("2×1 Split".to_string(), (usable_w / 2).max(500), usable_h),
-                ("2×2 Grid".to_string(), (usable_w / 2).max(500), (usable_h / 2).max(360)),
-                ("3×2 Grid".to_string(), (usable_w / 3).max(500), (usable_h / 2).max(360)),
-                ("4×2 Grid".to_string(), (usable_w / 4).max(500), (usable_h / 2).max(360)),
-            ];
+            let presets =
+                BonLoginApp::arrange_presets_for_monitor(mon_w, mon_h, target_count);
             let cur_size_raw = app.arrange_size_input.read(cx).value().to_string();
+            let active_preset_idx = app
+                .arrange_preset_idx
+                .filter(|&idx| {
+                    presets
+                        .get(idx)
+                        .is_some_and(|(_, pw, ph)| format!("{pw},{ph}") == cur_size_raw.trim())
+                })
+                .or_else(|| {
+                    presets
+                        .iter()
+                        .position(|(_, pw, ph)| format!("{pw},{ph}") == cur_size_raw.trim())
+                });
             let fit_hint = if let Some((w, h)) = crate::launcher::parse_window_size(&cur_size_raw) {
-                let cw = w.clamp(500, usable_w);
-                let ch = h.clamp(360, usable_h);
-                let cols = ((usable_w + (cw / 2).min(16)) / cw).max(1);
-                let rows = ((usable_h + (ch / 2).min(16)) / ch).max(1);
+                let (cols, rows, cw, ch) = crate::launcher::compute_tile_grid_dims(
+                    usable_w,
+                    usable_h,
+                    w,
+                    h,
+                    target_count.max(1),
+                );
                 format!(
                     "Fits {cols} col(s) × {rows} row(s) ({cw}×{ch}px each) on Display {} ({mon_w}×{mon_h})",
                     sel_idx + 1
                 )
             } else {
-                "Enter Width,Height (min 500×360 on macOS Chromium)".to_string()
+                "Enter Width,Height (min 200×200, e.g. 486,474)".to_string()
             };
 
             v_flex()
@@ -1552,8 +1564,22 @@ pub fn render_popup_modal(
                                             SfSymbol::PC,
                                             idx + 1
                                         ))
-                                        .on_click(cx.listener(move |app, _, _, cx| {
+                                        .on_click(cx.listener(move |app, _, window, cx| {
                                             app.arrange_display_idx = idx;
+                                            let count = app.running_targets_for_arrange().len();
+                                            let disp_presets =
+                                                BonLoginApp::arrange_presets_for_monitor(
+                                                    dw, dh, count,
+                                                );
+                                            if let Some(p_idx) = app.arrange_preset_idx
+                                                && let Some((_, pw, ph)) = disp_presets.get(p_idx)
+                                            {
+                                                app.set_arrange_size_text(
+                                                    format!("{pw},{ph}"),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
                                             cx.notify();
                                         }))
                                 }),
@@ -1569,17 +1595,14 @@ pub fn render_popup_modal(
                             h_flex().w_full().gap_1p5().flex_wrap().children(
                                 presets.into_iter().enumerate().map(|(i, (lbl, pw, ph))| {
                                     let val_str = format!("{pw},{ph}");
-                                    let active = cur_size_raw.trim() == val_str;
+                                    let active = active_preset_idx == Some(i);
                                     Button::new(SharedString::from(format!("arr-preset-{i}")))
                                         .with_variant(BonTheme::toggle_pill(cx, active))
                                         .small()
                                         .label(format!("{lbl} ({pw}×{ph})"))
                                         .on_click(cx.listener(move |app, _, window, cx| {
+                                            app.arrange_preset_idx = Some(i);
                                             app.set_arrange_size_text(val_str.clone(), window, cx);
-                                            if !app.running_targets_for_arrange().is_empty() {
-                                                app.popup_modal = None;
-                                                app.arrange_open_browsers(cx);
-                                            }
                                         }))
                                 }),
                             ),
@@ -1619,14 +1642,12 @@ pub fn render_popup_modal(
                             Button::new("arr-apply")
                                 .with_variant(BonTheme::primary_cta(cx))
                                 .small()
-                                .disabled(target_count == 0)
                                 .label(if target_count > 0 {
                                     format!("Apply to {target_count} open browser(s)")
                                 } else {
-                                    "No open browsers".to_string()
+                                    "Save preset".to_string()
                                 })
                                 .on_click(cx.listener(|app, _, _, cx| {
-                                    app.popup_modal = None;
                                     app.arrange_open_browsers(cx);
                                 })),
                         ),
@@ -2456,11 +2477,58 @@ pub fn render_popup_modal(
                 .child(
                     v_flex()
                         .w_full()
-                        .gap_1()
-                        .child(field_label(
-                            "Variables {{var}} Override (key=value, comma-separated)",
-                        ))
-                        .child(Input::new(&af.vars_input)),
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .gap_1()
+                                .child(field_label(
+                                    "Variables {{var}} Override (key=value, comma-separated)",
+                                ))
+                                .child(Input::new(&af.vars_input)),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_end()
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .gap_1()
+                                        .child(field_label(
+                                            "Batch CSV Data File (optional: email,pass,profile...)",
+                                        ))
+                                        .child(Input::new(&af.csv_input)),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(field_label("Concurrency"))
+                                        .child(
+                                            h_flex().gap_1().children(
+                                                [1usize, 3, 5, 10].into_iter().map(|c| {
+                                                    let active = af.concurrency == c;
+                                                    Button::new(SharedString::from(format!(
+                                                        "flw-conc-{c}"
+                                                    )))
+                                                    .with_variant(BonTheme::toggle_pill(cx, active))
+                                                    .small()
+                                                    .label(format!("{c}×"))
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        if let Some(ActivePopupModal::AgentFlows(
+                                                            m,
+                                                        )) = app.popup_modal.as_mut()
+                                                        {
+                                                            m.concurrency = c;
+                                                            cx.notify();
+                                                        }
+                                                    }))
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                        ),
                 )
                 .child(
                     v_flex()
@@ -2737,6 +2805,291 @@ pub fn render_popup_modal(
                                         ))
                                 }))
                         })),
+                )
+        }
+
+        ActivePopupModal::Synchronizer(sync_st) => {
+            let live_sync = crate::launcher::current_synchronizer_status();
+            let running_profiles: Vec<(String, String, String, u16)> = app
+                .profiles
+                .iter()
+                .filter_map(|p| {
+                    if let Some(crate::models::ProfileStatus::Running(rt)) = app.statuses.get(&p.id)
+                    {
+                        Some((p.id.clone(), p.short_id(), p.name.clone(), rt.cdp_port))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let effective_master_id = sync_st
+                .master_id
+                .clone()
+                .filter(|mid| running_profiles.iter().any(|(id, _, _, _)| id == mid))
+                .or_else(|| running_profiles.first().map(|(id, _, _, _)| id.clone()));
+            let follower_count = running_profiles
+                .iter()
+                .filter(|(id, _, _, _)| {
+                    Some(id.as_str()) != effective_master_id.as_deref()
+                        && sync_st.follower_ids.contains(id)
+                })
+                .count();
+
+            v_flex()
+                .w(px(540.))
+                .p_5()
+                .gap_3p5()
+                .rounded_lg()
+                .bg(BonTheme::bg_elevated())
+                .border_1()
+                .border_color(BonTheme::border())
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_bold()
+                                        .text_color(BonTheme::text_primary())
+                                        .child(format!(
+                                            "{}  Multi-Profile Synchronizer (1-to-N)",
+                                            SfSymbol::LINK
+                                        )),
+                                )
+                                .children(live_sync.active.then(|| {
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(BonTheme::success_bg())
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::success())
+                                        .child(format!(
+                                            "LIVE • {} events",
+                                            live_sync.mirrored_events
+                                        ))
+                                })),
+                        )
+                        .child(
+                            Button::new("sync-modal-close")
+                                .ghost()
+                                .small()
+                                .label(SfSymbol::XMARK)
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.close_popup_modal(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(BonTheme::text_secondary())
+                        .child(
+                            "Mirror mouse clicks (viewport-scaled), wheel scrolling, keyboard typing, and URL navigation from 1 Master window to all Follower windows in real time.",
+                        ),
+                )
+                .child(if running_profiles.len() < 2 {
+                    v_flex()
+                        .w_full()
+                        .p_4()
+                        .gap_1p5()
+                        .rounded_md()
+                        .bg(BonTheme::bg_well())
+                        .border_1()
+                        .border_color(BonTheme::border())
+                        .items_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(BonTheme::warning())
+                                .child("Launch at least 2 profiles to start Synchronizer"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(BonTheme::text_secondary())
+                                .child(format!(
+                                    "Currently running: {} profile(s)",
+                                    running_profiles.len()
+                                )),
+                        )
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .w_full()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .gap_1p5()
+                                .child(field_label("1. Master Profile (you control this window)"))
+                                .child(
+                                    h_flex().w_full().gap_1p5().flex_wrap().children(
+                                        running_profiles.iter().map(|(id, sid, name, _)| {
+                                            let is_master =
+                                                effective_master_id.as_deref() == Some(id.as_str());
+                                            let id_click = id.clone();
+                                            Button::new(SharedString::from(format!(
+                                                "sync-master-{sid}"
+                                            )))
+                                            .with_variant(BonTheme::toggle_pill(cx, is_master))
+                                            .small()
+                                            .label(format!("{name} (#{sid})"))
+                                            .on_click(cx.listener(move |app, _, _, cx| {
+                                                if let Some(ActivePopupModal::Synchronizer(st)) =
+                                                    app.popup_modal.as_mut()
+                                                {
+                                                    st.master_id = Some(id_click.clone());
+                                                    st.follower_ids.remove(&id_click);
+                                                    cx.notify();
+                                                }
+                                            }))
+                                        }),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_semibold()
+                                        .text_color(BonTheme::text_secondary())
+                                        .child(format!(
+                                            "2. Follower Profiles ({follower_count} selected)"
+                                        )),
+                                )
+                                .child(
+                                    h_flex().w_full().gap_1p5().flex_wrap().children(
+                                        running_profiles
+                                            .iter()
+                                            .filter(|(id, _, _, _)| {
+                                                Some(id.as_str()) != effective_master_id.as_deref()
+                                            })
+                                            .map(|(id, sid, name, _)| {
+                                                let checked = sync_st.follower_ids.contains(id);
+                                                let id_toggle = id.clone();
+                                                Button::new(SharedString::from(format!(
+                                                    "sync-flw-{sid}"
+                                                )))
+                                                .with_variant(BonTheme::toggle_pill(cx, checked))
+                                                .small()
+                                                .label(if checked {
+                                                    format!(
+                                                        "{}  {name} (#{sid})",
+                                                        SfSymbol::CHECKMARK
+                                                    )
+                                                } else {
+                                                    format!("{name} (#{sid})")
+                                                })
+                                                .on_click(cx.listener(move |app, _, _, cx| {
+                                                    if let Some(ActivePopupModal::Synchronizer(
+                                                        st,
+                                                    )) = app.popup_modal.as_mut()
+                                                    {
+                                                        if !st.follower_ids.remove(&id_toggle) {
+                                                            st.follower_ids
+                                                                .insert(id_toggle.clone());
+                                                        }
+                                                        cx.notify();
+                                                    }
+                                                }))
+                                            }),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    Button::new("sync-auto-tile-toggle")
+                                        .with_variant(BonTheme::toggle_pill(
+                                            cx,
+                                            sync_st.auto_tile,
+                                        ))
+                                        .small()
+                                        .label(if sync_st.auto_tile {
+                                            format!(
+                                                "{}  Auto-tile windows side-by-side on start",
+                                                SfSymbol::CHECKMARK
+                                            )
+                                        } else {
+                                            "Auto-tile windows side-by-side on start".to_string()
+                                        })
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            if let Some(ActivePopupModal::Synchronizer(st)) =
+                                                app.popup_modal.as_mut()
+                                            {
+                                                st.auto_tile = !st.auto_tile;
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        )
+                        .into_any_element()
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(BonTheme::border())
+                        .justify_between()
+                        .items_center()
+                        .child(if live_sync.active {
+                            Button::new("sync-stop-live")
+                                .danger()
+                                .small()
+                                .label(format!(
+                                    "{}  Stop Live Sync (#{})",
+                                    SfSymbol::STOP_FILL,
+                                    live_sync.master_short_id
+                                ))
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    app.stop_synchronizer_ui(cx);
+                                }))
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("sync-cancel-btn")
+                                        .with_variant(BonTheme::row_action(cx))
+                                        .small()
+                                        .label("Close")
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.close_popup_modal(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("sync-start-btn")
+                                        .with_variant(BonTheme::primary_cta(cx))
+                                        .small()
+                                        .disabled(follower_count == 0)
+                                        .label(format!(
+                                            "{}  Start Sync (1 → {follower_count})",
+                                            SfSymbol::PLAY_FILL
+                                        ))
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.start_synchronizer_from_modal(cx);
+                                        })),
+                                ),
+                        ),
                 )
         }
     };

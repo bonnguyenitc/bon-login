@@ -811,7 +811,30 @@ pub fn render_edit_profile_view(
                                                 .flex_1()
                                                 .min_w_0()
                                                 .gap_1()
-                                                .child(field_label("Start URL(s) (comma/space for multi-tab)"))
+                                                .child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .justify_between()
+                                                        .items_center()
+                                                        .child(field_label("Start URL(s) (comma/space for multi-tab)"))
+                                                        .child(
+                                                            Button::new("btn-set-preflight-url")
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .label("🛡️ Local Preflight (0 MB)")
+                                                                .on_click(cx.listener(|app, _, window, cx| {
+                                                                    if let Some(m) = app.modal.as_mut() {
+                                                                        m.startup_url_input = cx.new(|cx| {
+                                                                            InputState::new(window, cx)
+                                                                                .placeholder("Start URL(s)")
+                                                                                .default_value("bon://preflight")
+                                                                        });
+                                                                        m.draft.profile.startup_url = "bon://preflight".to_string();
+                                                                        cx.notify();
+                                                                    }
+                                                                })),
+                                                        ),
+                                                )
                                                 .child(Input::new(&modal.startup_url_input)),
                                         )
                                         .child(

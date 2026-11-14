@@ -2344,11 +2344,16 @@ impl BonLoginApp {
         let vars_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Vars: key=val, pass=123 (optional)")
         });
+        let csv_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Path to .csv file (or leave empty)")
+        });
         self.popup_modal = Some(ActivePopupModal::AgentFlows(AgentFlowsModalState {
             target_id: profile_id,
             expanded_flow_name: None,
             save_name_input,
             vars_input,
+            csv_input,
+            concurrency: 3,
         }));
         cx.notify();
     }
@@ -2468,12 +2473,38 @@ impl BonLoginApp {
     }
 
     pub fn run_saved_flow_ui(&mut self, flow_name: &str, cx: &mut Context<Self>) {
-        let (flow_target_id, extra_vars) = match &self.popup_modal {
+        let (flow_target_id, extra_vars, csv_raw_input, concurrency) = match &self.popup_modal {
             Some(ActivePopupModal::AgentFlows(af)) => (
                 af.target_id.clone(),
                 crate::flows::parse_flow_vars_text(&af.vars_input.read(cx).value()),
+                af.csv_input.read(cx).value().trim().to_string(),
+                af.concurrency.clamp(1, 32),
             ),
-            _ => (None, std::collections::HashMap::new()),
+            _ => (None, std::collections::HashMap::new(), String::new(), 3),
+        };
+        let csv_rows = if !csv_raw_input.is_empty() {
+            let content = if std::path::Path::new(&csv_raw_input).is_file() {
+                match std::fs::read_to_string(&csv_raw_input) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.banner_message = Some(format!("Failed to read CSV file: {e}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else {
+                csv_raw_input
+            };
+            match crate::flows::parse_flow_csv_rows(&content) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    self.banner_message = Some(format!("Invalid CSV data: {e}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
         };
         let target_ids: Vec<String> = if let Some(pid) = &flow_target_id {
             vec![pid.clone()]
@@ -2498,17 +2529,20 @@ impl BonLoginApp {
         let flow_name_str = flow_name.to_string();
         self.popup_modal = None;
         self.banner_message = Some(format!(
-            "Running flow '{flow_name_str}' on {} profile(s)...",
-            targets.len()
+            "Running flow '{flow_name_str}' on {} profile(s) ({}× concurrency)...",
+            targets.len(),
+            concurrency.min(targets.len())
         ));
         cx.notify();
 
-        for prof in targets {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        for (idx, prof) in targets.into_iter().enumerate() {
             let pid = prof.id.clone();
             let pid_task = pid.clone();
             let prof_name = prof.name.clone();
             let fn_cl = flow_name_str.clone();
-            let vars_cl = extra_vars.clone();
+            let vars_cl =
+                crate::flows::resolve_profile_csv_vars(&prof, idx, &csv_rows, &extra_vars);
             let existing_ws = match self.statuses.get(&pid) {
                 Some(ProfileStatus::Starting) => continue,
                 Some(ProfileStatus::Running(info)) => Some(info.ws_url.clone()),
@@ -2524,7 +2558,9 @@ impl BonLoginApp {
             let db = self.db.clone();
             let sup = self.supervisor.clone();
             let root_for_flow = self.workspace_root.clone();
+            let sem_cl = sem.clone();
             let join_handle = tokio_handle.spawn(async move {
+                let _permit = sem_cl.acquire_owned().await?;
                 let ws_url = if let Some(ws) = existing_ws {
                     ws
                 } else {
@@ -2662,6 +2698,71 @@ impl BonLoginApp {
         cx.notify();
     }
 
+    pub fn arrange_presets_for_monitor(
+        mon_w: i32,
+        mon_h: i32,
+        target_count: usize,
+    ) -> Vec<(String, i32, i32)> {
+        let usable_w = mon_w.max(500);
+        let usable_h = mon_h.max(360);
+        let auto_n = target_count.max(1);
+        let (auto_w, auto_h) = crate::launcher::auto_fit_window_size(usable_w, usable_h, auto_n);
+        vec![
+            (format!("Auto Fit ({auto_n})"), auto_w, auto_h),
+            ("2×1 Split".to_string(), (usable_w / 2).max(200), usable_h),
+            (
+                "2×2 Grid".to_string(),
+                (usable_w / 2).max(200),
+                (usable_h / 2).max(180),
+            ),
+            (
+                "3×2 Grid".to_string(),
+                (usable_w / 3).max(200),
+                (usable_h / 2).max(180),
+            ),
+            (
+                "4×2 Grid".to_string(),
+                (usable_w / 4).max(200),
+                (usable_h / 2).max(180),
+            ),
+            ("3×1 Split".to_string(), (usable_w / 3).max(200), usable_h),
+            (
+                "3×3 Grid".to_string(),
+                (usable_w / 3).max(200),
+                (usable_h / 3).max(180),
+            ),
+            (
+                "4×3 Grid".to_string(),
+                (usable_w / 4).max(200),
+                (usable_h / 3).max(180),
+            ),
+        ]
+    }
+
+    pub fn open_arrange_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let disp_rects = crate::launcher::macos_active_display_rects();
+        let sel_idx = self
+            .saved_arrange_prefs
+            .display_idx
+            .min(disp_rects.len().saturating_sub(1));
+        let (_, _, mon_w, mon_h) = disp_rects
+            .get(sel_idx)
+            .copied()
+            .unwrap_or((0, 0, 1440, 900));
+        let count = self.running_targets_for_arrange().len();
+        let presets = Self::arrange_presets_for_monitor(mon_w, mon_h, count);
+        self.arrange_display_idx = sel_idx;
+        self.arrange_preset_idx = self.saved_arrange_prefs.preset_idx;
+        let size_str = self
+            .arrange_preset_idx
+            .and_then(|idx| presets.get(idx))
+            .map(|(_, pw, ph)| format!("{pw},{ph}"))
+            .unwrap_or_else(|| self.saved_arrange_prefs.custom_size.clone());
+        self.set_arrange_size_text(size_str, window, cx);
+        self.popup_modal = Some(super::ActivePopupModal::ArrangeWindows);
+        cx.notify();
+    }
+
     pub fn set_arrange_size_text(
         &mut self,
         text: String,
@@ -2674,31 +2775,32 @@ impl BonLoginApp {
     }
 
     pub fn running_targets_for_arrange(&self) -> Vec<(u16, String)> {
-        let use_checked = self.profiles.iter().any(|p| {
-            self.checked_profile_ids.contains(&p.id)
-                && matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_)))
-        });
-        self.profiles
-            .iter()
-            .filter(|p| !use_checked || self.checked_profile_ids.contains(&p.id))
-            .filter_map(|p| match self.statuses.get(&p.id) {
-                Some(ProfileStatus::Running(info)) => Some((info.cdp_port, info.ws_url.clone())),
-                _ => None,
-            })
-            .collect()
+        let visible = self.filtered_profile_indices_rc();
+        let mut seen = std::collections::HashSet::with_capacity(self.profiles.len());
+        let mut out = Vec::new();
+        for &idx in visible.iter() {
+            if let Some(p) = self.profiles.get(idx)
+                && let Some(ProfileStatus::Running(info)) = self.statuses.get(&p.id)
+                && seen.insert(p.id.as_str())
+            {
+                out.push((info.cdp_port, info.ws_url.clone()));
+            }
+        }
+        for p in &self.profiles {
+            if let Some(ProfileStatus::Running(info)) = self.statuses.get(&p.id)
+                && seen.insert(p.id.as_str())
+            {
+                out.push((info.cdp_port, info.ws_url.clone()));
+            }
+        }
+        out
     }
 
     pub fn arrange_open_browsers(&mut self, cx: &mut Context<Self>) {
-        let targets = self.running_targets_for_arrange();
-        if targets.is_empty() {
-            self.banner_message = Some("No open browsers to arrange".to_string());
-            cx.notify();
-            return;
-        }
         let raw_size = self.arrange_size_input.read(cx).value().to_string();
         let Some((win_w, win_h)) = crate::launcher::parse_window_size(&raw_size) else {
             self.banner_message =
-                Some("Invalid window size (use Width,Height e.g. 960,600)".to_string());
+                Some("Invalid window size (use Width,Height e.g. 487,474)".to_string());
             cx.notify();
             return;
         };
@@ -2712,8 +2814,39 @@ impl BonLoginApp {
             .get(disp_idx)
             .copied()
             .unwrap_or((0, 0, 1440, 900));
-        let tokio_handle = self.tokio_handle.clone();
+
+        let targets = self.running_targets_for_arrange();
+        let presets = Self::arrange_presets_for_monitor(mon_w, mon_h, targets.len());
+        let resolved_preset = self
+            .arrange_preset_idx
+            .filter(|&idx| {
+                presets
+                    .get(idx)
+                    .is_some_and(|(_, pw, ph)| format!("{pw},{ph}") == raw_size.trim())
+            })
+            .or_else(|| {
+                presets
+                    .iter()
+                    .position(|(_, pw, ph)| format!("{pw},{ph}") == raw_size.trim())
+            });
+        self.arrange_preset_idx = resolved_preset;
+        self.saved_arrange_prefs = super::ArrangePrefs {
+            display_idx: disp_idx,
+            preset_idx: resolved_preset,
+            custom_size: format!("{win_w},{win_h}"),
+        };
+        self.saved_arrange_prefs.save_in(&self.workspace_root);
+        self.popup_modal = None;
+
         let disp_num = disp_idx + 1;
+        if targets.is_empty() {
+            self.banner_message = Some(format!(
+                "Saved arrange size {win_w}×{win_h} on Display {disp_num}"
+            ));
+            cx.notify();
+            return;
+        }
+        let tokio_handle = self.tokio_handle.clone();
         cx.spawn(async move |this, cx| {
             let (ok_count, total, applied_w, applied_h) = tokio_handle
                 .spawn_blocking(move || {
@@ -4685,5 +4818,182 @@ impl BonLoginApp {
             return;
         };
         self.delete_profile(&id, window, cx);
+    }
+
+    pub fn open_synchronizer_modal(&mut self, cx: &mut Context<Self>) {
+        let live = crate::launcher::current_synchronizer_status();
+        let running_ids: Vec<String> = self
+            .profiles
+            .iter()
+            .filter_map(|p| {
+                matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_)))
+                    .then(|| p.id.clone())
+            })
+            .collect();
+        let master_id = if live.active {
+            self.profiles
+                .iter()
+                .find(|p| p.short_id() == live.master_short_id)
+                .map(|p| p.id.clone())
+                .or_else(|| running_ids.first().cloned())
+        } else {
+            self.selected_profile_id
+                .clone()
+                .filter(|id| running_ids.contains(id))
+                .or_else(|| {
+                    running_ids
+                        .iter()
+                        .find(|id| self.checked_profile_ids.contains(*id))
+                        .cloned()
+                })
+                .or_else(|| running_ids.first().cloned())
+        };
+        let mut follower_ids = HashSet::new();
+        for id in &running_ids {
+            if Some(id.as_str()) != master_id.as_deref() {
+                if self.checked_profile_ids.is_empty()
+                    || self.checked_profile_ids.contains(id)
+                    || follower_ids.is_empty()
+                {
+                    follower_ids.insert(id.clone());
+                }
+            }
+        }
+        self.popup_modal = Some(ActivePopupModal::Synchronizer(SynchronizerModalState {
+            master_id,
+            follower_ids,
+            auto_tile: true,
+        }));
+        cx.notify();
+    }
+
+    pub fn start_synchronizer_from_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(ActivePopupModal::Synchronizer(st)) = self.popup_modal.clone() else {
+            return;
+        };
+        let running_profiles: Vec<(Profile, crate::models::RuntimeInfo)> = self
+            .profiles
+            .iter()
+            .filter_map(|p| {
+                if let Some(ProfileStatus::Running(rt)) = self.statuses.get(&p.id) {
+                    Some((p.clone(), rt.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let Some((master_prof, master_rt)) = st
+            .master_id
+            .as_ref()
+            .and_then(|mid| running_profiles.iter().find(|(p, _)| &p.id == mid))
+            .or_else(|| running_profiles.first())
+            .cloned()
+        else {
+            self.banner_message = Some("No running Master profile available".to_string());
+            cx.notify();
+            return;
+        };
+        let follower_pairs: Vec<(Profile, crate::models::RuntimeInfo)> = running_profiles
+            .into_iter()
+            .filter(|(p, _)| p.id != master_prof.id && st.follower_ids.contains(&p.id))
+            .collect();
+        if follower_pairs.is_empty() {
+            self.banner_message =
+                Some("Select at least 1 running Follower profile".to_string());
+            cx.notify();
+            return;
+        }
+        let followers_for_sync: Vec<(String, u16)> = follower_pairs
+            .iter()
+            .map(|(p, rt)| (p.short_id(), rt.cdp_port))
+            .collect();
+        match crate::launcher::start_background_synchronizer(
+            master_prof.short_id(),
+            master_rt.cdp_port,
+            followers_for_sync,
+        ) {
+            Ok(sync_status) => {
+                if st.auto_tile {
+                    let mut tile_targets = vec![(master_rt.cdp_port, master_rt.ws_url.clone())];
+                    for (_, rt) in &follower_pairs {
+                        tile_targets.push((rt.cdp_port, rt.ws_url.clone()));
+                    }
+                    let disp_idx = self.arrange_display_idx;
+                    self.tokio_handle.spawn_blocking(move || {
+                        let mon_rect = crate::launcher::macos_display_rect(disp_idx);
+                        let (_, _, mw, mh) = mon_rect;
+                        let (aw, ah) =
+                            crate::launcher::auto_fit_window_size(mw, mh, tile_targets.len());
+                        let _ = crate::control::tile_window_targets(
+                            &tile_targets,
+                            mon_rect,
+                            aw,
+                            ah,
+                        );
+                    });
+                }
+                self.popup_modal = None;
+                self.banner_message = Some(format!(
+                    "Synchronizer active: Master '{}' (#{}) → {} follower(s)",
+                    master_prof.name,
+                    sync_status.master_short_id,
+                    sync_status.follower_short_ids.len()
+                ));
+            }
+            Err(e) => {
+                self.banner_message = Some(format!("Synchronizer error: {e}"));
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn stop_synchronizer_ui(&mut self, cx: &mut Context<Self>) {
+        let st = crate::launcher::stop_background_synchronizer();
+        self.popup_modal = None;
+        self.banner_message = Some(format!(
+            "Stopped Synchronizer ({} events mirrored)",
+            st.mirrored_events
+        ));
+        cx.notify();
+    }
+
+    pub fn open_profile_preflight(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let Some(ProfileStatus::Running(rt)) = self.statuses.get(profile_id).cloned() else {
+            self.banner_message = Some(format!("Profile '{}' is not running", prof.name));
+            cx.notify();
+            return;
+        };
+        let root_dir = self.workspace_root.clone();
+        let prof_name = prof.name.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let res = tokio_handle
+                .spawn_blocking(move || -> anyhow::Result<String> {
+                    let udir = crate::launcher::profile_user_data_dir_in(&root_dir, &prof.id)?;
+                    let url = crate::launcher::write_profile_preflight_card(&prof, &udir, None);
+                    crate::launcher::cdp_navigate_page(rt.cdp_port, &url)?;
+                    Ok(url)
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                match res {
+                    Ok(Ok(_)) => {
+                        app.banner_message =
+                            Some(format!("Opened Preflight Card in '{prof_name}'"));
+                    }
+                    Ok(Err(e)) => {
+                        app.banner_message = Some(format!("Preflight error: {e}"));
+                    }
+                    Err(e) => {
+                        app.banner_message = Some(format!("Preflight task error: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }

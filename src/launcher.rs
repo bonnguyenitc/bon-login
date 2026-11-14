@@ -12,7 +12,7 @@ use std::time::Duration;
 
 // Re-exports from extracted modules (callers still use crate::launcher::...)
 pub use crate::cookies::{NormalizedCookieBundle, parse_and_normalize_cookies, read_prelaunch_cookies_in, save_prelaunch_cookies_in};
-pub use crate::bookmarks::{read_profile_bookmarks_in, parse_bookmarks_editable, write_profile_bookmarks_checked_in, write_profile_bookmarks_items, ensure_profile_bookmarks};
+pub use crate::bookmarks::{read_profile_bookmarks_in, parse_bookmarks_editable, write_profile_bookmarks_checked_in, write_profile_bookmarks_items, ensure_profile_bookmarks, write_profile_preflight_card};
 pub use crate::archive::{export_profile_archive_zip_in, import_profile_archive_zip_in};
 
 
@@ -769,7 +769,18 @@ pub fn build_chromium_args_with_extensions(
     ]);
 
     for url in profile.startup_urls() {
-        args.push(url);
+        let resolved_url = if matches!(
+            url.to_ascii_lowercase().as_str(),
+            "bon://preflight" | "bon://start" | "preflight"
+        ) {
+            format!(
+                "file://{}",
+                user_data_dir.join("bon_preflight.html").to_string_lossy()
+            )
+        } else {
+            url
+        };
+        args.push(resolved_url);
     }
 
     args
@@ -1269,6 +1280,9 @@ pub(crate) async fn launch_profile_with_kernel_in(
         }
     };
 
+    #[cfg(target_os = "macos")]
+    let winbounds_dylib = ensure_macos_winbounds_dylib_in(root_dir);
+
     let active_port_file = user_data_dir.join("DevToolsActivePort");
     let _ = std::fs::remove_file(&active_port_file);
     let _ = std::fs::remove_file(runtime_file_path_in(root_dir, &profile.id));
@@ -1276,6 +1290,7 @@ pub(crate) async fn launch_profile_with_kernel_in(
     cleanup_stale_singleton_locks(&user_data_dir);
     let _ = profile_download_dir_in(root_dir, &profile.short_id());
     ensure_profile_bookmarks(profile, &user_data_dir);
+    let _ = write_profile_preflight_card(profile, &user_data_dir, newly_resolved_geo.as_ref());
     let ext_dirs = discover_unpacked_extensions_in(root_dir);
     let args = build_chromium_args_with_extensions(
         profile,
@@ -1306,12 +1321,16 @@ pub(crate) async fn launch_profile_with_kernel_in(
         }
     }
 
-    let mut child_guard = match Command::new(&kernel_path)
-        .args(&args)
+    let mut cmd = Command::new(&kernel_path);
+    cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    #[cfg(target_os = "macos")]
+    if let Some(ref dylib) = winbounds_dylib {
+        cmd.env("DYLD_INSERT_LIBRARIES", dylib);
+    }
+    let mut child_guard = match cmd.spawn()
     {
         Ok(c) => SpawnedChildGuard {
             child: Some(c),
@@ -1523,7 +1542,7 @@ pub fn parse_window_size(raw: &str) -> Option<(i32, i32)> {
     let mut parts = cleaned.split(',').filter(|s| !s.is_empty());
     let w: i32 = parts.next()?.parse().ok()?;
     let h: i32 = parts.next()?.parse().ok()?;
-    (w >= 200 && h >= 200).then_some((w.min(7680), h.min(4320)))
+    (w >= 200 && h >= 180).then_some((w.min(7680), h.min(4320)))
 }
 
 /// Queries macOS `NSScreen.screens` (`visibleFrame`, which excludes the macOS Menu Bar, Notch, and Dock)
@@ -1571,12 +1590,16 @@ pub fn macos_active_display_rects() -> Vec<(i32, i32, i32, i32)> {
         }
 
         unsafe {
+            let msg_ptr: unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+            ) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            let app_cls = objc_getClass(c"NSApplication".as_ptr());
+            if !app_cls.is_null() {
+                let _ = msg_ptr(app_cls, sel_registerName(c"sharedApplication".as_ptr()));
+            }
             let cls = objc_getClass(c"NSScreen".as_ptr());
             if !cls.is_null() {
-                let msg_ptr: unsafe extern "C" fn(
-                    *mut std::ffi::c_void,
-                    *mut std::ffi::c_void,
-                ) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
                 let msg_usize: unsafe extern "C" fn(
                     *mut std::ffi::c_void,
                     *mut std::ffi::c_void,
@@ -1651,6 +1674,156 @@ pub fn macos_display_rect(display_idx: usize) -> (i32, i32, i32, i32) {
     rects.get(idx).copied().unwrap_or((0, 25, 1920, 1055))
 }
 
+#[cfg(target_os = "macos")]
+fn ensure_macos_winbounds_dylib_in(root_dir: &Path) -> Option<PathBuf> {
+    const DYLIB_BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/libbon_winbounds.dylib"));
+    let kernels_dir = root_dir.join("kernels");
+    let _ = std::fs::create_dir_all(&kernels_dir);
+    let target = kernels_dir.join("libbon_winbounds_v2.dylib");
+    if let Ok(existing) = std::fs::read(&target)
+        && existing == DYLIB_BYTES
+    {
+        return Some(target);
+    }
+    let tmp = kernels_dir.join(format!(
+        ".libbon_winbounds.{}.{}.tmp",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).ok()?;
+        if f.write_all(DYLIB_BYTES).is_err() || f.sync_all().is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    }
+    if std::fs::rename(&tmp, &target).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        if !target.is_file() {
+            return None;
+        }
+    }
+    Some(target)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_post_winbounds_notification(
+    cdp_port: u16,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+    raise: bool,
+) {
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFNotificationCenterGetDistributedCenter() -> *mut std::ffi::c_void;
+        fn CFStringCreateWithBytes(
+            alloc: *const std::ffi::c_void,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external: u8,
+        ) -> *const std::ffi::c_void;
+        fn CFNotificationCenterPostNotificationWithOptions(
+            center: *mut std::ffi::c_void,
+            name: *const std::ffi::c_void,
+            object: *const std::ffi::c_void,
+            user_info: *const std::ffi::c_void,
+            options: usize,
+        );
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NOTIFICATION_DELIVER_IMMEDIATELY: usize = 1;
+
+    let name_bytes = b"com.bonlogin.winbounds";
+    let spec = format!(
+        "{cdp_port},{left},{top},{width},{height},{}",
+        if raise { 1 } else { 0 }
+    );
+    unsafe {
+        let center = CFNotificationCenterGetDistributedCenter();
+        if center.is_null() {
+            return;
+        }
+        let cf_name = CFStringCreateWithBytes(
+            std::ptr::null(),
+            name_bytes.as_ptr(),
+            name_bytes.len() as isize,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        let cf_obj = CFStringCreateWithBytes(
+            std::ptr::null(),
+            spec.as_ptr(),
+            spec.len() as isize,
+            K_CF_STRING_ENCODING_UTF8,
+            0,
+        );
+        if !cf_name.is_null() && !cf_obj.is_null() {
+            CFNotificationCenterPostNotificationWithOptions(
+                center,
+                cf_name,
+                cf_obj,
+                std::ptr::null(),
+                K_CF_NOTIFICATION_DELIVER_IMMEDIATELY,
+            );
+        }
+        if !cf_name.is_null() {
+            CFRelease(cf_name);
+        }
+        if !cf_obj.is_null() {
+            CFRelease(cf_obj);
+        }
+    }
+}
+
+/// Computes `(cols, rows, applied_w, applied_h)` for `count` windows inside `(work_w, work_h)`.
+pub fn compute_tile_grid_dims(
+    work_w: i32,
+    work_h: i32,
+    win_w: i32,
+    win_h: i32,
+    _count: usize,
+) -> (usize, usize, i32, i32) {
+    let usable_w = work_w.max(500);
+    let usable_h = work_h.max(360);
+    let w = win_w.clamp(200, usable_w);
+    let h = win_h.clamp(180, usable_h);
+    let cols = (usable_w / w).max(1) as usize;
+    let rows = (usable_h / h).max(1) as usize;
+    (cols, rows, w, h)
+}
+
+pub fn auto_fit_window_size(mon_w: i32, mon_h: i32, count: usize) -> (i32, i32) {
+    let usable_w = mon_w.max(500);
+    let usable_h = mon_h.max(360);
+    let n = count.max(1);
+    let max_cols = (usable_w / 200).max(1) as usize;
+    let max_rows = (usable_h / 180).max(1) as usize;
+    let landscape = usable_w >= usable_h;
+    let (cols, rows) = match n {
+        1 => (1, 1),
+        2 => if landscape { (2, 1) } else { (1, 2) },
+        3 | 4 => (2, 2),
+        5 | 6 => if landscape { (3, 2) } else { (2, 3) },
+        7 | 8 if landscape && usable_w / 4 >= 240 => (4, 2),
+        7..=9 => (3, 3),
+        _ => {
+            let aspect = (usable_w as f32 / usable_h as f32).clamp(0.75, 2.0);
+            let c = ((n as f32 * aspect).sqrt().ceil() as usize).clamp(1, max_cols);
+            let r = n.div_ceil(c).clamp(1, max_rows);
+            (c, r)
+        }
+    };
+    let cols = cols.min(max_cols) as i32;
+    let rows = rows.min(max_rows) as i32;
+    ((usable_w / cols).max(200), (usable_h / rows).max(180))
+}
+
 /// Computes `(left, top, width, height)` for `count` windows tiled inside a usable work-area
 /// `(work_x, work_y, work_w, work_h)` (already excluding the macOS menu bar and Dock).
 pub fn compute_tile_work_area_bounds(
@@ -1667,24 +1840,26 @@ pub fn compute_tile_work_area_bounds(
     }
     let usable_w = work_w.max(500);
     let usable_h = work_h.max(360);
-    // shortcut: Chromium macOS enforces ~500px minimum normal window width
-    let w = win_w.clamp(500, usable_w);
-    let h = win_h.clamp(360, usable_h);
-    // Add `(w / 2)` / `(h / 2)` tolerance so integer-divided grid presets (e.g. `2503 / 2 = 1251`)
-    // still fit the intended number of columns/rows without dropping to 1 col/row due to 1px remainder.
-    let cols = ((usable_w + (w / 2).min(16)) / w).max(1) as usize;
-    let rows = ((usable_h + (h / 2).min(16)) / h).max(1) as usize;
+    let (cols, rows, w, h) = compute_tile_grid_dims(usable_w, usable_h, win_w, win_h, count);
     let per_layer = (cols * rows).max(1);
 
     (0..count)
         .map(|i| {
-            let layer = (i / per_layer) as i32;
             let cell = i % per_layer;
             let col = (cell % cols) as i32;
             let row = (cell / cols) as i32;
-            let cascade = (layer * 24) % 120;
-            let left = (work_x + col * w + cascade).min(work_x + usable_w - w);
-            let top = (work_y + row * h + cascade).min(work_y + usable_h - h);
+            let base_left = if cols > 1 && (cols as i32) * w > usable_w {
+                work_x + (col * (usable_w - w)) / (cols as i32 - 1)
+            } else {
+                work_x + col * w
+            };
+            let base_top = if rows > 1 && (rows as i32) * h > usable_h {
+                work_y + (row * (usable_h - h)) / (rows as i32 - 1)
+            } else {
+                work_y + row * h
+            };
+            let left = base_left.min(work_x + usable_w - w);
+            let top = base_top.min(work_y + usable_h - h);
             (left, top, w, h)
         })
         .collect()
@@ -1915,6 +2090,7 @@ fn cdp_update_and_activate_window(
     cdp_port: u16,
     ws_url: &str,
     rect: Option<(i32, i32, i32, i32)>,
+    raise_macos: bool,
 ) -> Result<()> {
     let (target_id, _) = cdp_first_page_target(cdp_port)?;
     let mut cdp = CdpClient::connect(cdp_port, ws_url)?;
@@ -1963,9 +2139,17 @@ fn cdp_update_and_activate_window(
         "Target.activateTarget",
         serde_json::json!({ "targetId": target_id }),
     );
+
+    #[cfg(target_os = "macos")]
+    if let Some((left, top, width, height)) = rect {
+        macos_post_winbounds_notification(cdp_port, left, top, width, height, raise_macos);
+    } else if raise_macos {
+        macos_post_winbounds_notification(cdp_port, 0, 0, 0, 0, true);
+    }
     Ok(())
 }
 
+#[cfg(test)]
 pub fn cdp_set_window_bounds(
     cdp_port: u16,
     ws_url: &str,
@@ -1974,7 +2158,18 @@ pub fn cdp_set_window_bounds(
     width: i32,
     height: i32,
 ) -> Result<()> {
-    cdp_update_and_activate_window(cdp_port, ws_url, Some((left, top, width, height)))
+    cdp_update_and_activate_window(cdp_port, ws_url, Some((left, top, width, height)), true)
+}
+
+pub fn cdp_set_window_bounds_quiet(
+    cdp_port: u16,
+    ws_url: &str,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    cdp_update_and_activate_window(cdp_port, ws_url, Some((left, top, width, height)), false)
 }
 
 /// Brings a running Chromium window to the front on macOS (restores if minimized, activates CDP target, and raises PID).
@@ -1985,7 +2180,7 @@ pub fn cdp_focus_window_in(
     cdp_port: u16,
     ws_url: &str,
 ) -> Result<()> {
-    let cdp_res = cdp_update_and_activate_window(cdp_port, ws_url, None);
+    let cdp_res = cdp_update_and_activate_window(cdp_port, ws_url, None, true);
     #[cfg(target_os = "macos")]
     {
         let effective_pid = if pid > 0 {
@@ -2107,6 +2302,565 @@ pub fn cdp_capture_screenshot_in(
     };
     std::fs::write(&out_path, png_bytes)?;
     Ok(out_path)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Profile Synchronizer (1-to-N Live Input & Navigation Mirror via CDP)
+// ---------------------------------------------------------------------------
+
+const MASTER_SYNC_RECORDER_JS: &str = r#"(() => {
+  const st = window.__bonSyncState || (window.__bonSyncState = { q: [], hooked: false, lastUrl: location.href });
+  if (!st.hooked) {
+    st.hooked = true;
+    const push = (ev) => {
+      ev.vw = window.innerWidth || 1280;
+      ev.vh = window.innerHeight || 800;
+      if (st.q.length < 256) st.q.push(ev);
+    };
+    window.addEventListener('mousedown', (e) => {
+      if (!e.isTrusted) return;
+      push({ k: 'mouse', sub: 'down', x: Math.round(e.clientX), y: Math.round(e.clientY), b: e.button || 0, c: e.detail || 1, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+    }, true);
+    window.addEventListener('mouseup', (e) => {
+      if (!e.isTrusted) return;
+      push({ k: 'mouse', sub: 'up', x: Math.round(e.clientX), y: Math.round(e.clientY), b: e.button || 0, c: e.detail || 1, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+    }, true);
+    let wt = null, wx = 0, wy = 0, lx = 0, ly = 0;
+    window.addEventListener('wheel', (e) => {
+      if (!e.isTrusted) return;
+      wx += e.deltaX; wy += e.deltaY; lx = Math.round(e.clientX); ly = Math.round(e.clientY);
+      if (!wt) {
+        wt = setTimeout(() => {
+          push({ k: 'wheel', x: lx, y: ly, dx: Math.round(wx), dy: Math.round(wy) });
+          wx = 0; wy = 0; wt = null;
+        }, 45);
+      }
+    }, { capture: true, passive: true });
+    window.addEventListener('keydown', (e) => {
+      if (!e.isTrusted) return;
+      if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+      push({ k: 'key', sub: 'down', key: e.key || '', code: e.code || '', vk: e.keyCode || 0, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+    }, true);
+    window.addEventListener('keyup', (e) => {
+      if (!e.isTrusted) return;
+      if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
+      push({ k: 'key', sub: 'up', key: e.key || '', code: e.code || '', vk: e.keyCode || 0, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+    }, true);
+  }
+  if (location.href !== st.lastUrl) {
+    st.lastUrl = location.href;
+  }
+  const out = st.q.splice(0, 64);
+  return JSON.stringify({ url: location.href, vw: window.innerWidth || 1280, vh: window.innerHeight || 800, events: out });
+})()"#;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SyncCapturedEvent {
+    #[serde(rename = "k", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub sub: String,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub vw: i32,
+    #[serde(default)]
+    pub vh: i32,
+    #[serde(rename = "b", default)]
+    pub button: u8,
+    #[serde(rename = "c", default)]
+    pub click_count: i32,
+    #[serde(rename = "m", default)]
+    pub modifiers: i32,
+    #[serde(default)]
+    pub dx: i32,
+    #[serde(default)]
+    pub dy: i32,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub vk: i32,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SyncMasterPollBatch {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub vw: i32,
+    #[serde(default)]
+    pub vh: i32,
+    #[serde(default)]
+    pub events: Vec<SyncCapturedEvent>,
+}
+
+impl CdpClient {
+    /// Evaluates `expression` inside an isolated utility world (`Page.createIsolatedWorld`) on the page
+    /// without calling `Runtime.enable`, preserving 100% C++ stealth on BrowserScan & CreepJS.
+    fn eval_in_isolated_world(
+        &mut self,
+        target_id: &str,
+        cached_ctx_id: &mut Option<i64>,
+        expression: &str,
+    ) -> Result<String> {
+        for attempt in 0..2 {
+            let ctx_id = match *cached_ctx_id {
+                Some(id) => id,
+                None => {
+                    let world = self.call(
+                        "Page.createIsolatedWorld",
+                        serde_json::json!({
+                            "frameId": target_id,
+                            "worldName": "__bon_sync",
+                            "grantUniveralAccess": true
+                        }),
+                    )?;
+                    let id = world
+                        .get("result")
+                        .and_then(|r| r.get("executionContextId"))
+                        .and_then(|v| v.as_i64())
+                        .context("Missing executionContextId from Page.createIsolatedWorld")?;
+                    *cached_ctx_id = Some(id);
+                    id
+                }
+            };
+            match self.call(
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": expression,
+                    "contextId": ctx_id,
+                    "returnByValue": true
+                }),
+            ) {
+                Ok(resp) => {
+                    if resp
+                        .get("result")
+                        .and_then(|r| r.get("exceptionDetails"))
+                        .is_some()
+                        && attempt == 0
+                    {
+                        *cached_ctx_id = None;
+                        continue;
+                    }
+                    let s = resp
+                        .get("result")
+                        .and_then(|r| r.get("result"))
+                        .and_then(|r| r.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}")
+                        .to_string();
+                    return Ok(s);
+                }
+                Err(_) if attempt == 0 => {
+                    *cached_ctx_id = None;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        bail!("Failed to evaluate in isolated world")
+    }
+}
+
+/// Scales `(x, y)` from Master viewport `(src_vw, src_vh)` to Follower viewport `(dst_vw, dst_vh)`.
+pub fn scale_sync_point(
+    x: i32,
+    y: i32,
+    src_vw: i32,
+    src_vh: i32,
+    dst_vw: i32,
+    dst_vh: i32,
+) -> (i32, i32) {
+    let sw = src_vw.max(1) as f64;
+    let sh = src_vh.max(1) as f64;
+    let dw = dst_vw.max(1) as f64;
+    let dh = dst_vh.max(1) as f64;
+    let sx = ((x as f64 / sw) * dw).round() as i32;
+    let sy = ((y as f64 / sh) * dh).round() as i32;
+    (sx.clamp(0, dst_vw.max(1)), sy.clamp(0, dst_vh.max(1)))
+}
+
+/// Dispatches a batch of `SyncCapturedEvent`s (and optional URL navigation) onto a Follower CDP client.
+fn dispatch_sync_batch_to_follower(
+    cdp: &mut CdpClient,
+    follower_target_id: &str,
+    follower_ctx_id: &mut Option<i64>,
+    follower_vw_vh: &mut (i32, i32),
+    nav_url: Option<&str>,
+    events: &[SyncCapturedEvent],
+) -> Result<usize> {
+    let mut applied = 0usize;
+    if let Some(u) = nav_url.filter(|u| {
+        !u.is_empty() && !u.starts_with("devtools://") && !u.starts_with("chrome-extension://")
+    }) {
+        cdp.call("Page.navigate", serde_json::json!({ "url": u }))?;
+        *follower_ctx_id = None;
+        applied += 1;
+    }
+    if events.is_empty() {
+        return Ok(applied);
+    }
+    if follower_vw_vh.0 <= 0
+        && let Ok(raw_vp) = cdp.eval_in_isolated_world(
+            follower_target_id,
+            follower_ctx_id,
+            "JSON.stringify([window.innerWidth||1280, window.innerHeight||800])",
+        )
+        && let Ok(pair) = serde_json::from_str::<[i32; 2]>(&raw_vp)
+    {
+        *follower_vw_vh = (pair[0].max(200), pair[1].max(200));
+    }
+    let (dst_vw, dst_vh) = if follower_vw_vh.0 > 0 {
+        *follower_vw_vh
+    } else {
+        (1280, 800)
+    };
+
+    for ev in events {
+        match ev.kind.as_str() {
+            "mouse" => {
+                let (tx, ty) = scale_sync_point(ev.x, ev.y, ev.vw, ev.vh, dst_vw, dst_vh);
+                let (btn_name, buttons_mask) = match ev.button {
+                    2 => ("right", 2),
+                    1 => ("middle", 4),
+                    _ => ("left", 1),
+                };
+                if ev.sub == "down" {
+                    let _ = cdp.call(
+                        "Input.dispatchMouseEvent",
+                        serde_json::json!({
+                            "type": "mouseMoved",
+                            "x": tx,
+                            "y": ty,
+                            "modifiers": ev.modifiers,
+                        }),
+                    );
+                    cdp.call(
+                        "Input.dispatchMouseEvent",
+                        serde_json::json!({
+                            "type": "mousePressed",
+                            "x": tx,
+                            "y": ty,
+                            "button": btn_name,
+                            "buttons": buttons_mask,
+                            "clickCount": ev.click_count.max(1),
+                            "modifiers": ev.modifiers,
+                        }),
+                    )?;
+                } else {
+                    cdp.call(
+                        "Input.dispatchMouseEvent",
+                        serde_json::json!({
+                            "type": "mouseReleased",
+                            "x": tx,
+                            "y": ty,
+                            "button": btn_name,
+                            "buttons": 0,
+                            "clickCount": ev.click_count.max(1),
+                            "modifiers": ev.modifiers,
+                        }),
+                    )?;
+                }
+                applied += 1;
+            }
+            "wheel" => {
+                let (tx, ty) = scale_sync_point(ev.x, ev.y, ev.vw, ev.vh, dst_vw, dst_vh);
+                cdp.call(
+                    "Input.dispatchMouseEvent",
+                    serde_json::json!({
+                        "type": "mouseWheel",
+                        "x": tx,
+                        "y": ty,
+                        "deltaX": ev.dx,
+                        "deltaY": ev.dy,
+                    }),
+                )?;
+                applied += 1;
+            }
+            "key" => {
+                let is_down = ev.sub == "down";
+                let is_printable = ev.key.chars().count() == 1 && (ev.modifiers & !8) == 0;
+                let params = if is_down {
+                    if ev.key == "Enter" {
+                        serde_json::json!({
+                            "type": "rawKeyDown",
+                            "key": "Enter",
+                            "code": "Enter",
+                            "windowsVirtualKeyCode": 13,
+                            "nativeVirtualKeyCode": 13,
+                            "text": "\r",
+                            "unmodifiedText": "\r",
+                            "modifiers": ev.modifiers,
+                        })
+                    } else if is_printable {
+                        serde_json::json!({
+                            "type": "keyDown",
+                            "key": ev.key,
+                            "code": ev.code,
+                            "windowsVirtualKeyCode": ev.vk,
+                            "nativeVirtualKeyCode": ev.vk,
+                            "text": ev.key,
+                            "unmodifiedText": ev.key,
+                            "modifiers": ev.modifiers,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "rawKeyDown",
+                            "key": ev.key,
+                            "code": ev.code,
+                            "windowsVirtualKeyCode": ev.vk,
+                            "nativeVirtualKeyCode": ev.vk,
+                            "modifiers": ev.modifiers,
+                        })
+                    }
+                } else {
+                    serde_json::json!({
+                        "type": "keyUp",
+                        "key": ev.key,
+                        "code": ev.code,
+                        "windowsVirtualKeyCode": ev.vk,
+                        "nativeVirtualKeyCode": ev.vk,
+                        "modifiers": ev.modifiers,
+                    })
+                };
+                cdp.call("Input.dispatchKeyEvent", params)?;
+                applied += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(applied)
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SynchronizerStatus {
+    pub active: bool,
+    pub master_short_id: String,
+    pub master_port: u16,
+    pub follower_short_ids: Vec<String>,
+    pub follower_ports: Vec<u16>,
+    pub mirrored_events: u64,
+}
+
+struct FollowerConnState {
+    port: u16,
+    target_id: String,
+    ctx_id: Option<i64>,
+    vw_vh: (i32, i32),
+    client: Option<CdpClient>,
+}
+
+/// Runs the blocking Master -> Followers CDP input & navigation synchronizer loop until `stop_flag` is set
+/// or the Master browser window closes. Returns the total count of mirrored events.
+pub fn run_multi_profile_synchronizer_loop(
+    master_port: u16,
+    follower_ports: &[u16],
+    stop_flag: &std::sync::atomic::AtomicBool,
+    event_counter: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<u64> {
+    use std::sync::atomic::Ordering;
+    if follower_ports.is_empty() {
+        bail!("At least 1 follower profile is required for Synchronizer");
+    }
+    let (mut master_target_id, mut master_cdp) = CdpClient::connect_first_page(master_port)
+        .with_context(|| format!("Failed to connect to Master profile CDP port {master_port}"))?;
+    let mut master_ctx_id: Option<i64> = None;
+    let mut last_master_url = String::new();
+
+    let mut followers: Vec<FollowerConnState> = follower_ports
+        .iter()
+        .copied()
+        .filter(|&p| p != master_port)
+        .map(|port| {
+            let (tid, client) = match CdpClient::connect_first_page(port) {
+                Ok((t, c)) => (t, Some(c)),
+                Err(_) => (String::new(), None),
+            };
+            FollowerConnState {
+                port,
+                target_id: tid,
+                ctx_id: None,
+                vw_vh: (0, 0),
+                client,
+            }
+        })
+        .collect();
+    if followers.is_empty() {
+        bail!("Follower ports cannot be identical to Master port {master_port}");
+    }
+
+    let mut total_mirrored = 0u64;
+    let mut consecutive_master_errs = 0u8;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        let poll_res = master_cdp.eval_in_isolated_world(
+            &master_target_id,
+            &mut master_ctx_id,
+            MASTER_SYNC_RECORDER_JS,
+        );
+        let raw_json = match poll_res {
+            Ok(s) => {
+                consecutive_master_errs = 0;
+                s
+            }
+            Err(_) => {
+                consecutive_master_errs = consecutive_master_errs.saturating_add(1);
+                if consecutive_master_errs > 12 {
+                    break;
+                }
+                if let Ok((new_tid, new_c)) = CdpClient::connect_first_page(master_port) {
+                    master_target_id = new_tid;
+                    master_cdp = new_c;
+                    master_ctx_id = None;
+                }
+                std::thread::sleep(Duration::from_millis(80));
+                continue;
+            }
+        };
+
+        let batch: SyncMasterPollBatch = serde_json::from_str(&raw_json).unwrap_or_default();
+        let nav_url = if !batch.url.is_empty() && batch.url != last_master_url {
+            let changed = !last_master_url.is_empty();
+            last_master_url = batch.url.clone();
+            changed.then_some(last_master_url.as_str())
+        } else {
+            None
+        };
+
+        if nav_url.is_some() || !batch.events.is_empty() {
+            for fl in &mut followers {
+                if fl.client.is_none()
+                    && let Ok((tid, c)) = CdpClient::connect_first_page(fl.port)
+                {
+                    fl.target_id = tid;
+                    fl.client = Some(c);
+                    fl.ctx_id = None;
+                    fl.vw_vh = (0, 0);
+                }
+                if let Some(cdp) = &mut fl.client {
+                    match dispatch_sync_batch_to_follower(
+                        cdp,
+                        &fl.target_id,
+                        &mut fl.ctx_id,
+                        &mut fl.vw_vh,
+                        nav_url,
+                        &batch.events,
+                    ) {
+                        Ok(n) => {
+                            total_mirrored = total_mirrored.saturating_add(n as u64);
+                            if let Some(cnt) = event_counter {
+                                cnt.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => {
+                            fl.client = None;
+                            fl.ctx_id = None;
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(35));
+    }
+    Ok(total_mirrored)
+}
+
+struct ActiveSyncGuard {
+    status: SynchronizerStatus,
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+static ACTIVE_SYNCHRONIZER: std::sync::LazyLock<std::sync::Mutex<Option<ActiveSyncGuard>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Starts or replaces the background Multi-Profile Synchronizer session in-process.
+pub fn start_background_synchronizer(
+    master_short_id: String,
+    master_port: u16,
+    followers: Vec<(String, u16)>,
+) -> Result<SynchronizerStatus> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let dedup_followers: Vec<(String, u16)> = followers
+        .into_iter()
+        .filter(|(_, port)| *port != master_port)
+        .collect();
+    if dedup_followers.is_empty() {
+        bail!("Select at least 1 running Follower profile different from Master");
+    }
+    stop_background_synchronizer();
+
+    let stop_flag = std::sync::Arc::new(AtomicBool::new(false));
+    let event_counter = std::sync::Arc::new(AtomicU64::new(0));
+    let follower_short_ids: Vec<String> = dedup_followers.iter().map(|(id, _)| id.clone()).collect();
+    let follower_ports: Vec<u16> = dedup_followers.iter().map(|(_, p)| *p).collect();
+
+    let status = SynchronizerStatus {
+        active: true,
+        master_short_id,
+        master_port,
+        follower_short_ids,
+        follower_ports: follower_ports.clone(),
+        mirrored_events: 0,
+    };
+    let flag_thread = stop_flag.clone();
+    let cnt_thread = event_counter.clone();
+    std::thread::spawn(move || {
+        let _ = run_multi_profile_synchronizer_loop(
+            master_port,
+            &follower_ports,
+            &flag_thread,
+            Some(&cnt_thread),
+        );
+        flag_thread.store(true, Ordering::Relaxed);
+    });
+
+    if let Ok(mut guard) = ACTIVE_SYNCHRONIZER.lock() {
+        *guard = Some(ActiveSyncGuard {
+            status: status.clone(),
+            stop_flag,
+            event_counter,
+        });
+    }
+    Ok(status)
+}
+
+/// Stops the active background Multi-Profile Synchronizer session, if any.
+pub fn stop_background_synchronizer() -> SynchronizerStatus {
+    use std::sync::atomic::Ordering;
+    if let Ok(mut guard) = ACTIVE_SYNCHRONIZER.lock()
+        && let Some(active) = guard.take()
+    {
+        active.stop_flag.store(true, Ordering::Relaxed);
+        let mut st = active.status;
+        st.active = false;
+        st.mirrored_events = active.event_counter.load(Ordering::Relaxed);
+        return st;
+    }
+    SynchronizerStatus::default()
+}
+
+/// Queries the current state of the in-process Multi-Profile Synchronizer.
+pub fn current_synchronizer_status() -> SynchronizerStatus {
+    use std::sync::atomic::Ordering;
+    if let Ok(mut guard) = ACTIVE_SYNCHRONIZER.lock() {
+        if let Some(active) = guard.as_ref() {
+            if active.stop_flag.load(Ordering::Relaxed) {
+                let mut st = active.status.clone();
+                st.active = false;
+                st.mirrored_events = active.event_counter.load(Ordering::Relaxed);
+                *guard = None;
+                return st;
+            }
+            let mut st = active.status.clone();
+            st.mirrored_events = active.event_counter.load(Ordering::Relaxed);
+            return st;
+        }
+    }
+    SynchronizerStatus::default()
 }
 
 /// Returns true when an `agent-browser` command failed due to an unattached/stale CDP session
@@ -3367,8 +4121,8 @@ mod tests {
         assert_eq!(bounds[1], (960, 25, 960, 500));
         assert_eq!(bounds[2], (0, 525, 960, 500));
         assert_eq!(bounds[3], (960, 525, 960, 500));
-        // 5th window cascades on second layer (+24px offset)
-        assert_eq!(bounds[4], (24, 49, 960, 500));
+        // 5th window snaps cleanly to exact grid slot (0, 0) without crooked diagonal offset
+        assert_eq!(bounds[4], (0, 25, 960, 500));
 
         // Work-area tiling (already accounts for macOS menu bar y=30 and left Dock x=57)
         // must start directly at `(work_x, work_y)` without adding a fake +25px menu bar offset!
@@ -3377,6 +4131,81 @@ mod tests {
         assert_eq!(work_2x2[1], (1308, 30, 1251, 525));
         assert_eq!(work_2x2[2], (57, 555, 1251, 525));
         assert_eq!(work_2x2[3], (1308, 555, 1251, 525));
+
+        // Laptop work-area (`1463×949`) with 6 windows (`Auto Fit (6)` = `487×474`) and 8 windows (`4×2` = `365×474`)
+        // must tile side-by-side with zero overlap (`49`, `536`, `1023`).
+        let laptop_3x2 = compute_tile_work_area_bounds(49, 33, 1463, 949, 487, 474, 6);
+        assert_eq!(laptop_3x2.len(), 6);
+        assert_eq!(laptop_3x2[0], (49, 33, 487, 474));
+        assert_eq!(laptop_3x2[1], (536, 33, 487, 474));
+        assert_eq!(laptop_3x2[2], (1023, 33, 487, 474));
+        assert_eq!(laptop_3x2[3], (49, 507, 487, 474));
+        assert_eq!(laptop_3x2[4], (536, 507, 487, 474));
+        assert_eq!(laptop_3x2[5], (1023, 507, 487, 474));
+
+        let laptop_4x2 = compute_tile_work_area_bounds(49, 33, 1463, 949, 365, 474, 8);
+        assert_eq!(laptop_4x2[0], (49, 33, 365, 474));
+        assert_eq!(laptop_4x2[1], (414, 33, 365, 474));
+        assert_eq!(laptop_4x2[2], (779, 33, 365, 474));
+        assert_eq!(laptop_4x2[3], (1144, 33, 365, 474));
+
+        // Exhaustive invariant check across counts 1..=25 and all presets / custom sizes:
+        // 1) All windows stay strictly inside `(work_x..work_x+work_w, work_y..work_y+work_h)`
+        // 2) Within each layer (`per_layer` cells), NO two windows ever overlap (`0px` overlap)
+        // 3) Overflow windows (`i >= per_layer`) snap to exact `(left, top, w, h)` of `i % per_layer`
+        for &(wx, wy, ww, wh) in &[(56, 33, 1456, 949), (0, 25, 1920, 1055), (57, 30, 2503, 1050)] {
+            for count in 1..=25 {
+                let (aw, ah) = auto_fit_window_size(ww, wh, count);
+                let placements = compute_tile_work_area_bounds(wx, wy, ww, wh, aw, ah, count);
+                let (cols, rows, _, _) = compute_tile_grid_dims(ww, wh, aw, ah, count);
+                let per_layer = cols * rows;
+                assert!(per_layer >= count.min(((ww / 200) * (wh / 180)) as usize));
+                for (i, &(l, t, w, h)) in placements.iter().enumerate() {
+                    assert!(l >= wx && l + w <= wx + ww);
+                    assert!(t >= wy && t + h <= wy + wh);
+                    if i >= per_layer {
+                        assert_eq!(placements[i], placements[i % per_layer]);
+                    }
+                }
+                let layer0 = &placements[..count.min(per_layer)];
+                for a in 0..layer0.len() {
+                    for b in (a + 1)..layer0.len() {
+                        let (al, at, aw, ah) = layer0[a];
+                        let (bl, bt, bw, bh) = layer0[b];
+                        let sep = al + aw <= bl || bl + bw <= al || at + ah <= bt || bt + bh <= at;
+                        assert!(sep, "overlap for count={count}: {:?} vs {:?}", layer0[a], layer0[b]);
+                    }
+                }
+            }
+            // Custom size slightly over half-screen (`735×480` on `1456×949`) must NOT overlap!
+            let custom = compute_tile_work_area_bounds(wx, wy, ww, wh, 735, 480, 6);
+            let (cc, cr, _, _) = compute_tile_grid_dims(ww, wh, 735, 480, 6);
+            let c_layer = &custom[..6.min(cc * cr)];
+            for a in 0..c_layer.len() {
+                for b in (a + 1)..c_layer.len() {
+                    let (al, at, aw, ah) = c_layer[a];
+                    let (bl, bt, bw, bh) = c_layer[b];
+                    assert!(al + aw <= bl || bl + bw <= al || at + ah <= bt || bt + bh <= at);
+                }
+            }
+        }
+
+        let tmp_prefs_dir = std::env::temp_dir().join(format!(
+            "bonlogin-arr-prefs-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::create_dir_all(&tmp_prefs_dir);
+        let saved = crate::ui::ArrangePrefs {
+            display_idx: 0,
+            preset_idx: Some(4),
+            custom_size: "365,474".to_string(),
+        };
+        saved.save_in(&tmp_prefs_dir);
+        let loaded = crate::ui::ArrangePrefs::load_in(&tmp_prefs_dir);
+        assert_eq!(loaded.preset_idx, Some(4));
+        assert_eq!(loaded.custom_size, "365,474");
+        let _ = std::fs::remove_dir_all(&tmp_prefs_dir);
 
         // macOS active display enumeration must return non-empty global work-area rects
         let displays = macos_active_display_rects();
@@ -3862,12 +4691,19 @@ mod tests {
             "",
         ));
         assert_eq!(code_rot_502, 502);
-        assert_eq!(crate::control::CONTROL_HTTP_ENDPOINTS.len(), 12);
+        assert_eq!(crate::control::CONTROL_HTTP_ENDPOINTS.len(), 16);
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"GET /flows"));
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /profiles/:id/totp"));
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /profiles/:id/screenshot"));
+        assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /profiles/:id/preflight"));
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /profiles/:id/flow/:flow_name"));
-
+        assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"GET /synchronizer"));
+        assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /synchronizer/start"));
+        assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /synchronizer/stop"));
+        let (code_sync, body_sync) =
+            rt.block_on(handle_control_http_request_in(&tmp, "GET", "/synchronizer", ""));
+        assert_eq!(code_sync, 200);
+        assert!(body_sync.contains("\"synchronizer\""));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -5036,6 +5872,169 @@ mod tests {
             .is_err(),
             "from_step > flow.steps.len() must return Err instead of succeeding with 0 steps"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_multi_profile_synchronizer_scales_and_mirrors_events() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        assert_eq!(scale_sync_point(500, 400, 1000, 800, 1920, 1080), (960, 540));
+        assert_eq!(scale_sync_point(-10, 9999, 1000, 800, 1280, 720), (0, 720));
+
+        fn spawn_mock_cdp(is_master: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log_cl = log.clone();
+            std::thread::spawn(move || {
+                let mut poll_count = 0usize;
+                for stream in listener.incoming().flatten() {
+                    let mut s = stream;
+                    let mut buf = [0u8; 1024];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.starts_with("GET /json/list") {
+                        let body = format!(
+                            r#"[{{"id":"f1","type":"page","url":"https://example.com","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/f1"}}]"#
+                        );
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                    } else if req.contains("Upgrade: websocket") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                        );
+                        while let Ok(h) = {
+                            let mut b = [0u8; 2];
+                            s.read_exact(&mut b).map(|_| b)
+                        } {
+                            let len0 = (h[1] & 0x7f) as usize;
+                            let len = if len0 == 126 {
+                                let mut ext = [0u8; 2];
+                                if s.read_exact(&mut ext).is_err() {
+                                    break;
+                                }
+                                u16::from_be_bytes(ext) as usize
+                            } else {
+                                len0
+                            };
+                            let mut mask = [0u8; 4];
+                            if s.read_exact(&mut mask).is_err() {
+                                break;
+                            }
+                            let mut payload = vec![0u8; len];
+                            if s.read_exact(&mut payload).is_err() {
+                                break;
+                            }
+                            for (i, b) in payload.iter_mut().enumerate() {
+                                *b ^= mask[i & 3];
+                            }
+                            let msg: serde_json::Value =
+                                serde_json::from_slice(&payload).unwrap_or_default();
+                            let id = msg["id"].as_u64().unwrap_or(1);
+                            let method = msg["method"].as_str().unwrap_or("").to_string();
+                            log_cl.lock().unwrap().push(method.clone());
+                            let reply = if method == "Page.createIsolatedWorld" {
+                                serde_json::json!({"id": id, "result": {"executionContextId": 77}})
+                            } else if method == "Runtime.evaluate" {
+                                let val_str = if is_master {
+                                    poll_count += 1;
+                                    if poll_count == 1 {
+                                        r#"{"url":"https://example.com/a","vw":1000,"vh":800,"events":[{"k":"mouse","sub":"down","x":500,"y":400,"vw":1000,"vh":800,"b":0,"c":1,"m":0},{"k":"key","sub":"down","key":"a","code":"KeyA","vk":65,"m":0}]}"#
+                                    } else {
+                                        r#"{"url":"https://example.com/b","vw":1000,"vh":800,"events":[]}"#
+                                    }
+                                } else {
+                                    "[2000,1600]"
+                                };
+                                serde_json::json!({"id": id, "result": {"result": {"type": "string", "value": val_str}}})
+                            } else {
+                                serde_json::json!({"id": id, "result": {}})
+                            };
+                            let r_bytes = reply.to_string().into_bytes();
+                            let mut frame = if r_bytes.len() < 126 {
+                                vec![0x81, r_bytes.len() as u8]
+                            } else {
+                                let l = (r_bytes.len() as u16).to_be_bytes();
+                                vec![0x81, 126, l[0], l[1]]
+                            };
+                            frame.extend_from_slice(&r_bytes);
+                            if s.write_all(&frame).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            (port, log)
+        }
+
+        let (m_port, m_log) = spawn_mock_cdp(true);
+        let (f_port, f_log) = spawn_mock_cdp(false);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            stop_bg.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mirrored =
+            run_multi_profile_synchronizer_loop(m_port, &[f_port], &stop, None).unwrap();
+        assert!(mirrored >= 3, "expected mouse + key + url navigation mirrored, got {mirrored}");
+        let master_methods = m_log.lock().unwrap().clone();
+        let follower_methods = f_log.lock().unwrap().clone();
+        assert!(!master_methods.iter().any(|m| m == "Runtime.enable"));
+        assert!(!follower_methods.iter().any(|m| m == "Runtime.enable"));
+        assert!(follower_methods.iter().any(|m| m == "Input.dispatchMouseEvent"));
+        assert!(follower_methods.iter().any(|m| m == "Input.dispatchKeyEvent"));
+        assert!(follower_methods.iter().any(|m| m == "Page.navigate"));
+    }
+
+    #[test]
+    fn test_flow_csv_variables_and_preflight_card_generation() {
+        let csv_raw = "profile,email,pass\nShop Beta,beta@example.com,\"p@ss,2\"\nShop Alpha,alpha@example.com,pass1\n";
+        let rows = crate::flows::parse_flow_csv_rows(csv_raw).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let p_alpha = Profile::new_default("Shop Alpha", PlatformType::MacOS);
+        let p_gamma = Profile::new_default("Shop Gamma", PlatformType::Windows);
+        let mut base = std::collections::HashMap::new();
+        base.insert("site".to_string(), "tiktok.com".to_string());
+
+        // Matches by profile name ("Shop Alpha" is row index 1)
+        let v_alpha = crate::flows::resolve_profile_csv_vars(&p_alpha, 0, &rows, &base);
+        assert_eq!(v_alpha.get("email").map(String::as_str), Some("alpha@example.com"));
+        assert_eq!(v_alpha.get("pass").map(String::as_str), Some("pass1"));
+        assert_eq!(v_alpha.get("site").map(String::as_str), Some("tiktok.com"));
+
+        // Falls back to index modulo row count when profile name isn't in CSV
+        let v_gamma = crate::flows::resolve_profile_csv_vars(&p_gamma, 0, &rows, &base);
+        assert_eq!(v_gamma.get("email").map(String::as_str), Some("beta@example.com"));
+        assert_eq!(v_gamma.get("pass").map(String::as_str), Some("p@ss,2"));
+
+        // Preflight card generation & bon://preflight startup URL resolution
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-preflight-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let mut pre_prof = Profile::new_default("Preflight <Test>", PlatformType::MacOS);
+        pre_prof.startup_url = "bon://preflight".to_string();
+        let udir = profile_user_data_dir_in(&tmp, &pre_prof.id).unwrap();
+        let file_url = write_profile_preflight_card(&pre_prof, &udir, None);
+        assert!(file_url.starts_with("file://") && file_url.ends_with("/bon_preflight.html"));
+        let html = std::fs::read_to_string(udir.join("bon_preflight.html")).unwrap();
+        assert!(html.contains("Preflight &lt;Test&gt;"));
+        assert!(html.contains("disable_non_proxied_udp"));
+
+        let args = build_chromium_args_with_extensions(&pre_prof, None, &udir, None, &[]);
+        assert_eq!(args.last().map(String::as_str), Some(file_url.as_str()));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

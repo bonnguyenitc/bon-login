@@ -1271,6 +1271,111 @@ pub fn parse_flow_vars_text(raw: &str) -> std::collections::HashMap<String, Stri
     map
 }
 
+/// Parses a CSV or TSV table (header row + data rows) into `Vec<HashMap<String, String>>` for batch AgentFlow runs.
+pub fn parse_flow_csv_rows(raw_csv: &str) -> Result<Vec<std::collections::HashMap<String, String>>> {
+    fn split_csv_line(line: &str, delim: char) -> Vec<String> {
+        let mut cols = Vec::new();
+        let mut cur = String::new();
+        let mut in_q = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_q {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        cur.push('"');
+                        let _ = chars.next();
+                    } else {
+                        in_q = false;
+                    }
+                } else {
+                    cur.push(c);
+                }
+            } else if c == '"' {
+                in_q = true;
+            } else if c == delim {
+                cols.push(std::mem::take(&mut cur).trim().to_string());
+            } else {
+                cur.push(c);
+            }
+        }
+        cols.push(cur.trim().to_string());
+        cols
+    }
+
+    let lines: Vec<&str> = raw_csv
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() < 2 {
+        bail!("CSV requires a header row and at least 1 data row");
+    }
+    let delim = if lines[0].contains('\t') { '\t' } else { ',' };
+    let headers: Vec<String> = split_csv_line(lines[0], delim)
+        .into_iter()
+        .map(|h| h.trim_start_matches('\u{feff}').trim().to_string())
+        .collect();
+    if headers.iter().all(String::is_empty) {
+        bail!("CSV header row is empty");
+    }
+    let mut out = Vec::with_capacity(lines.len() - 1);
+    for row_line in &lines[1..] {
+        let vals = split_csv_line(row_line, delim);
+        if vals.iter().all(String::is_empty) {
+            continue;
+        }
+        let mut map = std::collections::HashMap::new();
+        for (idx, h) in headers.iter().enumerate() {
+            if !h.is_empty() {
+                map.insert(h.clone(), vals.get(idx).cloned().unwrap_or_default());
+            }
+        }
+        out.push(map);
+    }
+    if out.is_empty() {
+        bail!("CSV contains 0 non-empty data rows");
+    }
+    Ok(out)
+}
+
+/// Matches a `Profile` to its corresponding CSV row (by `profile`/`name`/`id`/`short_id` column if present,
+/// otherwise by `target_index` modulo row count) and merges `base_vars` overrides on top.
+pub fn resolve_profile_csv_vars(
+    profile: &Profile,
+    target_index: usize,
+    csv_rows: &[std::collections::HashMap<String, String>],
+    base_vars: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = std::collections::HashMap::new();
+    if !csv_rows.is_empty() {
+        let sid = profile.short_id();
+        let bon_sid = format!("bon_{sid}");
+        let matched_row = csv_rows
+            .iter()
+            .find(|row| {
+                row.iter().any(|(k, v)| {
+                    matches!(
+                        k.to_ascii_lowercase().as_str(),
+                        "profile" | "profile_id" | "short_id" | "id" | "name" | "profile_name"
+                    ) && (v.eq_ignore_ascii_case(&profile.name)
+                        || v.eq_ignore_ascii_case(&profile.id)
+                        || v.eq_ignore_ascii_case(&sid)
+                        || v.eq_ignore_ascii_case(&bon_sid))
+                })
+            })
+            .or_else(|| csv_rows.get(target_index % csv_rows.len()));
+        if let Some(r) = matched_row {
+            for (k, v) in r {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for (k, v) in base_vars {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
 pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

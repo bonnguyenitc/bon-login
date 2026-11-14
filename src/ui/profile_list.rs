@@ -622,6 +622,7 @@ pub fn render_profile_table(
                                 let pid_type = prof.id.clone();
                                 let pid_shot = prof.id.clone();
                                 let pid_focus = prof.id.clone();
+                                let pid_pre = prof.id.clone();
                                 let is_prof_running =
                                     matches!(statuses.get(&prof.id), Some(ProfileStatus::Running(_)));
                                 let has_proxy_rot = prof
@@ -668,6 +669,18 @@ pub fn render_profile_table(
                                                         app.capture_profile_screenshot(
                                                             &pid_shot, cx,
                                                         );
+                                                    }))
+                                            }))
+                                            .children(is_prof_running.then(|| {
+                                                Button::new("drawer-preflight")
+                                                    .with_variant(BonTheme::outline_blue(cx))
+                                                    .xsmall()
+                                                    .label(format!(
+                                                        "{} Preflight",
+                                                        SfSymbol::CHECKMARK_SHIELD
+                                                    ))
+                                                    .on_click(cx.listener(move |app, _, _, cx| {
+                                                        app.open_profile_preflight(&pid_pre, cx);
                                                     }))
                                             }))
                                             .children(has_proxy_rot.then(|| {

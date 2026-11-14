@@ -415,6 +415,30 @@ impl Render for BonLoginApp {
                                             }))
                                     })
                                     .child({
+                                        let sync_st =
+                                            crate::launcher::current_synchronizer_status();
+                                        let lbl = if sync_st.active {
+                                            format!(
+                                                "{}  Sync #{}→{}",
+                                                SfSymbol::LINK,
+                                                sync_st.master_short_id,
+                                                sync_st.follower_short_ids.len()
+                                            )
+                                        } else {
+                                            format!("{}  Sync", SfSymbol::LINK)
+                                        };
+                                        Button::new("top-open-synchronizer")
+                                            .with_variant(BonTheme::toggle_pill(
+                                                cx,
+                                                sync_st.active,
+                                            ))
+                                            .small()
+                                            .label(lbl)
+                                            .on_click(cx.listener(|app, _, _, cx| {
+                                                app.open_synchronizer_modal(cx);
+                                            }))
+                                    })
+                                    .child({
                                         let running_total = self
                                             .statuses
                                             .values()
@@ -429,10 +453,8 @@ impl Render for BonLoginApp {
                                             .with_variant(BonTheme::row_action(cx))
                                             .small()
                                             .label(label)
-                                            .on_click(cx.listener(|app, _, _, cx| {
-                                                app.popup_modal =
-                                                    Some(ActivePopupModal::ArrangeWindows);
-                                                cx.notify();
+                                            .on_click(cx.listener(|app, _, window, cx| {
+                                                app.open_arrange_modal(window, cx);
                                             }))
                                     })
                                     .child(
@@ -906,6 +928,7 @@ impl Render for BonLoginApp {
                                                         let app_arr = app_entity.clone();
                                                         let app_clip = app_entity.clone();
                                                         let app_totp = app_entity.clone();
+                                                        let app_sync = app_entity.clone();
                                                         let has_running = checked_running_count > 0;
                                                         Button::new("batch-run-flow-btn")
                                                             .with_variant(BonTheme::outline_blue(
@@ -924,6 +947,7 @@ impl Render for BonLoginApp {
                                                                     let ar = app_arr.clone();
                                                                     let cl = app_clip.clone();
                                                                     let tp = app_totp.clone();
+                                                                    let sy = app_sync.clone();
                                                                     menu.min_w(px(210.))
                                                                         .item(
                                                                             PopupMenuItem::new(
@@ -968,6 +992,22 @@ impl Render for BonLoginApp {
                                                                                             ActivePopupModal::ArrangeWindows,
                                                                                         );
                                                                                         cx.notify();
+                                                                                    });
+                                                                                },
+                                                                            ),
+                                                                        )
+                                                                        .item(
+                                                                            PopupMenuItem::new(
+                                                                                format!(
+                                                                                    "{}   Synchronizer (1-to-N Input)…",
+                                                                                    SfSymbol::LINK
+                                                                                ),
+                                                                            )
+                                                                            .disabled(!has_running)
+                                                                            .on_click(
+                                                                                move |_, _, cx| {
+                                                                                    sy.update(cx, |app, cx| {
+                                                                                        app.open_synchronizer_modal(cx);
                                                                                     });
                                                                                 },
                                                                             ),

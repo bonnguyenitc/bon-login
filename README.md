@@ -11,6 +11,7 @@
     <a href="#cli-reference">CLI Reference</a> •
     <a href="#local-http-control-api">HTTP API</a> •
     <a href="#agent-flow-playbooks">Agent Flows</a> •
+    <a href="#roadmap">Roadmap</a> •
     <a href="LICENSE">License</a>
   </p>
 </div>
@@ -228,8 +229,13 @@ bon-login totp <id|name> [--type]
 # Capture a zero-leak PNG screenshot via CDP Page.captureScreenshot
 bon-login screenshot <id|name> [--out <file.png>]
 
+# Generate (and optionally open) a zero-bandwidth local Stealth & Proxy Health Preflight Card
+bon-login preflight <id|name|--group <g>|--all> [--open]
 # Broadcast URL navigation, human typing, or per-profile 2FA across running browsers
 bon-login broadcast <open|type|totp> [value] [--group <group>]
+
+# Live 1-to-N Multi-Profile Synchronizer (mouse, wheel, keyboard, and URL navigation)
+bon-login synchronizer <master_id|name> [follower1,follower2...|--group <g>] [--tile] [--duration <secs>]
 ```
 
 ### Profile Lifecycle Management (`bon-login profile ...`)
@@ -329,11 +335,11 @@ bon-login flow save login_playbook "TikTok US 01" \
   --var email="alice@example.com" \
   --var password="SuperSecret123"
 
-# 3. Replay the flow across any profile or group with custom variables
+# 3. Replay the flow across any profile or group with custom variables, CSV data, & concurrency
 bon-login flow run login_playbook --group "TikTok" \
+  --csv accounts.csv --concurrency 5 \
   --var email="bob@example.com" \
   --var password="OtherPassword456"
-
 # 4. Self-heal a broken step if the website layout changes
 bon-login flow heal login_playbook 2 "TikTok US 01" click @e9
 
@@ -361,9 +367,12 @@ Toggle **`🔌 Local API`** in the top header bar or run `bon-login serve [--por
 | `POST /profiles/<id\|name>/type` | Human-type raw request body into the active browser input |
 | `POST /profiles/<id\|name>/totp` | Generate and human-type the profile's 6-digit 2FA TOTP code |
 | `POST /profiles/<id\|name>/screenshot` | Capture a PNG screenshot and return its file path |
+| `POST /profiles/<id\|name>/preflight` | Generate local Stealth & Proxy Preflight Card HTML and navigate if running |
 | `POST /profiles/<id\|name>/flow/<flow_name>` | Launch/attach profile and replay saved Agent Flow (JSON `{"vars":{...}}` or `k=v` body) |
 | `POST /arrange` | Tile all running browser windows (optional body `"960,600"`) |
-
+| `GET /synchronizer` | Query active 1-to-N Multi-Profile Synchronizer status & mirrored event count |
+| `POST /synchronizer/start` | Start background Synchronizer (`{"master": "<id>", "followers": ["<id2>"]}`) |
+| `POST /synchronizer/stop` | Stop active background Synchronizer session |
 ```bash
 # Example: Launch a profile and type its 2FA code via cURL / n8n / Python
 curl -X POST http://127.0.0.1:19820/profiles/a1b2c3d4/launch
@@ -395,6 +404,21 @@ All application data is stored locally under `~/Library/Application Support/com.
 # SQLite CRUD, Cookie Parser, CRX3 Key Extraction, AgentFlow Locators, HTTP API, E2E Launch)
 cargo test --bin bon-login
 ```
+
+---
+
+## Roadmap
+
+High-leverage operator & stealth automation features planned and delivered under the Ponytail zero-bloat philosophy:
+
+| # | Feature | Status | Description |
+| :-: | :--- | :---: | :--- |
+| **1** | **Multi-Profile Synchronizer (1-to-N Live Input Mirror)** | ✅ **Done** | Real-time Master → Follower mirroring of mouse clicks (viewport-scaled), wheel scrolling, keyboard typing (`Input.dispatchKeyEvent`), and URL navigation across running profiles (`bon-login synchronizer <master> [followers...]`, `POST /synchronizer/*`, and Desktop UI `🔗 Sync` controls). |
+| **2** | **Paste as Human Typing + Auto-2FA Broadcast** | ✅ **Done** | Bypass anti-bot clipboard paste listeners via character-by-character CDP keystroke dispatch and 1-click RFC 6238 TOTP typing (`bon-login type`, `bon-login totp --type`, `bon-login broadcast`). |
+| **3** | **Smart Cookie Robot / 1-Click Warm-up** | ✅ **Done** | Automated multi-domain browsing and human scrolling to warm up fresh cookie stores before sensitive logins (`bon-login profile warmup`). |
+| **4** | **Profile Storage Cleaner & Disk Quota** | ✅ **Done** | Strip Chromium shader/code/crashpad caches while preserving 100% of Cookies, LocalStorage, and IndexedDB (`bon-login profile clean-cache`). |
+| **5** | **Batch AgentFlow Runner + CSV Data Variables (`--csv`, `--concurrency N`)** | ✅ **Done** | Execute parameterized `AgentFlow` playbooks across 50+ profiles with per-row CSV credentials (`{{email}}`, `{{pass}}`, matched by profile or index) and bounded worker concurrency (`bon-login flow run ... --csv <file> --concurrency <n>` & UI). |
+| **6** | **Stealth & Proxy Health Preflight Card (Local Start Page)** | ✅ **Done** | Zero-bandwidth local diagnostic start page (`bon://preflight`, `bon-login preflight`, `POST /profiles/:id/preflight`, and UI `🛡️ Preflight`) showing live Exit IP, Timezone/Locale coherence, WebRTC/DNS lock status, Seed/GPU summary, and quick bookmarks. |
 
 ---
 
