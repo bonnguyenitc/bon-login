@@ -6,16 +6,63 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::sync::LazyLock;
 
+const FALLBACK_CHROME_VERSION: &str = "148.0.7778.215";
+
 static EXT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    let version = chrome_prod_version();
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(30))
         .tcp_nodelay(true)
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        .user_agent(format!(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+        ))
         .build()
         .expect("Failed to initialize EXT_CLIENT")
 });
+
+fn chrome_version_in(label: &str) -> Option<&str> {
+    let b = label.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut dots = 0u8;
+        let mut saw_digit = false;
+        while i < b.len() {
+            if b[i].is_ascii_digit() {
+                saw_digit = true;
+                i += 1;
+            } else if b[i] == b'.' && saw_digit {
+                dots += 1;
+                saw_digit = false;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if dots == 3 && saw_digit {
+            return Some(&label[start..i]);
+        }
+    }
+    None
+}
+
+fn chrome_prod_version() -> String {
+    crate::launcher::locate_chromium_kernel()
+        .and_then(|k| chrome_version_in(&k.version_label).map(str::to_string))
+        .unwrap_or_else(|| FALLBACK_CHROME_VERSION.to_string())
+}
+
+fn crx_update_url(store_id: &str, prod_version: &str) -> String {
+    format!(
+        "https://clients2.google.com/service/update2/crx?response=redirect&prodversion={prod_version}&acceptformat=crx2,crx3&x=id%3D{store_id}%26uc"
+    )
+}
 
 /// Computes SHA-256 via macOS CommonCrypto for Chrome 32-char extension IDs (`a-p`).
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -196,6 +243,15 @@ const BON_EXT_SHIM_JS: &str = r#"/* __BON_EXT_SHIM__ */
       tabs[0] &&
       typeof tabs[0].url === 'string' &&
       tabs[0].url.startsWith('chrome-extension://');
+    const oneWebTab = (allTabs) => {
+      const webTabs = (allTabs || []).filter(t => t && t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('devtools://'));
+      return webTabs.length === 1 ? webTabs[0] : null;
+    };
+    const normalActiveQuery = (queryInfo) => {
+      const webInfo = Object.assign({}, queryInfo, { active: true, windowType: 'normal' });
+      delete webInfo.currentWindow;
+      return webInfo;
+    };
 
     ch.tabs.query = function(queryInfo, callback) {
       if (!queryInfo || !queryInfo.active) {
@@ -204,26 +260,18 @@ const BON_EXT_SHIM_JS: &str = r#"/* __BON_EXT_SHIM__ */
       if (callback) {
         return origQuery(queryInfo, (tabs) => {
           if (!isSelfExtOnly(tabs)) return callback(tabs);
-          const allInfo = Object.assign({}, queryInfo);
-          delete allInfo.active;
-          origQuery(allInfo, (allTabs) => {
-            const webTabs = (allTabs || []).filter(t => t && t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('devtools://'));
-            if (webTabs.length > 0) {
-              return callback([Object.assign({}, webTabs[webTabs.length - 1], { active: true })]);
-            }
+          origQuery(normalActiveQuery(queryInfo), (allTabs) => {
+            const web = oneWebTab(allTabs);
+            if (web) return callback([Object.assign({}, web, { active: true })]);
             callback(tabs);
           });
         });
       }
       return origQuery(queryInfo).then(async (tabs) => {
         if (!isSelfExtOnly(tabs)) return tabs;
-        const allInfo = Object.assign({}, queryInfo);
-        delete allInfo.active;
-        const allTabs = await origQuery(allInfo);
-        const webTabs = (allTabs || []).filter(t => t && t.url && !t.url.startsWith('chrome-extension://') && !t.url.startsWith('devtools://'));
-        if (webTabs.length > 0) {
-          return [Object.assign({}, webTabs[webTabs.length - 1], { active: true })];
-        }
+        const allTabs = await origQuery(normalActiveQuery(queryInfo));
+        const web = oneWebTab(allTabs);
+        if (web) return [Object.assign({}, web, { active: true })];
         return tabs;
       });
     };
@@ -299,12 +347,19 @@ const BON_EXT_SHIM_JS: &str = r#"/* __BON_EXT_SHIM__ */
 })();
 "#;
 
-fn inject_html_shim_recursive(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn inject_html_shim_recursive(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
     };
-    for entry in entries.flatten() {
+    let mut ok = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            ok = false;
+            continue;
+        };
         let Ok(ft) = entry.file_type() else {
+            ok = false;
             continue;
         };
         if ft.is_symlink() {
@@ -312,48 +367,155 @@ fn inject_html_shim_recursive(dir: &Path) {
         }
         let p = entry.path();
         if ft.is_dir() {
-            inject_html_shim_recursive(&p);
+            if !inject_html_shim_recursive(&p) {
+                ok = false;
+            }
         } else if ft.is_file()
             && p.extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("html"))
-            && let Ok(html) = std::fs::read_to_string(&p)
-            && !html.contains("__bon_ext_shim.js")
         {
-            let tag = r#"<script src="/__bon_ext_shim.js"></script>"#;
-            let patched = if let Some(idx) = html.to_ascii_lowercase().find("<head>") {
-                let split_at = idx + "<head>".len();
-                format!("{}{}{}", &html[..split_at], tag, &html[split_at..])
-            } else {
-                format!("{tag}{html}")
-            };
-            let _ = std::fs::write(&p, patched);
+            match std::fs::read_to_string(&p) {
+                Ok(html) if !html.contains("__bon_ext_shim.js") => {
+                    let tag = r#"<script src="/__bon_ext_shim.js"></script>"#;
+                    let patched = if let Some(idx) = html.to_ascii_lowercase().find("<head>") {
+                        let split_at = idx + "<head>".len();
+                        format!("{}{}{}", &html[..split_at], tag, &html[split_at..])
+                    } else {
+                        format!("{tag}{html}")
+                    };
+                    if replace_file_atomically(&p, patched.as_bytes()).is_err() {
+                        ok = false;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => ok = false,
+            }
         }
     }
+    ok
+}
+
+fn replace_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp_path = path.with_file_name(format!(
+        ".{name}.bon-tmp-{}-{}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+fn extension_script_file(ext_dir: &Path, rel_js: &str) -> Option<PathBuf> {
+    let rel = rel_js.trim().trim_start_matches('/');
+    if rel.is_empty() || rel.contains("..") {
+        return None;
+    }
+    let cand = ext_dir.join(rel);
+    let meta = std::fs::symlink_metadata(&cand).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let canon_root = ext_dir.canonicalize().ok()?;
+    let canon_cand = cand.canonicalize().ok()?;
+    if !canon_cand.starts_with(&canon_root) {
+        return None;
+    }
+    Some(canon_cand)
 }
 
 fn prepend_js_shim_if_needed(ext_dir: &Path, rel_js: &str) {
-    let rel = rel_js.trim().trim_start_matches('/');
-    if rel.is_empty() || rel.contains("..") {
-        return;
-    }
-    let cand = ext_dir.join(rel);
-    let Ok(meta) = std::fs::symlink_metadata(&cand) else {
+    let Some(path) = extension_script_file(ext_dir, rel_js) else {
         return;
     };
-    if !meta.file_type().is_file() {
-        return;
-    }
-    let (Ok(canon_root), Ok(canon_cand)) = (ext_dir.canonicalize(), cand.canonicalize()) else {
-        return;
-    };
-    if !canon_cand.starts_with(&canon_root) {
-        return;
-    }
-    if let Ok(raw) = std::fs::read_to_string(&canon_cand)
+    if let Ok(raw) = std::fs::read_to_string(&path)
         && !raw.contains("__BON_EXT_SHIM__")
     {
-        let _ = std::fs::write(&canon_cand, format!("{BON_EXT_SHIM_JS}\n{raw}"));
+        let _ = replace_file_atomically(&path, format!("{BON_EXT_SHIM_JS}\n{raw}").as_bytes());
+    }
+}
+
+fn starts_with_prefix(file: &mut impl std::io::Read, prefix: &[u8]) -> std::io::Result<bool> {
+    if prefix.is_empty() {
+        return Ok(true);
+    }
+    let mut head = vec![0u8; prefix.len()];
+    match std::io::Read::read_exact(file, &mut head) {
+        Ok(()) => Ok(head == prefix),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn strip_js_shim_if_present(ext_dir: &Path, rel_js: &str) {
+    let Some(path) = extension_script_file(ext_dir, rel_js) else {
+        return;
+    };
+    let prefix = format!("{BON_EXT_SHIM_JS}\n");
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return;
+    };
+    if !starts_with_prefix(&mut file, prefix.as_bytes()).unwrap_or(false) {
+        return;
+    }
+    let mut rest = Vec::new();
+    if std::io::Read::read_to_end(&mut file, &mut rest).is_err() {
+        return;
+    }
+    drop(file);
+    let _ = replace_file_atomically(&path, &rest);
+}
+
+fn module_service_worker_rel(ext_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(ext_dir.join("manifest.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let bg = val.get("background")?;
+    if bg.get("type").and_then(|v| v.as_str()) != Some("module") {
+        return None;
+    }
+    bg.get("service_worker")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn html_settled_path(ext_dir: &Path) -> PathBuf {
+    ext_dir.join("__bon_html_settled")
+}
+
+/// First launch patches once. Later launches only peel a module-worker shim,
+/// and skip HTML once a finished walk has written the marker.
+fn settle_unpacked_extension(ext_dir: &Path, ext_id: &str) {
+    if !ext_dir.join("__bon_ext_shim.js").is_file() {
+        patch_unpacked_extension_for_agent(ext_dir, ext_id, None);
+        return;
+    }
+    if let Some(sw) = module_service_worker_rel(ext_dir) {
+        strip_js_shim_if_present(ext_dir, &sw);
+    }
+    let marker = html_settled_path(ext_dir);
+    if marker.is_file() {
+        return;
+    }
+    if inject_html_shim_recursive(ext_dir) {
+        let _ = replace_file_atomically(&marker, b"1");
     }
 }
 
@@ -378,6 +540,7 @@ pub fn patch_unpacked_extension_for_agent(
     let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
         return;
     };
+    let _ = std::fs::remove_file(html_settled_path(ext_dir));
     let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return;
     };
@@ -403,58 +566,55 @@ pub fn patch_unpacked_extension_for_agent(
         );
     }
 
-    let mv = obj
-        .get("manifest_version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3);
-    if mv >= 3 {
-        let mut hosts: Vec<String> = obj
-            .get("host_permissions")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(ToString::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(opt_arr) = obj
-            .get("optional_host_permissions")
-            .and_then(|v| v.as_array())
-        {
-            for item in opt_arr.iter().filter_map(|x| x.as_str()) {
-                if !hosts.iter().any(|h| h == item) {
-                    hosts.push(item.to_string());
-                }
-            }
-        }
-        if !hosts.is_empty() && !hosts.iter().any(|h| h == "<all_urls>") {
-            hosts.push("<all_urls>".to_string());
-        }
-        if !hosts.is_empty() {
-            obj.insert(
-                "host_permissions".to_string(),
-                serde_json::Value::Array(
-                    hosts.into_iter().map(serde_json::Value::String).collect(),
-                ),
-            );
+    let module_worker = obj
+        .get("background")
+        .and_then(|bg| bg.get("type"))
+        .and_then(|v| v.as_str())
+        == Some("module");
+    let service_worker = obj
+        .get("background")
+        .and_then(|bg| bg.get("service_worker"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let classic_scripts: Vec<String> = obj
+        .get("background")
+        .and_then(|bg| bg.get("scripts"))
+        .and_then(|v| v.as_array())
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(sw) = service_worker {
+        if module_worker {
+            strip_js_shim_if_present(ext_dir, &sw);
+        } else {
+            prepend_js_shim_if_needed(ext_dir, &sw);
         }
     }
-
-    if let Some(bg) = obj.get("background") {
-        if let Some(sw) = bg.get("service_worker").and_then(|v| v.as_str()) {
-            prepend_js_shim_if_needed(ext_dir, sw);
-        }
-        if let Some(scripts) = bg.get("scripts").and_then(|v| v.as_array()) {
-            for s in scripts.iter().filter_map(|v| v.as_str()) {
-                prepend_js_shim_if_needed(ext_dir, s);
-            }
-        }
+    for script in classic_scripts {
+        prepend_js_shim_if_needed(ext_dir, &script);
     }
 
-    let _ = std::fs::write(ext_dir.join("__bon_ext_shim.js"), BON_EXT_SHIM_JS);
-    inject_html_shim_recursive(ext_dir);
-    if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-        let _ = std::fs::write(&manifest_path, pretty);
+    let html_ok = inject_html_shim_recursive(ext_dir);
+    let Ok(pretty) = serde_json::to_string_pretty(&val) else {
+        return;
+    };
+    if replace_file_atomically(&manifest_path, pretty.as_bytes()).is_err() {
+        return;
+    }
+    if replace_file_atomically(
+        &ext_dir.join("__bon_ext_shim.js"),
+        BON_EXT_SHIM_JS.as_bytes(),
+    )
+    .is_err()
+    {
+        return;
+    }
+    if html_ok {
+        let _ = replace_file_atomically(&html_settled_path(ext_dir), b"1");
     }
 }
 
@@ -528,32 +688,23 @@ pub fn is_placeholder_extension_dir(dir: &Path) -> bool {
 
 /// Discovers enabled unpacked Chrome extensions inside `~/Library/Application Support/com.bonlogin.app/extensions/*`.
 pub fn discover_unpacked_extensions_in(root_dir: &Path) -> Vec<PathBuf> {
-    if let Ok(db) = crate::db::Database::open_at(root_dir)
-        && let Ok(exts) = db.list_extensions()
-    {
-        let mut enabled_paths = Vec::new();
-        for ext in exts.into_iter().filter(|e| e.enabled) {
-            if let Ok(p) = ensure_extension_unpacked_in(root_dir, &ext)
-                && p.join("manifest.json").is_file()
-            {
-                enabled_paths.push(p);
+    let Ok(db) = crate::db::Database::open_at(root_dir) else {
+        return Vec::new();
+    };
+    let Ok(exts) = db.list_extensions() else {
+        return Vec::new();
+    };
+    exts.into_iter()
+        .filter(|ext| ext.enabled)
+        .filter_map(|ext| {
+            let path = ensure_extension_unpacked_in(root_dir, &ext).ok()?;
+            if is_placeholder_extension_dir(&path) || !path.join("manifest.json").is_file() {
+                None
+            } else {
+                Some(path)
             }
-        }
-        return enabled_paths;
-    }
-
-    let ext_dir = root_dir.join("extensions");
-    let mut found = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(ext_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() && p.join("manifest.json").is_file() {
-                found.push(p);
-            }
-        }
-    }
-    found.sort();
-    found
+        })
+        .collect()
 }
 
 
@@ -1075,9 +1226,7 @@ pub async fn download_extension_from_url_cancellable_in(
 
     let (download_url, store_id_opt) =
         if let Some(store_id) = BrowserExtension::extract_chrome_store_id(trimmed) {
-            let crx_url = format!(
-                "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=134.0.0.0&acceptformat=crx2,crx3&x=id%3D{store_id}%26uc"
-            );
+            let crx_url = crx_update_url(&store_id, &chrome_prod_version());
             (crx_url, Some(store_id))
         } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             (trimmed.to_string(), None)
@@ -1136,10 +1285,11 @@ pub fn ensure_extension_unpacked_in(root_dir: &Path, ext: &BrowserExtension) -> 
     } else {
         root_dir.join("extensions").join(&ext.id)
     };
+    if needs_remote_extension_download_in(root_dir, ext) {
+        bail!("extension {} is not downloaded yet", ext.id);
+    }
     if ext_dir.join("manifest.json").is_file() {
-        if !ext_dir.join("__bon_ext_shim.js").is_file() {
-            patch_unpacked_extension_for_agent(&ext_dir, &ext.id, None);
-        }
+        settle_unpacked_extension(&ext_dir, &ext.id);
         return Ok(ext_dir);
     }
     std::fs::create_dir_all(&ext_dir)?;
@@ -1198,11 +1348,7 @@ document.getElementById('grab-btn').onclick = async () => {
             r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Proxy / IP Status Badge</title></head><body style="width:240px;padding:12px;font-family:sans-serif;background:#0f1117;color:#f8fafc"><h3>Proxy / IP Status Badge</h3><div id="info"></div><script src="popup.js"></script></body></html>"#,
             r#"document.getElementById('info').textContent = navigator.language + ' | ' + (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC');"#,
         ),
-        _ => (
-            "// BonLogin Managed Extension\n",
-            r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Extension Popup</title></head><body><h1>Extension Ready</h1></body></html>"#,
-            "",
-        ),
+        _ => bail!("no local bundle for extension {}", ext.id),
     };
     let manifest = format!(
         r#"{{
@@ -1488,8 +1634,8 @@ mod tests {
             folder_path: String::new(),
             created_at: 2,
         };
-        let mm_dir = ensure_extension_unpacked_in(&tmp, &remote_ext).unwrap();
-        assert!(is_placeholder_extension_dir(&mm_dir));
+        assert!(ensure_extension_unpacked_in(&tmp, &remote_ext).is_err());
+        assert!(!tmp.join("extensions/metamask/manifest.json").exists());
         assert!(needs_remote_extension_download_in(&tmp, &remote_ext));
 
         // 3. Nested wrapper dir flattening + `__MSG_appName__` localization lookup + install_extension_from_file_in
@@ -1522,6 +1668,455 @@ mod tests {
         assert!(Path::new(&installed.folder_path).join("manifest.json").is_file());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discover_skips_undownloaded_store_extension_and_loads_nothing_when_db_fails() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-disc-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let db = crate::db::Database::open_at(&tmp).unwrap();
+        db.set_extension_enabled("metamask", true).unwrap();
+        db.set_extension_enabled("coordinates", true).unwrap();
+        drop(db);
+
+        let found = discover_unpacked_extensions_in(&tmp);
+        assert_eq!(found, vec![tmp.join("extensions/coordinates")]);
+        assert!(found[0].join("manifest.json").is_file());
+        assert!(!tmp.join("extensions/metamask/manifest.json").exists());
+
+        let bad = tmp.join("bad-root");
+        std::fs::create_dir_all(bad.join("extensions/evil")).unwrap();
+        std::fs::write(
+            bad.join("extensions/evil/manifest.json"),
+            r#"{"manifest_version":3,"name":"Evil","version":"1"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(bad.join("bonlogin.sqlite3")).unwrap();
+        assert!(discover_unpacked_extensions_in(&bad).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn pin_mtime(path: &Path) -> std::time::SystemTime {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        t
+    }
+
+    fn ext_pointing_at(dir: &Path, id: &str) -> BrowserExtension {
+        BrowserExtension {
+            id: id.to_string(),
+            name: id.to_string(),
+            icon_label: "X".to_string(),
+            icon_bg: 1,
+            is_default: false,
+            enabled: true,
+            source_url: String::new(),
+            folder_path: dir.to_string_lossy().into_owned(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn second_ensure_does_not_rewrite_a_finished_extension() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-stable-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ext = BrowserExtension {
+            id: "coordinates".to_string(),
+            name: "Coordinates Helper".to_string(),
+            icon_label: "C".to_string(),
+            icon_bg: 1,
+            is_default: true,
+            enabled: true,
+            source_url: String::new(),
+            folder_path: String::new(),
+            created_at: 1,
+        };
+        let dir = ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+        let manifest = std::fs::read(dir.join("manifest.json")).unwrap();
+        let pinned = [
+            dir.join("manifest.json"),
+            dir.join("__bon_ext_shim.js"),
+            dir.join("popup.html"),
+            dir.join("content.js"),
+        ];
+        let times: Vec<_> = pinned.iter().map(|p| pin_mtime(p)).collect();
+        ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+        assert_eq!(std::fs::read(dir.join("manifest.json")).unwrap(), manifest);
+        for (path, t) in pinned.iter().zip(times) {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                t,
+                "rewrote {}",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_strips_module_shim_without_rewriting_manifest() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-repair-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest = b"{\"manifest_version\":3,\"name\":\"Mail\",\"version\":\"1\",\"background\":{\"service_worker\":\"sw.js\",\"type\":\"module\"}}";
+        std::fs::write(tmp.join("manifest.json"), manifest).unwrap();
+        std::fs::write(tmp.join("__bon_ext_shim.js"), super::BON_EXT_SHIM_JS).unwrap();
+        let original = "import './worker.js';\n";
+        std::fs::write(
+            tmp.join("sw.js"),
+            format!("{}\n{original}", super::BON_EXT_SHIM_JS),
+        )
+        .unwrap();
+        let manifest_mtime = pin_mtime(&tmp.join("manifest.json"));
+        let ext = ext_pointing_at(&tmp, "mail");
+        ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.join("sw.js")).unwrap(), original);
+        assert_eq!(std::fs::read(tmp.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(
+            std::fs::metadata(tmp.join("manifest.json"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            manifest_mtime
+        );
+        let sw_mtime = pin_mtime(&tmp.join("sw.js"));
+        ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+        assert_eq!(
+            std::fs::metadata(tmp.join("sw.js"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            sw_mtime
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn strip_keeps_the_old_worker_readable_until_replace_finishes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-atom-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest = b"{\"manifest_version\":3,\"name\":\"Mail\",\"version\":\"1\",\"background\":{\"service_worker\":\"sw.js\",\"type\":\"module\"}}";
+        std::fs::write(tmp.join("manifest.json"), manifest).unwrap();
+        std::fs::write(tmp.join("__bon_ext_shim.js"), super::BON_EXT_SHIM_JS).unwrap();
+        let original = "import './worker.js';\n";
+        let prefixed = format!("{}\n{original}", super::BON_EXT_SHIM_JS);
+        std::fs::write(tmp.join("sw.js"), &prefixed).unwrap();
+        let mut held = std::fs::File::open(tmp.join("sw.js")).unwrap();
+        ensure_extension_unpacked_in(&tmp, &ext_pointing_at(&tmp, "mail")).unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.join("sw.js")).unwrap(), original);
+        std::io::Seek::seek(&mut held, std::io::SeekFrom::Start(0)).unwrap();
+        let mut still_open = String::new();
+        std::io::Read::read_to_string(&mut held, &mut still_open).unwrap();
+        assert_eq!(still_open, prefixed);
+        let leftover = std::fs::read_dir(&tmp).unwrap().flatten().any(|e| {
+            e.file_name().to_string_lossy().contains("bon-tmp")
+        });
+        assert!(!leftover);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_fills_missing_html_shim_without_rewriting_manifest() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-html-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("pages")).unwrap();
+        let manifest = b"{\"manifest_version\":3,\"name\":\"Mail\",\"version\":\"1\",\"background\":{\"service_worker\":\"sw.js\",\"type\":\"module\"}}";
+        std::fs::write(tmp.join("manifest.json"), manifest).unwrap();
+        std::fs::write(tmp.join("__bon_ext_shim.js"), super::BON_EXT_SHIM_JS).unwrap();
+        std::fs::write(tmp.join("sw.js"), "import './worker.js';\n").unwrap();
+        std::fs::write(
+            tmp.join("popup.html"),
+            "<html><head></head><body>Hi</body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("pages/options.html"),
+            "<html><body>Opt</body></html>",
+        )
+        .unwrap();
+        let manifest_mtime = pin_mtime(&tmp.join("manifest.json"));
+        let shim_mtime = pin_mtime(&tmp.join("__bon_ext_shim.js"));
+        ensure_extension_unpacked_in(&tmp, &ext_pointing_at(&tmp, "mail")).unwrap();
+        let popup = std::fs::read_to_string(tmp.join("popup.html")).unwrap();
+        assert!(popup.contains(r#"<script src="/__bon_ext_shim.js"></script>"#));
+        assert!(popup.contains("<head>"));
+        let options = std::fs::read_to_string(tmp.join("pages/options.html")).unwrap();
+        assert!(options.starts_with(r#"<script src="/__bon_ext_shim.js"></script>"#));
+        assert_eq!(std::fs::read(tmp.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(
+            std::fs::metadata(tmp.join("manifest.json"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            manifest_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(tmp.join("__bon_ext_shim.js"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            shim_mtime
+        );
+        let popup_mtime = pin_mtime(&tmp.join("popup.html"));
+        ensure_extension_unpacked_in(&tmp, &ext_pointing_at(&tmp, "mail")).unwrap();
+        assert_eq!(
+            std::fs::metadata(tmp.join("popup.html"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            popup_mtime
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    struct OneByte<R>(R);
+    impl<R: std::io::Read> std::io::Read for OneByte<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.0.read(&mut buf[..1])
+        }
+    }
+
+    #[test]
+    fn prefix_check_survives_one_byte_reads() {
+        let prefix = b"abcdef";
+        let mut matched = OneByte(&b"abcdefREST"[..]);
+        assert_eq!(
+            super::starts_with_prefix(&mut matched, prefix).unwrap(),
+            true
+        );
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut matched, &mut rest).unwrap();
+        assert_eq!(rest, b"REST");
+        let mut short = OneByte(&b"abc"[..]);
+        assert_eq!(super::starts_with_prefix(&mut short, prefix).unwrap(), false);
+    }
+
+    #[test]
+    fn patch_replaces_files_a_reader_already_has_open() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-open-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest = b"{\"manifest_version\":3,\"name\":\"Mail\",\"version\":\"1\",\"background\":{\"service_worker\":\"bg.js\"}}";
+        let source = "console.log('bg');\n";
+        std::fs::write(tmp.join("manifest.json"), manifest).unwrap();
+        std::fs::write(tmp.join("bg.js"), source).unwrap();
+        let mut held_manifest = std::fs::File::open(tmp.join("manifest.json")).unwrap();
+        let mut held_worker = std::fs::File::open(tmp.join("bg.js")).unwrap();
+        patch_unpacked_extension_for_agent(&tmp, "mail", None);
+        let new_manifest = std::fs::read(tmp.join("manifest.json")).unwrap();
+        let new_worker = std::fs::read_to_string(tmp.join("bg.js")).unwrap();
+        assert_ne!(new_manifest, manifest);
+        assert!(new_worker.starts_with("/* __BON_EXT_SHIM__ */"));
+        assert!(new_worker.ends_with(source));
+        assert!(tmp.join("__bon_ext_shim.js").is_file());
+        std::io::Seek::seek(&mut held_manifest, std::io::SeekFrom::Start(0)).unwrap();
+        std::io::Seek::seek(&mut held_worker, std::io::SeekFrom::Start(0)).unwrap();
+        let mut old_manifest = Vec::new();
+        let mut old_worker = String::new();
+        std::io::Read::read_to_end(&mut held_manifest, &mut old_manifest).unwrap();
+        std::io::Read::read_to_string(&mut held_worker, &mut old_worker).unwrap();
+        assert_eq!(old_manifest, manifest);
+        assert_eq!(old_worker, source);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn settled_html_is_not_scanned_again_until_repatched() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-mark-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest = b"{\"manifest_version\":3,\"name\":\"Mail\",\"version\":\"1\"}";
+        std::fs::write(tmp.join("manifest.json"), manifest).unwrap();
+        std::fs::write(tmp.join("__bon_ext_shim.js"), super::BON_EXT_SHIM_JS).unwrap();
+        std::fs::write(tmp.join("popup.html"), "<html><head></head><body>Hi</body></html>").unwrap();
+        let ext = ext_pointing_at(&tmp, "mail");
+        ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+        assert!(tmp.join("__bon_html_settled").is_file());
+        std::fs::write(tmp.join("extra.html"), "<html><body>New</body></html>").unwrap();
+        ensure_extension_unpacked_in(&tmp, &ext).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("extra.html")).unwrap(),
+            "<html><body>New</body></html>"
+        );
+        patch_unpacked_extension_for_agent(&tmp, "mail", None);
+        assert!(
+            std::fs::read_to_string(tmp.join("extra.html"))
+                .unwrap()
+                .contains("__bon_ext_shim.js")
+        );
+        assert!(tmp.join("__bon_html_settled").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn patch_does_not_widen_hosts_and_repairs_module_worker() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-ext-patch-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("manifest.json"),
+            r#"{
+              "manifest_version": 3,
+              "name": "Mail",
+              "version": "1.0.0",
+              "host_permissions": ["https://mail.google.com/*"],
+              "optional_host_permissions": ["https://a.example/*"],
+              "background": { "service_worker": "sw.js", "type": "module" }
+            }"#,
+        )
+        .unwrap();
+        let original = "import './worker.js';\nconsole.log('ok');\n";
+        std::fs::write(
+            tmp.join("sw.js"),
+            format!("{}\n{original}", super::BON_EXT_SHIM_JS),
+        )
+        .unwrap();
+
+        patch_unpacked_extension_for_agent(&tmp, "mail", None);
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["host_permissions"],
+            serde_json::json!(["https://mail.google.com/*"])
+        );
+        assert_eq!(
+            manifest["optional_host_permissions"],
+            serde_json::json!(["https://a.example/*"])
+        );
+        assert_eq!(std::fs::read_to_string(tmp.join("sw.js")).unwrap(), original);
+
+        std::fs::write(tmp.join("classic.js"), "console.log('bg');\n").unwrap();
+        let mut classic = manifest;
+        classic["background"] = serde_json::json!({ "service_worker": "classic.js" });
+        std::fs::write(
+            tmp.join("manifest.json"),
+            serde_json::to_string(&classic).unwrap(),
+        )
+        .unwrap();
+        patch_unpacked_extension_for_agent(&tmp, "mail", None);
+        patch_unpacked_extension_for_agent(&tmp, "mail", None);
+        let classic_js = std::fs::read_to_string(tmp.join("classic.js")).unwrap();
+        assert!(classic_js.starts_with("/* __BON_EXT_SHIM__ */"));
+        assert_eq!(classic_js.matches("/* __BON_EXT_SHIM__ */").count(), 1);
+        assert!(classic_js.ends_with("console.log('bg');\n"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn crx_update_url_uses_the_given_chrome_version() {
+        assert_eq!(
+            super::chrome_version_in("chromium-148.0.7778.215"),
+            Some("148.0.7778.215")
+        );
+        assert_eq!(
+            super::chrome_version_in("Custom Kernel (BONLOGIN_CHROMIUM_PATH)"),
+            None
+        );
+        let url = super::crx_update_url("nkbihfbeogaeaoehlefnkodbefgpgknn", "148.0.7778.215");
+        assert!(url.contains("prodversion=148.0.7778.215"));
+        assert!(url.contains("id%3Dnkbihfbeogaeaoehlefnkodbefgpgknn"));
+        assert!(!url.contains("134.0.0.0"));
+        assert!(!url.contains("130.0.0.0"));
+    }
+
+    #[test]
+    fn shim_uses_the_single_normal_active_web_tab() {
+        let script = format!(
+            r#"
+            const calls = [];
+            globalThis.chrome = {{
+              tabs: {{
+                query(info, cb) {{
+                  calls.push(info);
+                  const tabs = globalThis.__tabs(info);
+                  if (cb) {{ cb(tabs); return; }}
+                  return Promise.resolve(tabs);
+                }}
+              }}
+            }};
+            {shim}
+            function run(name, tabsFor, expectUrl) {{
+              calls.length = 0;
+              globalThis.__tabs = tabsFor;
+              return chrome.tabs.query({{ active: true, currentWindow: true }}).then((tabs) => {{
+                if (!tabs[0] || tabs[0].url !== expectUrl) {{
+                  console.error(name, JSON.stringify(tabs), JSON.stringify(calls));
+                  process.exit(1);
+                }}
+              }});
+            }}
+            const ext = () => [{{ id: 1, url: 'chrome-extension://abc/popup.html' }}];
+            Promise.resolve()
+              .then(() => run('one-web', (info) => {{
+                if (info.windowType === 'normal') return [{{ id: 2, url: 'https://dapp.example/' }}];
+                return ext();
+              }}, 'https://dapp.example/'))
+              .then(() => run('two-web', (info) => {{
+                if (info.windowType === 'normal') return [
+                  {{ id: 2, url: 'https://first.example/' }},
+                  {{ id: 3, url: 'https://last.example/' }}
+                ];
+                return ext();
+              }}, 'chrome-extension://abc/popup.html'))
+              .catch((e) => {{ console.error(e); process.exit(1); }});
+            "#,
+            shim = super::BON_EXT_SHIM_JS
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .expect("node is required to test the extension shim");
+        if !output.status.success() {
+            panic!(
+                "shim node test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 

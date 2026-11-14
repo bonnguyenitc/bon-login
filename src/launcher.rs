@@ -3734,7 +3734,8 @@ mod tests {
         let html_patched = std::fs::read_to_string(tmp.join("popup.html")).unwrap();
         assert!(html_patched.contains("__bon_ext_shim.js"));
         let manifest_patched = std::fs::read_to_string(tmp.join("manifest.json")).unwrap();
-        assert!(manifest_patched.contains("\"<all_urls>\""));
+        assert!(!manifest_patched.contains("\"<all_urls>\""));
+        assert!(manifest_patched.contains("optional_host_permissions"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

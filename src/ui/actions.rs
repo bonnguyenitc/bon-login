@@ -1128,17 +1128,33 @@ impl BonLoginApp {
     }
 
     pub fn toggle_extension(&mut self, ext_id: &str, cx: &mut Context<Self>) {
+        if self.ext_tasks.contains_key(ext_id) {
+            self.cancel_extension_task(ext_id);
+            if let Ok(db) = self.db.lock() {
+                let _ = db.set_extension_enabled(ext_id, false);
+            }
+            let target_dir = self.workspace_root.join("extensions").join(ext_id);
+            if crate::extensions::is_placeholder_extension_dir(&target_dir) {
+                crate::extensions::remove_extension_files_in(&self.workspace_root, ext_id);
+            }
+            self.reload_extensions_only();
+            self.banner_message = Some("Stopped extension download".to_string());
+            cx.notify();
+            return;
+        }
         let Some(ext) = self.extensions.iter().find(|e| e.id == ext_id).cloned() else {
             return;
         };
-        let was_downloading = self.cancel_extension_task(ext_id);
         let next_enabled = !ext.enabled;
-        if let Ok(db) = self.db.lock() {
-            let _ = db.set_extension_enabled(ext_id, next_enabled);
-        }
-        self.reload_extensions_only();
-
         let target_dir = self.workspace_root.join("extensions").join(&ext.id);
+        let defer_enable = next_enabled
+            && crate::extensions::needs_remote_extension_download_in(&self.workspace_root, &ext);
+        if !defer_enable {
+            if let Ok(db) = self.db.lock() {
+                let _ = db.set_extension_enabled(ext_id, next_enabled);
+            }
+            self.reload_extensions_only();
+        }
 
         if next_enabled {
             if crate::extensions::needs_remote_extension_download_in(&self.workspace_root, &ext) {
@@ -1173,11 +1189,7 @@ impl BonLoginApp {
                         {
                             app.ext_tasks.remove(&eid);
                         }
-                        let still_enabled = app
-                            .extensions
-                            .iter()
-                            .any(|e| e.id == eid && e.enabled);
-                        if flag_for_ui.load(std::sync::atomic::Ordering::SeqCst) || !still_enabled {
+                        if flag_for_ui.load(std::sync::atomic::Ordering::SeqCst) {
                             cx.notify();
                             return;
                         }
@@ -1217,14 +1229,10 @@ impl BonLoginApp {
                 self.banner_message = Some(format!("Enabled extension: {}", ext.name));
             }
         } else {
-            if was_downloading && crate::extensions::is_placeholder_extension_dir(&target_dir) {
+            if crate::extensions::is_placeholder_extension_dir(&target_dir) {
                 crate::extensions::remove_extension_files_in(&self.workspace_root, ext_id);
             }
-            self.banner_message = Some(if was_downloading {
-                format!("Stopped download & disabled extension: {}", ext.name)
-            } else {
-                format!("Disabled extension: {}", ext.name)
-            });
+            self.banner_message = Some(format!("Disabled extension: {}", ext.name));
         }
         cx.notify();
     }
