@@ -641,13 +641,14 @@ pub fn render_proxies_view(
                             ),
                         )
                         .child(div().w(px(28.)).flex_shrink_0().truncate().child("#"))
-                        .child(div().flex_1().min_w(px(140.)).truncate().child("Name"))
+                        .child(div().w(px(200.)).flex_shrink_0().truncate().child("Name"))
                         .child(div().w(px(80.)).flex_shrink_0().truncate().child("Tag"))
                         .child(div().w(px(108.)).flex_shrink_0().truncate().child("Protocol support"))
                         .child(div().w(px(84.)).flex_shrink_0().truncate().child("Started at"))
                         .child(div().w(px(116.)).flex_shrink_0().truncate().child("Expired at"))
                         .child(div().w(px(96.)).flex_shrink_0().truncate().child("Status"))
                         .child(div().w(px(72.)).flex_shrink_0().truncate().child("Profiles"))
+                        .child(div().flex_1().min_w_0())
                         .child(
                             div()
                                 .w(px(92.))
@@ -848,9 +849,8 @@ pub fn render_proxies_view(
                                         )
                                         .child(
                                             v_flex()
-                                                .w_0()
-                                                .flex_1()
-                                                .min_w(px(140.))
+                                                .w(px(200.))
+                                                .flex_shrink_0()
                                                 .overflow_hidden()
                                                 .gap_0p5()
                                                 .child(
@@ -988,6 +988,7 @@ pub fn render_proxies_view(
                                                 })
                                                 .child(format!("{used_count} profile(s)")),
                                         )
+                                        .child(div().flex_1().min_w_0())
                                         .child(
                                             h_flex()
                                                 .w(px(92.))

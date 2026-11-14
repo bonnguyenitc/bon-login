@@ -98,7 +98,7 @@ pub fn render_profile_table(
                 .border_1()
                 .border_color(BonTheme::border())
                 .overflow_hidden()
-                // Table Header (`[☐] | ID ↓ | Name ↓ (flex) | Tags | Note | Proxy | Updated ↓ | Status | [⚙]`)
+                // Table Header (`[☐] | ID ↓ | Name ↓ | Tags | Note | Proxy | Updated ↓ | Status | … | [⚙]`)
                 .child(
                     h_flex()
                         .w_full()
@@ -135,12 +135,14 @@ pub fn render_profile_table(
                         .children(cols.show_name.then(|| {
                             sortable_col_header(
                                 "Name",
-                                None,
+                                Some(180.),
                                 ProfileSortColumn::Name,
                                 sort_col,
                                 sort_asc,
                                 cx,
                             )
+                            .min_w(px(96.))
+                            .flex_shrink_1()
                         }))
                         .children(cols.show_tags.then(|| {
                             sortable_col_header(
@@ -151,6 +153,8 @@ pub fn render_profile_table(
                                 sort_asc,
                                 cx,
                             )
+                            .min_w(px(48.))
+                            .flex_shrink_1()
                         }))
                         .children(cols.show_notes.then(|| {
                             sortable_col_header(
@@ -161,6 +165,8 @@ pub fn render_profile_table(
                                 sort_asc,
                                 cx,
                             )
+                            .min_w(px(40.))
+                            .flex_shrink_1()
                         }))
                         .children(cols.show_proxy.then(|| {
                             sortable_col_header(
@@ -171,6 +177,8 @@ pub fn render_profile_table(
                                 sort_asc,
                                 cx,
                             )
+                            .min_w(px(72.))
+                            .flex_shrink_1()
                         }))
                         .children(cols.show_updated.then(|| {
                             sortable_col_header(
@@ -185,16 +193,17 @@ pub fn render_profile_table(
                         .children(cols.show_status.then(|| {
                             sortable_col_header(
                                 "Status",
-                                Some(74.),
+                                Some(132.),
                                 ProfileSortColumn::Status,
                                 sort_col,
                                 sort_asc,
                                 cx,
                             )
                         }))
+                        .child(div().flex_1().min_w_0())
                         .child(
                             h_flex()
-                                .w(px(88.))
+                                .w(px(108.))
                                 .flex_shrink_0()
                                 .justify_end()
                                 .items_center()
@@ -1337,8 +1346,9 @@ fn render_profile_row(
                 .children(cols.show_name.then(|| {
                     let (dot_border, dot_bg, _) = Profile::accent_color_for_seed(profile.seed);
                     h_flex()
-                        .flex_1()
-                        .min_w(px(140.))
+                        .w(px(180.))
+                        .min_w(px(96.))
+                        .flex_shrink_1()
                         .gap_1p5()
                         .items_center()
                         .overflow_hidden()
@@ -1371,7 +1381,8 @@ fn render_profile_row(
                     let extra_count = profile.tags.len().saturating_sub(1);
                     h_flex()
                         .w(px(88.))
-                        .flex_shrink_0()
+                        .min_w(px(48.))
+                        .flex_shrink_1()
                         .gap_1()
                         .items_center()
                         .overflow_hidden()
@@ -1433,7 +1444,8 @@ fn render_profile_row(
                     let totp_opt = profile.current_totp();
                     h_flex()
                         .w(px(96.))
-                        .flex_shrink_0()
+                        .min_w(px(40.))
+                        .flex_shrink_1()
                         .gap_1()
                         .items_center()
                         .overflow_hidden()
@@ -1507,7 +1519,8 @@ fn render_profile_row(
                     let has_proxy = profile.proxy.is_some();
                     div()
                         .w(px(136.))
-                        .flex_shrink_0()
+                        .min_w(px(72.))
+                        .flex_shrink_1()
                         .truncate()
                         .text_xs()
                         .text_color(
@@ -1549,10 +1562,12 @@ fn render_profile_row(
                 .children(cols.show_status.then(|| {
                     let pid_status_focus = profile_id.clone();
                     let mut badge = h_flex()
+                        .max_w_full()
                         .px_2()
                         .py_0p5()
                         .gap_1()
                         .items_center()
+                        .overflow_hidden()
                         .rounded_full()
                         .bg(badge_bg)
                         .text_xs()
@@ -1562,10 +1577,11 @@ fn render_profile_row(
                             div()
                                 .w(px(5.5))
                                 .h(px(5.5))
+                                .flex_shrink_0()
                                 .rounded_full()
                                 .bg(badge_fg),
                         )
-                        .child(state_title);
+                        .child(div().min_w_0().truncate().child(state_title));
                     if is_running {
                         badge = badge
                             .cursor_pointer()
@@ -1578,7 +1594,7 @@ fn render_profile_row(
                                 }),
                             );
                     }
-                    div().w(px(74.)).flex_shrink_0().child(
+                    div().w(px(132.)).flex_shrink_0().overflow_hidden().child(
                         h_flex().child(if is_starting {
                             badge
                                 .with_animation(
@@ -1592,10 +1608,11 @@ fn render_profile_row(
                         }),
                     )
                 }))
+                .child(div().flex_1().min_w_0())
                 // Rightmost Action Column: `[Launch/Stop]` + `[⋯]`
                 .child(
                     h_flex()
-                        .w(px(88.))
+                        .w(px(108.))
                         .flex_shrink_0()
                         .justify_end()
                         .items_center()
@@ -1605,6 +1622,7 @@ fn render_profile_row(
                             Button::new(SharedString::from(format!("row-stop-{profile_id}")))
                                 .danger()
                                 .small()
+                                .flex_shrink_0()
                                 .label("Stop")
                                 .on_click(cx.listener(move |app, _, _, cx| {
                                     app.stop_profile(&pid_stop, cx);
@@ -1614,6 +1632,7 @@ fn render_profile_row(
                             Button::new(SharedString::from(format!("row-launch-{profile_id}")))
                                 .with_variant(BonTheme::launch_cta(cx))
                                 .small()
+                                .flex_shrink_0()
                                 .label("Start")
                                 .on_click(cx.listener(move |app, _, window, cx| {
                                     app.select_profile(&pid_launch, window, cx);
@@ -1630,6 +1649,7 @@ fn render_profile_row(
                             Button::new(SharedString::from(format!("row-dots-{profile_id}")))
                                 .ghost()
                                 .small()
+                                .flex_shrink_0()
                                 .label(SfSymbol::ELLIPSIS)
                                 .dropdown_menu_with_anchor(
                                     Anchor::TopRight,
@@ -1750,11 +1770,12 @@ pub fn render_trash_table(
                         .text_xs()
                         .font_semibold()
                         .text_color(BonTheme::text_secondary())
-                        .child(div().w(px(80.)).child("ID"))
-                        .child(div().flex_1().min_w(px(160.)).child("Name"))
+                        .child(div().w(px(80.)).flex_shrink_0().child("ID"))
+                        .child(div().w(px(180.)).flex_shrink_0().truncate().child("Name"))
                         .child(div().w(px(130.)).child("Group / Tags"))
                         .child(div().w(px(150.)).child("Proxy"))
                         .child(div().w(px(140.)).child("Deleted"))
+                        .child(div().flex_1().min_w_0())
                         .child(div().w(px(190.)).flex_shrink_0().flex().justify_end().child("Actions")),
                 )
                 .child(if trashed.is_empty() {
@@ -1831,8 +1852,8 @@ pub fn render_trash_table(
                                         )
                                         .child(
                                             div()
-                                                .flex_1()
-                                                .min_w(px(160.))
+                                                .w(px(180.))
+                                                .flex_shrink_0()
                                                 .truncate()
                                                 .text_xs()
                                                 .font_semibold()
@@ -1863,6 +1884,7 @@ pub fn render_trash_table(
                                                 .text_color(BonTheme::warning())
                                                 .child(deleted_label),
                                         )
+                                        .child(div().flex_1().min_w_0())
                                         .child(
                                             h_flex()
                                                 .w(px(190.))
