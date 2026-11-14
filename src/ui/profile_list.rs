@@ -5,7 +5,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use std::time::Duration;
-use crate::models::{Profile, ProfileStatus};
+use crate::models::{IpKind, Profile, ProfileStatus};
 use crate::ui::profile_modal::{
     detail_summary_row as drawer_row, detail_summary_row_mono as drawer_row_mono,
 };
@@ -254,6 +254,25 @@ pub fn render_profile_table(
                             let selected_id = app.selected_profile_id.as_deref();
                             let copied_key = app.recently_copied_key.as_deref();
                             let cols = app.col_vis;
+                            let mut ip_counts: std::collections::HashMap<String, usize> =
+                                std::collections::HashMap::new();
+                            let mut proxy_counts: std::collections::HashMap<
+                                (String, u16, Option<String>),
+                                usize,
+                            > = std::collections::HashMap::new();
+                            for p in &app.profiles {
+                                if p.deleted_at.is_some() {
+                                    continue;
+                                }
+                                if let Some(ip) = p.resolved_geo.as_ref().map(|g| g.ip.as_str()) {
+                                    *ip_counts.entry(ip.to_string()).or_default() += 1;
+                                }
+                                if let Some(px) = &p.proxy {
+                                    *proxy_counts
+                                        .entry((px.host.clone(), px.port, px.username.clone()))
+                                        .or_default() += 1;
+                                }
+                            }
                             let mut items = Vec::with_capacity(range.len());
                             for row_ix in range {
                                 let Some(&prof_ix) = indices_for_list.get(row_ix) else {
@@ -277,6 +296,18 @@ pub fn render_profile_table(
                                 let copied_totp = copied_key
                                     .and_then(|k| k.strip_prefix("totp:"))
                                     == Some(profile.id.as_str());
+                                let shared_note = profile.resolved_geo.as_ref().and_then(|g| {
+                                    let n = ip_counts.get(&g.ip).copied().unwrap_or(0);
+                                    (n > 1).then(|| format!("exit IP shared with {} profiles", n - 1))
+                                }).or_else(|| {
+                                    profile.proxy.as_ref().and_then(|px| {
+                                        let n = proxy_counts
+                                            .get(&(px.host.clone(), px.port, px.username.clone()))
+                                            .copied()
+                                            .unwrap_or(0);
+                                        (n > 1).then(|| format!("proxy shared with {} profiles", n - 1))
+                                    })
+                                });
                                 items.push(render_profile_row(
                                     profile,
                                     status,
@@ -285,6 +316,7 @@ pub fn render_profile_table(
                                     is_checking_proxy,
                                     copied_id,
                                     copied_totp,
+                                    shared_note,
                                     cols,
                                     cx,
                                 ));
@@ -579,6 +611,16 @@ pub fn render_profile_table(
                                 flash_seed,
                             ))
                             .child(drawer_row_mono("Proxy", proxy_str))
+                            .child(drawer_row(
+                                "IP quality",
+                                prof.resolved_geo
+                                    .as_ref()
+                                    .and_then(|g| g.quality_label())
+                                    .unwrap_or_else(|| "Unknown".to_string()),
+                            ))
+                            .children(Profile::shared_exit_label(profiles, prof).map(|note| {
+                                drawer_row("Shared", note)
+                            }))
                             .child(drawer_row("Timezone", tz_str))
                             .child(drawer_row(
                                 "WebRTC Policy",
@@ -894,6 +936,10 @@ fn build_profile_popup_menu(
     let pid_rot = profile_id.clone();
     let app_robot = app_entity.clone();
     let pid_robot = profile_id.clone();
+    let app_seed = app_entity.clone();
+    let pid_seed = profile_id.clone();
+    let app_audit = app_entity.clone();
+    let pid_audit = profile_id.clone();
     let app_flow = app_entity.clone();
     let pid_flow = profile_id.clone();
     let app_import_cookies = app_entity.clone();
@@ -992,6 +1038,20 @@ fn build_profile_popup_menu(
             let pid = pid_robot.clone();
             app_robot.update(cx, |app, cx| {
                 app.open_cookie_robot_modal(Some(pid), window, cx);
+            });
+        }),
+    )
+    .item(
+        PopupMenuItem::new("Seed profile").on_click(move |_, _, cx| {
+            app_seed.update(cx, |app, cx| {
+                app.seed_profile(&pid_seed, cx);
+            });
+        }),
+    )
+    .item(
+        PopupMenuItem::new("Audit profile").on_click(move |_, _, cx| {
+            app_audit.update(cx, |app, cx| {
+                app.audit_profile(&pid_audit, cx);
             });
         }),
     )
@@ -1123,6 +1183,7 @@ fn render_profile_row(
     is_checking_proxy: bool,
     copied_id: bool,
     copied_totp: bool,
+    shared_note: Option<String>,
     cols: ColumnVisibility,
     cx: &mut Context<BonLoginApp>,
 ) -> AnyElement {
@@ -1135,9 +1196,23 @@ fn render_profile_row(
     } else {
         match (&profile.proxy, &profile.resolved_geo) {
             (Some(_), Some(g)) => {
-                format!("{} {} ({})", SfSymbol::GLOBE, g.compact_ip(), g.country_code)
+                let base = format!("{} {} ({})", SfSymbol::GLOBE, g.compact_ip(), g.country_code);
+                let labeled = match g.quality_label() {
+                    Some(q) => format!("{base} · {q}"),
+                    None => base,
+                };
+                match &shared_note {
+                    Some(note) => format!("{labeled} · {note}"),
+                    None => labeled,
+                }
             }
-            (Some(p), None) => format!("{} {}", SfSymbol::GLOBE, p.display_short()),
+            (Some(p), None) => {
+                let base = format!("{} {}", SfSymbol::GLOBE, p.display_short());
+                match &shared_note {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
             (None, _) => "Local IP".to_string(),
         }
     };
@@ -1166,6 +1241,7 @@ fn render_profile_row(
             "Error".to_string(),
         ),
     };
+    let state_title = format!("{state_title} · {}", profile.trust_stage.label());
 
     let note_text = profile
         .short_note(18)
@@ -1434,13 +1510,17 @@ fn render_profile_row(
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
-                        .text_color(if has_proxy && profile.resolved_geo.is_some() {
-                            BonTheme::success()
-                        } else if has_proxy {
-                            BonTheme::text_primary()
-                        } else {
-                            BonTheme::text_muted()
-                        })
+                        .text_color(
+                            match profile.resolved_geo.as_ref().map(|g| g.ip_kind) {
+                                Some(IpKind::Hosting) => BonTheme::danger(),
+                                Some(IpKind::Residential | IpKind::Mobile) => BonTheme::success(),
+                                _ if has_proxy && profile.resolved_geo.is_some() => {
+                                    BonTheme::success()
+                                }
+                                _ if has_proxy => BonTheme::text_primary(),
+                                _ => BonTheme::text_muted(),
+                            },
+                        )
                         .hover(|s| s.text_color(BonTheme::accent()))
                         .on_mouse_down(
                             MouseButton::Left,

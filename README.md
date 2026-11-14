@@ -113,7 +113,8 @@
                                             v
 +-----------------------------------------------------------------------------------+
 |                    adryfish/fingerprint-chromium (macOS 148)                      |
-|  --fingerprint=<seed>  --disable-blink-features=AutomationControlled              |
+|  --fingerprint=<seed>  --no-first-run                                            |
+|  --no-pings --disable-breakpad --disable-background-networking                    |
 |  --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"                      |
 +-------------------------------------------+---------------------------------------+
                                             |
@@ -264,6 +265,8 @@ bon-login profile batch-create --count 10 --prefix "Shop" --group "TikTok" --os 
 bon-login profile check-proxy <id|name|--group <g>|--all>
 bon-login profile rotate-proxy <id|name|--group <g>|--all>
 bon-login profile warmup <id|name|--group <g>|--all> [url1,url2,...] [--dwell <secs>]
+bon-login profile seed <id|name>
+bon-login audit <id|name>
 
 # Cookies, Archives (.zip), CSV, JSON Backup & Disk Maintenance
 bon-login profile export-cookies <id|name> [--out <file.json>]

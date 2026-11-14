@@ -421,6 +421,60 @@ impl ProxyConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IpKind {
+    #[default]
+    Unknown,
+    Residential,
+    Business,
+    Mobile,
+    Hosting,
+}
+
+impl IpKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Residential => "Residential",
+            Self::Business => "Business",
+            Self::Mobile => "Mobile",
+            Self::Hosting => "Hosting",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum IpPolicy {
+    #[default]
+    #[serde(rename = "any")]
+    Any,
+    #[serde(rename = "no-hosting")]
+    NoHosting,
+    #[serde(rename = "residential")]
+    ResidentialOrMobile,
+}
+
+impl IpPolicy {
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::NoHosting => "no-hosting",
+            Self::ResidentialOrMobile => "residential",
+        }
+    }
+
+    pub fn from_cli(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "any" => Some(Self::Any),
+            "no-hosting" => Some(Self::NoHosting),
+            "residential" => Some(Self::ResidentialOrMobile),
+            _ => None,
+        }
+    }
+
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeoInfo {
     pub ip: String,
@@ -430,9 +484,151 @@ pub struct GeoInfo {
     pub accept_lang: String,
     #[serde(default)]
     pub latency_ms: Option<u32>,
+    #[serde(default)]
+    pub city: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub asn: String,
+    #[serde(default)]
+    pub isp: String,
+    #[serde(default)]
+    pub ip_kind: IpKind,
+    #[serde(default)]
+    pub is_hosting: Option<bool>,
+    #[serde(default)]
+    pub is_mobile: Option<bool>,
 }
 
 impl GeoInfo {
+    pub fn core(
+        ip: String,
+        country_code: String,
+        timezone: String,
+        locale: String,
+        accept_lang: String,
+        latency_ms: Option<u32>,
+    ) -> Self {
+        Self {
+            ip,
+            country_code,
+            timezone,
+            locale,
+            accept_lang,
+            latency_ms,
+            city: String::new(),
+            region: String::new(),
+            asn: String::new(),
+            isp: String::new(),
+            ip_kind: IpKind::Unknown,
+            is_hosting: None,
+            is_mobile: None,
+        }
+    }
+
+    pub fn classify(is_hosting: Option<bool>, is_mobile: Option<bool>, is_proxy: Option<bool>) -> IpKind {
+        if is_hosting == Some(true) {
+            IpKind::Hosting
+        } else if is_mobile == Some(true) {
+            IpKind::Mobile
+        } else if is_hosting == Some(false) && is_mobile == Some(false) && is_proxy != Some(true) {
+            IpKind::Residential
+        } else {
+            IpKind::Unknown
+        }
+    }
+
+    pub fn quality_json(&self) -> String {
+        serde_json::json!({
+            "city": self.city,
+            "region": self.region,
+            "asn": self.asn,
+            "isp": self.isp,
+            "ip_kind": self.ip_kind,
+            "is_hosting": self.is_hosting,
+            "is_mobile": self.is_mobile,
+        })
+        .to_string()
+    }
+
+    pub fn apply_quality_json(&mut self, raw: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return;
+        };
+        if let Some(s) = v.get("city").and_then(|x| x.as_str()) {
+            self.city = s.to_string();
+        }
+        if let Some(s) = v.get("region").and_then(|x| x.as_str()) {
+            self.region = s.to_string();
+        }
+        if let Some(s) = v.get("asn").and_then(|x| x.as_str()) {
+            self.asn = s.to_string();
+        }
+        if let Some(s) = v.get("isp").and_then(|x| x.as_str()) {
+            self.isp = s.to_string();
+        }
+        if let Some(kind) = v.get("ip_kind").and_then(|x| serde_json::from_value(x.clone()).ok()) {
+            self.ip_kind = kind;
+        }
+        self.is_hosting = v.get("is_hosting").and_then(|x| x.as_bool());
+        self.is_mobile = v.get("is_mobile").and_then(|x| x.as_bool());
+    }
+
+    /// `None` when the launch may proceed. Missing hosting bit never blocks.
+    pub fn launch_block_reason(&self, policy: IpPolicy) -> Option<String> {
+        if policy == IpPolicy::Any || self.is_hosting.is_none() {
+            return None;
+        }
+        let blocked = match policy {
+            IpPolicy::Any => false,
+            IpPolicy::NoHosting => self.is_hosting == Some(true),
+            IpPolicy::ResidentialOrMobile => {
+                self.is_hosting == Some(true)
+                    || matches!(self.ip_kind, IpKind::Hosting | IpKind::Business)
+            }
+        };
+        if !blocked {
+            return None;
+        }
+        let kind = if self.ip_kind == IpKind::Unknown && self.is_hosting == Some(true) {
+            "Hosting"
+        } else {
+            self.ip_kind.label()
+        };
+        Some(format!(
+            "exit IP {} is {kind}{}, policy requires {}",
+            self.ip,
+            self.org_paren(),
+            policy.as_cli_str()
+        ))
+    }
+
+    fn org_paren(&self) -> String {
+        let asn = self.asn.trim();
+        let isp = self.isp.trim();
+        if asn.is_empty() && isp.is_empty() {
+            String::new()
+        } else if isp.is_empty() || asn.contains(isp) {
+            format!(" ({asn})")
+        } else if asn.is_empty() {
+            format!(" ({isp})")
+        } else {
+            format!(" ({asn} {isp})")
+        }
+    }
+
+    /// `Residential · Hangzhou` when the probe had a city or a known kind.
+    pub fn quality_label(&self) -> Option<String> {
+        let kind = (self.ip_kind != IpKind::Unknown).then_some(self.ip_kind.label());
+        let city = (!self.city.trim().is_empty()).then_some(self.city.trim());
+        match (kind, city) {
+            (Some(k), Some(c)) => Some(format!("{k} · {c}")),
+            (Some(k), None) => Some(k.to_string()),
+            (None, Some(c)) => Some(c.to_string()),
+            (None, None) => None,
+        }
+    }
+
     pub fn locale_for_country(country_code: &str) -> (String, String) {
         match country_code.to_ascii_uppercase().as_str() {
             "VN" => ("vi-VN".into(), "vi-VN,vi,en-US;q=0.9,en;q=0.8".into()),
@@ -714,14 +910,14 @@ impl FreeProxyCandidate {
             sp.resolved_geo = Some(geo.clone());
         } else if !cc.is_empty() && !self.timezone.is_empty() {
             let (locale, accept_lang) = GeoInfo::locale_for_country(cc);
-            sp.resolved_geo = Some(GeoInfo {
-                ip: self.config.host.clone(),
-                country_code: cc.to_ascii_uppercase(),
-                timezone: self.timezone.clone(),
+            sp.resolved_geo = Some(GeoInfo::core(
+                self.config.host.clone(),
+                cc.to_ascii_uppercase(),
+                self.timezone.clone(),
                 locale,
                 accept_lang,
-                latency_ms: self.reported_latency_ms,
-            });
+                self.reported_latency_ms,
+            ));
         }
         sp
     }
@@ -739,6 +935,108 @@ fn valid_civil_date(y: i32, m: u32, d: u32) -> bool {
         _ => return false,
     };
     d <= max_d
+}
+
+pub fn seed_urls_for_locale(locale: &str) -> &'static [&'static str] {
+    let loc = locale.trim().to_ascii_lowercase();
+    if loc.starts_with("zh") {
+        &[
+            "https://www.baidu.com",
+            "https://weibo.com",
+            "https://www.zhihu.com",
+            "https://www.taobao.com",
+        ]
+    } else if loc.starts_with("vi") {
+        &[
+            "https://vnexpress.net",
+            "https://dantri.com.vn",
+            "https://tuoitre.vn",
+            "https://www.wikipedia.org",
+        ]
+    } else {
+        &[
+            "https://www.wikipedia.org",
+            "https://www.bbc.com",
+            "https://www.reddit.com",
+            "https://www.amazon.com",
+        ]
+    }
+}
+
+fn locale_lang(locale: &str) -> String {
+    locale
+        .split([',', ';', '-', '_'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+pub fn utc_day_key(ts: i64) -> String {
+    let z = ts.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustStage {
+    #[default]
+    New,
+    Warming,
+    Mature,
+    Restricted,
+    Banned,
+}
+
+impl TrustStage {
+    pub fn from_cli(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "warming" => Self::Warming,
+            "mature" => Self::Mature,
+            "restricted" => Self::Restricted,
+            "banned" => Self::Banned,
+            _ => Self::New,
+        }
+    }
+
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Warming => "warming",
+            Self::Mature => "mature",
+            Self::Restricted => "restricted",
+            Self::Banned => "banned",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::New => "New",
+            Self::Warming => "Warming",
+            Self::Mature => "Mature",
+            Self::Restricted => "Restricted",
+            Self::Banned => "Banned",
+        }
+    }
+
+    /// Restricted and Banned stick. Otherwise 20 minutes across 2 days is Mature.
+    pub fn from_activity(self, seconds: i64, days: i64) -> Self {
+        match self {
+            Self::Restricted | Self::Banned => self,
+            _ if seconds >= 20 * 60 && days >= 2 => Self::Mature,
+            _ if seconds > 0 => Self::Warming,
+            _ => Self::New,
+        }
+    }
 }
 
 pub fn format_unix_dd_mm_yyyy(ts: i64) -> String {
@@ -788,6 +1086,12 @@ pub struct Profile {
     pub custom_locale: Option<String>,
     pub proxy: Option<ProxyConfig>,
     pub resolved_geo: Option<GeoInfo>,
+    #[serde(default)]
+    pub ip_policy: IpPolicy,
+    #[serde(default)]
+    pub trust_stage: TrustStage,
+    #[serde(default)]
+    pub seeded_at: Option<i64>,
     pub startup_url: String,
     pub notes: String,
     #[serde(default)]
@@ -834,6 +1138,9 @@ impl Profile {
             custom_locale: None,
             proxy: None,
             resolved_geo: None,
+            ip_policy: IpPolicy::Any,
+            trust_stage: TrustStage::New,
+            seeded_at: None,
             startup_url: "https://browserscan.net".to_string(),
             notes: String::new(),
             totp_secret: String::new(),
@@ -912,7 +1219,10 @@ impl Profile {
         if !self.spoof_client_rects {
             disabled.push("clientrects");
         }
-        if self.gpu_spoofing == GpuSpoofMode::NativePassthrough {
+        // Apple Metal passthrough on a Windows/Linux fingerprint reports the Mac GPU.
+        if self.os_platform == PlatformType::MacOS
+            && self.gpu_spoofing == GpuSpoofMode::NativePassthrough
+        {
             disabled.push("gpu");
         }
         if disabled.is_empty() {
@@ -920,6 +1230,122 @@ impl Profile {
         } else {
             Some(disabled.join(","))
         }
+    }
+
+    pub fn gpu_coherence_warning(&self) -> Option<&'static str> {
+        (self.os_platform != PlatformType::MacOS)
+            .then_some("Native GPU passthrough only matches macOS profiles")
+    }
+
+    pub fn seed_locale(&self) -> &str {
+        self.custom_locale
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.resolved_geo
+                    .as_ref()
+                    .map(|g| g.locale.as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or("en-US")
+    }
+
+    pub fn seed_urls(&self) -> Vec<String> {
+        seed_urls_for_locale(self.seed_locale())
+            .iter()
+            .map(|u| (*u).to_string())
+            .collect()
+    }
+
+    pub fn timezone_coherent(&self) -> bool {
+        let Some(geo_tz) = self
+            .resolved_geo
+            .as_ref()
+            .map(|g| g.timezone.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return true;
+        };
+        match self
+            .custom_timezone
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => true,
+            Some(custom) => custom.eq_ignore_ascii_case(geo_tz),
+        }
+    }
+
+    pub fn locale_coherent(&self) -> bool {
+        let Some(geo_loc) = self
+            .resolved_geo
+            .as_ref()
+            .map(|g| g.locale.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return true;
+        };
+        match self
+            .custom_locale
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => true,
+            Some(custom) => locale_lang(custom) == locale_lang(geo_loc),
+        }
+    }
+
+    pub fn audit_report(&self) -> serde_json::Value {
+        let geo = self.resolved_geo.as_ref();
+        serde_json::json!({
+            "short_id": self.short_id(),
+            "name": self.name,
+            "seeded_at": self.seeded_at,
+            "trust_stage": self.trust_stage.as_cli_str(),
+            "ip": geo.map(|g| g.ip.as_str()).unwrap_or(""),
+            "ip_kind": geo.map(|g| g.ip_kind.label()).unwrap_or("Unknown"),
+            "asn": geo.map(|g| g.asn.as_str()).unwrap_or(""),
+            "isp": geo.map(|g| g.isp.as_str()).unwrap_or(""),
+            "city": geo.map(|g| g.city.as_str()).unwrap_or(""),
+            "timezone": self.custom_timezone.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| geo.map(|g| g.timezone.as_str()).unwrap_or("")),
+            "locale": self.seed_locale(),
+            "timezone_coherent": self.timezone_coherent(),
+            "locale_coherent": self.locale_coherent(),
+            "webrtc": "disable_non_proxied_udp",
+        })
+    }
+
+    pub fn shared_exit_label(profiles: &[Profile], profile: &Profile) -> Option<String> {
+        if let Some(ip) = profile.resolved_geo.as_ref().map(|g| g.ip.as_str()) {
+            let n = profiles
+                .iter()
+                .filter(|p| {
+                    p.id != profile.id
+                        && p.deleted_at.is_none()
+                        && p.resolved_geo.as_ref().is_some_and(|g| g.ip == ip)
+                })
+                .count();
+            if n > 0 {
+                return Some(format!("exit IP shared with {n} profiles"));
+            }
+        }
+        let Some(px) = &profile.proxy else {
+            return None;
+        };
+        let n = profiles
+            .iter()
+            .filter(|p| {
+                p.id != profile.id
+                    && p.deleted_at.is_none()
+                    && p.proxy.as_ref().is_some_and(|o| {
+                        o.host == px.host && o.port == px.port && o.username == px.username
+                    })
+            })
+            .count();
+        (n > 0).then(|| format!("proxy shared with {n} profiles"))
     }
 
     pub fn matches_filter(&self, query: &str, group_filter: Option<&str>) -> bool {
@@ -1490,6 +1916,87 @@ mod tests {
         p.seed = 987654321;
         assert!(p.matches_filter("7654", None));
         assert!(!p.matches_filter("1111", None));
+    }
+
+    #[test]
+    fn test_windows_native_gpu_is_not_passthrough() {
+        let mut p = Profile::new_default("Win", PlatformType::Windows);
+        p.gpu_spoofing = GpuSpoofMode::NativePassthrough;
+        assert_eq!(p.disabled_spoofing_csv(), None);
+        assert_eq!(
+            p.gpu_coherence_warning(),
+            Some("Native GPU passthrough only matches macOS profiles")
+        );
+        p.os_platform = PlatformType::MacOS;
+        assert_eq!(p.disabled_spoofing_csv().as_deref(), Some("gpu"));
+        assert_eq!(p.gpu_coherence_warning(), None);
+    }
+
+    #[test]
+    fn test_ip_policy_blocks_only_known_hosting() {
+        let mut geo = GeoInfo::core(
+            "1.2.3.4".into(),
+            "US".into(),
+            "America/New_York".into(),
+            "en-US".into(),
+            "en-US,en;q=0.9".into(),
+            None,
+        );
+        assert!(geo.launch_block_reason(IpPolicy::NoHosting).is_none());
+        assert!(geo.launch_block_reason(IpPolicy::ResidentialOrMobile).is_none());
+
+        geo.is_hosting = Some(true);
+        geo.ip_kind = IpKind::Hosting;
+        geo.asn = "AS16509".into();
+        geo.isp = "Amazon".into();
+        let reason = geo.launch_block_reason(IpPolicy::ResidentialOrMobile).unwrap();
+        assert!(reason.contains("exit IP 1.2.3.4 is Hosting (AS16509 Amazon)"));
+        assert!(reason.contains("policy requires residential"));
+        assert!(geo.launch_block_reason(IpPolicy::NoHosting).unwrap().contains("no-hosting"));
+        assert!(geo.launch_block_reason(IpPolicy::Any).is_none());
+
+        geo.is_hosting = Some(false);
+        geo.is_mobile = Some(true);
+        geo.ip_kind = IpKind::Mobile;
+        geo.city = "Hangzhou".into();
+        assert!(geo.launch_block_reason(IpPolicy::ResidentialOrMobile).is_none());
+        assert_eq!(geo.quality_label().as_deref(), Some("Mobile · Hangzhou"));
+
+        let mut a = Profile::new_default("A", PlatformType::Windows);
+        let mut b = Profile::new_default("B", PlatformType::Windows);
+        a.resolved_geo = Some(geo.clone());
+        b.resolved_geo = Some(geo);
+        let note = Profile::shared_exit_label(&[a.clone(), b.clone()], &a).unwrap();
+        assert_eq!(note, "exit IP shared with 1 profiles");
+    }
+
+    #[test]
+    fn test_seed_urls_and_audit_coherence() {
+        let zh = seed_urls_for_locale("zh-CN");
+        assert!(zh.iter().any(|u| u.contains("baidu.com")));
+        let vi = seed_urls_for_locale("vi-VN");
+        assert!(vi.iter().any(|u| u.contains("vnexpress.net")));
+        assert!(seed_urls_for_locale("en-US").iter().any(|u| u.contains("wikipedia.org")));
+
+        let mut p = Profile::new_default("Audit", PlatformType::Windows);
+        p.custom_timezone = Some("Asia/Shanghai".into());
+        p.custom_locale = Some("zh-CN".into());
+        p.resolved_geo = Some(GeoInfo::core(
+            "1.2.3.4".into(),
+            "US".into(),
+            "America/New_York".into(),
+            "en-US".into(),
+            "en-US,en".into(),
+            None,
+        ));
+        assert!(!p.timezone_coherent());
+        assert!(!p.locale_coherent());
+        assert!(!p.seed_urls().is_empty());
+        assert!(p.seed_urls()[0].contains("baidu"));
+        let report = p.audit_report();
+        assert_eq!(report["webrtc"], "disable_non_proxied_udp");
+        assert_eq!(report["timezone_coherent"], false);
+        assert_eq!(report["ip_kind"], "Unknown");
     }
 
     #[test]

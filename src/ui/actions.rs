@@ -3012,6 +3012,7 @@ impl BonLoginApp {
             if let Some(ProfileStatus::Running(info)) = self.statuses.get(profile_id).cloned() {
                 let cdp_port = info.cdp_port;
                 let code_to_type = format!("{code}\n");
+                let type_seed = prof.seed;
                 let prof_name = prof.name.clone();
                 let tokio_handle = self.tokio_handle.clone();
                 self.banner_message = Some(format!(
@@ -3021,7 +3022,7 @@ impl BonLoginApp {
                 cx.spawn(async move |this, cx| {
                     let ok = tokio_handle
                         .spawn_blocking(move || {
-                            crate::launcher::cdp_type_as_human(cdp_port, &code_to_type).is_ok()
+                            crate::launcher::cdp_type_as_human(cdp_port, &code_to_type, type_seed).is_ok()
                         })
                         .await
                         .unwrap_or(false);
@@ -3532,12 +3533,12 @@ impl BonLoginApp {
             self.checked_profile_ids.contains(&p.id)
                 && matches!(self.statuses.get(&p.id), Some(ProfileStatus::Running(_)))
         });
-        let ports: Vec<u16> = self
+        let ports: Vec<(u16, u32)> = self
             .profiles
             .iter()
             .filter(|p| !use_checked || self.checked_profile_ids.contains(&p.id))
             .filter_map(|p| match self.statuses.get(&p.id) {
-                Some(ProfileStatus::Running(info)) => Some(info.cdp_port),
+                Some(ProfileStatus::Running(info)) => Some((info.cdp_port, p.seed)),
                 _ => None,
             })
             .collect();
@@ -3555,13 +3556,13 @@ impl BonLoginApp {
                     std::thread::scope(|s| {
                         let handles: Vec<_> = ports
                             .into_iter()
-                            .map(|port| {
+                            .map(|(port, seed)| {
                                 let v = val.clone();
                                 s.spawn(move || {
                                     if is_url {
                                         crate::launcher::cdp_navigate_page(port, &v).is_ok()
                                     } else {
-                                        crate::launcher::cdp_type_as_human(port, &v).is_ok()
+                                        crate::launcher::cdp_type_as_human(port, &v, seed).is_ok()
                                     }
                                 })
                             })
@@ -3603,10 +3604,16 @@ impl BonLoginApp {
             return;
         };
         let cdp_port = info.cdp_port;
+        let seed = self
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .map(|p| p.seed)
+            .unwrap_or(1);
         let tokio_handle = self.tokio_handle.clone();
         cx.spawn(async move |this, cx| {
             let res = tokio_handle
-                .spawn_blocking(move || crate::launcher::cdp_type_as_human(cdp_port, &clip))
+                .spawn_blocking(move || crate::launcher::cdp_type_as_human(cdp_port, &clip, seed))
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
             let _ = this.update(cx, |app, cx| {
@@ -3766,6 +3773,131 @@ impl BonLoginApp {
             dwell_secs: 5,
         }));
         cx.notify();
+    }
+
+    pub fn seed_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let urls = prof.seed_urls();
+        let pid = prof.id.clone();
+        let short_id = prof.short_id();
+        let name = prof.name.clone();
+        let existing_ws = match self.statuses.get(&pid) {
+            Some(ProfileStatus::Starting) => return,
+            Some(ProfileStatus::Running(info)) => Some(info.ws_url.clone()),
+            _ => None,
+        };
+        if existing_ws.is_none() {
+            self.statuses.insert(pid.clone(), ProfileStatus::Starting);
+        }
+        self.banner_message = Some(format!("Seeding '{name}' ({} pages)...", urls.len()));
+        cx.notify();
+        let tokio_handle = self.tokio_handle.clone();
+        let db = self.db.clone();
+        let sup = self.supervisor.clone();
+        let root = self.workspace_root.clone();
+        let join_handle = tokio_handle.spawn(async move {
+            let ws_url = if let Some(ws) = existing_ws {
+                ws
+            } else {
+                sup.ensure_launched(&db, &prof).await?.ws_url
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::launcher::run_cookie_robot_warmup_in(&root, &short_id, &ws_url, &urls, 4)
+            })
+            .await?
+        });
+        cx.spawn(async move |this, cx| {
+            let join_res = join_handle.await;
+            let _ = this.update(cx, |app, cx| {
+                let res = match join_res {
+                    Ok(r) => r,
+                    Err(e) if e.is_cancelled() => return,
+                    Err(e) => Err(anyhow::anyhow!("Seed task error: {e}")),
+                };
+                let live = app.supervisor.live_info(&pid);
+                match res {
+                    Ok(visited) if visited > 0 => {
+                        if let Ok(guard) = app.db.lock() {
+                            let _ = guard.mark_profile_seeded(&pid);
+                        }
+                        if let Some(info) = live {
+                            app.statuses.insert(pid.clone(), ProfileStatus::Running(info));
+                        }
+                        app.reload_profiles();
+                        app.banner_message = Some(format!(
+                            "Seeded '{name}': visited {visited} pages"
+                        ));
+                    }
+                    Ok(_) => {
+                        app.banner_message = Some(format!("Seed failed for '{name}': no page opened"));
+                    }
+                    Err(e) => {
+                        if let Some(info) = live {
+                            app.statuses.insert(pid.clone(), ProfileStatus::Running(info));
+                        }
+                        app.banner_message = Some(format!("Seed failed for '{name}': {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn audit_profile(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(prof) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+            return;
+        };
+        let name = prof.name.clone();
+        let existing = match self.statuses.get(profile_id) {
+            Some(ProfileStatus::Starting) => return,
+            Some(ProfileStatus::Running(info)) => Some(info.cdp_port),
+            _ => None,
+        };
+        if existing.is_none() {
+            self.statuses.insert(prof.id.clone(), ProfileStatus::Starting);
+        }
+        self.banner_message = Some(format!("Auditing '{name}'..."));
+        cx.notify();
+        let tokio_handle = self.tokio_handle.clone();
+        let db = self.db.clone();
+        let sup = self.supervisor.clone();
+        let root = self.workspace_root.clone();
+        let pid = prof.id.clone();
+        cx.spawn(async move |this, cx| {
+            let launched = if let Some(port) = existing {
+                Ok(port)
+            } else {
+                sup.ensure_launched(&db, &prof).await.map(|info| info.cdp_port)
+            };
+            let res = match launched {
+                Ok(port) => {
+                    tokio_handle
+                        .spawn_blocking(move || {
+                            crate::launcher::write_profile_audit(&root, &prof, port)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("Audit task error: {e}")))
+                }
+                Err(e) => Err(e),
+            };
+            let _ = this.update(cx, |app, cx| {
+                if let Some(info) = app.supervisor.live_info(&pid) {
+                    app.statuses.insert(pid, ProfileStatus::Running(info));
+                }
+                app.banner_message = Some(match res {
+                    Ok(report) => format!(
+                        "Audit '{name}' saved {}",
+                        report.get("json").and_then(|v| v.as_str()).unwrap_or("audits/")
+                    ),
+                    Err(e) => format!("Audit failed for '{name}': {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn start_cookie_robot(&mut self, cx: &mut Context<Self>) {

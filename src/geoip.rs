@@ -1,5 +1,5 @@
-use crate::models::{FreeProxyCandidate, GeoInfo, ProxyConfig, ProxyProtocol};
-use anyhow::{Context, Result, bail};
+use crate::models::{FreeProxyCandidate, GeoInfo, IpKind, ProxyConfig, ProxyProtocol};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -60,7 +60,24 @@ struct IpWhoResponse {
     success: bool,
     ip: Option<String>,
     country_code: Option<String>,
+    city: Option<String>,
+    region: Option<String>,
     timezone: Option<IpWhoTimezone>,
+    connection: Option<IpWhoConnection>,
+    security: Option<IpWhoSecurity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpWhoConnection {
+    asn: Option<serde_json::Value>,
+    isp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpWhoSecurity {
+    hosting: Option<bool>,
+    proxy: Option<bool>,
+    vpn: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +90,9 @@ struct IpInfoResponse {
     ip: Option<String>,
     country: Option<String>,
     timezone: Option<String>,
+    city: Option<String>,
+    region: Option<String>,
+    org: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +103,15 @@ struct IpApiResponse {
     country_code: Option<String>,
     query: Option<String>,
     timezone: Option<String>,
+    city: Option<String>,
+    #[serde(rename = "regionName")]
+    region_name: Option<String>,
+    #[serde(rename = "as")]
+    as_field: Option<String>,
+    isp: Option<String>,
+    proxy: Option<bool>,
+    hosting: Option<bool>,
+    mobile: Option<bool>,
 }
 
 fn build_geo_info(
@@ -98,14 +127,52 @@ fn build_geo_info(
         bail!("Incomplete GeoIP fields (ip='{ip}', country='{country_code}', tz='{timezone}')");
     }
     let (locale, accept_lang) = GeoInfo::locale_for_country(&country_code);
-    Ok(GeoInfo {
+    Ok(GeoInfo::core(
         ip,
         country_code,
         timezone,
         locale,
         accept_lang,
         latency_ms,
-    })
+    ))
+}
+
+fn asn_token(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (String::new(), String::new());
+    }
+    let mut parts = raw.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    if head.to_ascii_uppercase().starts_with("AS") && head.len() > 2 {
+        (head.to_string(), rest.to_string())
+    } else {
+        (String::new(), raw.to_string())
+    }
+}
+
+fn value_asn(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Number(n) => format!("AS{n}"),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                String::new()
+            } else if s.to_ascii_uppercase().starts_with("AS") {
+                s.to_string()
+            } else {
+                format!("AS{s}")
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn apply_kind(geo: &mut GeoInfo, hosting: Option<bool>, mobile: Option<bool>, proxy: Option<bool>) {
+    geo.is_hosting = hosting;
+    geo.is_mobile = mobile;
+    geo.ip_kind = GeoInfo::classify(hosting, mobile, proxy);
 }
 
 fn parse_ipwho_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
@@ -119,7 +186,26 @@ fn parse_ipwho_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
         .timezone
         .and_then(|t| t.id)
         .context("ipwho.is missing timezone.id")?;
-    build_geo_info(ip, country_code, timezone, latency_ms)
+    let mut geo = build_geo_info(ip, country_code, timezone, latency_ms)?;
+    if let Some(city) = parsed.city {
+        geo.city = city;
+    }
+    if let Some(region) = parsed.region {
+        geo.region = region;
+    }
+    if let Some(conn) = parsed.connection {
+        if let Some(asn) = conn.asn.as_ref() {
+            geo.asn = value_asn(asn);
+        }
+        if let Some(isp) = conn.isp {
+            geo.isp = isp;
+        }
+    }
+    if let Some(sec) = parsed.security {
+        let proxy = sec.proxy.or(sec.vpn);
+        apply_kind(&mut geo, sec.hosting, None, proxy);
+    }
+    Ok(geo)
 }
 
 fn parse_ipinfo_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
@@ -127,7 +213,19 @@ fn parse_ipinfo_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
     let ip = parsed.ip.context("ipinfo.io missing ip")?;
     let country_code = parsed.country.context("ipinfo.io missing country")?;
     let timezone = parsed.timezone.context("ipinfo.io missing timezone")?;
-    build_geo_info(ip, country_code, timezone, latency_ms)
+    let mut geo = build_geo_info(ip, country_code, timezone, latency_ms)?;
+    if let Some(city) = parsed.city {
+        geo.city = city;
+    }
+    if let Some(region) = parsed.region {
+        geo.region = region;
+    }
+    if let Some(org) = parsed.org {
+        let (asn, name) = asn_token(&org);
+        geo.asn = asn;
+        geo.isp = if name.is_empty() { org } else { name };
+    }
+    Ok(geo)
 }
 
 fn parse_ipapi_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
@@ -142,7 +240,55 @@ fn parse_ipapi_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
     let ip = parsed.query.context("ip-api.com missing query")?;
     let country_code = parsed.country_code.context("ip-api.com missing countryCode")?;
     let timezone = parsed.timezone.context("ip-api.com missing timezone")?;
-    build_geo_info(ip, country_code, timezone, latency_ms)
+    let mut geo = build_geo_info(ip, country_code, timezone, latency_ms)?;
+    if let Some(city) = parsed.city {
+        geo.city = city;
+    }
+    if let Some(region) = parsed.region_name {
+        geo.region = region;
+    }
+    if let Some(as_field) = parsed.as_field {
+        let (asn, name) = asn_token(&as_field);
+        if !asn.is_empty() {
+            geo.asn = asn;
+        }
+        if geo.isp.is_empty() {
+            geo.isp = if name.is_empty() { as_field } else { name };
+        }
+    }
+    if let Some(isp) = parsed.isp.filter(|s| !s.trim().is_empty()) {
+        geo.isp = isp;
+    }
+    if parsed.hosting.is_some() || parsed.mobile.is_some() {
+        apply_kind(&mut geo, parsed.hosting, parsed.mobile, parsed.proxy);
+    }
+    Ok(geo)
+}
+
+async fn finish_geo_race(
+    mut set: JoinSet<std::result::Result<GeoInfo, String>>,
+) -> std::result::Result<GeoInfo, String> {
+    let mut fallback = None;
+    let mut errors = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(geo)) if geo.is_hosting.is_some() => {
+                set.abort_all();
+                return Ok(geo);
+            }
+            Ok(Ok(geo)) => {
+                if fallback.is_none() {
+                    fallback = Some(geo);
+                }
+            }
+            Ok(Err(err)) => errors.push(err),
+            Err(join_err) => errors.push(format!("task join: {join_err}")),
+        }
+    }
+    if let Some(geo) = fallback {
+        return Ok(geo);
+    }
+    Err(errors.join(" | "))
 }
 
 pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoInfo> {
@@ -159,7 +305,7 @@ pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoIn
         ("ipinfo.io", "https://ipinfo.io/json", parse_ipinfo_json),
         (
             "ip-api.com",
-            "http://ip-api.com/json/?fields=status,message,countryCode,query,timezone",
+            "http://ip-api.com/json/?fields=status,message,countryCode,query,timezone,city,regionName,as,isp,proxy,hosting,mobile",
             parse_ipapi_json,
         ),
     ];
@@ -183,22 +329,9 @@ pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoIn
         });
     }
 
-    let mut errors = Vec::with_capacity(3);
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(geo)) => {
-                set.abort_all();
-                return Ok(geo);
-            }
-            Ok(Err(err)) => errors.push(err),
-            Err(join_err) => errors.push(format!("task join: {join_err}")),
-        }
-    }
-
-    bail!(
-        "Fail-closed: all GeoIP providers failed ({})",
-        errors.join(" | ")
-    )
+    finish_geo_race(set)
+        .await
+        .map_err(|errors| anyhow!("Fail-closed: all GeoIP providers failed ({errors})"))
 }
 
 /// Calls a proxy provider's IP rotation webhook (`change_ip_url`) directly and returns a short status summary.
@@ -276,18 +409,9 @@ pub async fn resolve_geo_via_port_fast(local_proxy_port: u16) -> Result<GeoInfo>
             parser(&text, Some(ms)).map_err(|e| format!("{name}: {e}"))
         });
     }
-    let mut last_err = String::from("timeout");
-    while let Some(joined) = set.join_next().await {
-        match joined {
-            Ok(Ok(geo)) => {
-                set.abort_all();
-                return Ok(geo);
-            }
-            Ok(Err(e)) => last_err = e,
-            Err(e) => last_err = e.to_string(),
-        }
-    }
-    bail!("Proxy check failed ({last_err})")
+    finish_geo_race(set)
+        .await
+        .map_err(|errors| anyhow!("Proxy check failed ({errors})"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +787,88 @@ mod tests {
         .unwrap();
         assert_eq!(g3.country_code, "JP");
         assert_eq!(g3.locale, "ja-JP");
+        assert_eq!(g3.ip_kind, IpKind::Unknown);
+        assert!(g3.is_hosting.is_none());
+    }
+
+    #[test]
+    fn test_parse_hosting_and_mobile_quality() {
+        let hosting = parse_ipapi_json(
+            r#"{
+                "status": "success",
+                "countryCode": "US",
+                "query": "1.2.3.4",
+                "timezone": "America/New_York",
+                "city": "Ashburn",
+                "regionName": "Virginia",
+                "as": "AS16509 Amazon.com, Inc.",
+                "isp": "Amazon",
+                "proxy": false,
+                "hosting": true,
+                "mobile": false
+            }"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(hosting.ip_kind, IpKind::Hosting);
+        assert_eq!(hosting.is_hosting, Some(true));
+        assert_eq!(hosting.asn, "AS16509");
+        assert_eq!(hosting.isp, "Amazon");
+        assert_eq!(hosting.city, "Ashburn");
+
+        let mobile = parse_ipapi_json(
+            r#"{
+                "status": "success",
+                "countryCode": "CN",
+                "query": "39.1.2.3",
+                "timezone": "Asia/Shanghai",
+                "city": "Hangzhou",
+                "proxy": false,
+                "hosting": false,
+                "mobile": true
+            }"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mobile.ip_kind, IpKind::Mobile);
+        assert_eq!(mobile.is_hosting, Some(false));
+        assert_eq!(mobile.quality_label().as_deref(), Some("Mobile · Hangzhou"));
+
+        let who = parse_ipwho_json(
+            r#"{
+                "success": true,
+                "ip": "8.8.8.8",
+                "country_code": "US",
+                "city": "Mountain View",
+                "region": "California",
+                "timezone": { "id": "America/Los_Angeles" },
+                "connection": { "asn": 15169, "isp": "Google" },
+                "security": { "hosting": false, "proxy": false, "vpn": false }
+            }"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(who.asn, "AS15169");
+        assert_eq!(who.isp, "Google");
+        assert_eq!(who.is_hosting, Some(false));
+        assert_eq!(who.ip_kind, IpKind::Unknown);
+
+        let info = parse_ipinfo_json(
+            r#"{
+                "ip": "3.5.1.1",
+                "country": "US",
+                "city": "Ashburn",
+                "region": "Virginia",
+                "timezone": "America/New_York",
+                "org": "AS16509 Amazon.com, Inc."
+            }"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(info.ip_kind, IpKind::Unknown);
+        assert!(info.is_hosting.is_none());
+        assert_eq!(info.asn, "AS16509");
+        assert!(info.launch_block_reason(crate::models::IpPolicy::NoHosting).is_none());
     }
 
     #[tokio::test]

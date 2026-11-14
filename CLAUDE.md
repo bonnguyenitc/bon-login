@@ -24,7 +24,7 @@ Agents working in this repository MUST proactively use the 12 TypeSafe Jev MCP j
    - Giao diện người dùng: **`gpui-kit = "0.9.0"`** (gói tích hợp chính thức từ `longbridge/gpui-component` gồm `gpui-pre = "=0.3.11"`, `gpui-component` và `gpui-kit-assets`, render GPU 120fps).
    - **KHÔNG** nhúng Electron, Tauri/WebView, Python runtime hay Node.js runtime để mở trình duyệt cơ bản.
 2. **Cách kết hợp `fingerprint-chromium` + `Patchright` + `agent-browser` trong kiến trúc Pure Rust:**
-   - **Khi người dùng mở Profile thủ công (Manual Multilogin):** Rust trực tiếp spawn tiến trình `Chromium.app` (`adryfish/fingerprint-chromium`) với bộ cờ **Patchright Stealth Args** (`--disable-blink-features=AutomationControlled`, bỏ `--enable-automation`, `--no-first-run`, `--fingerprint=<seed>`, v.v.) + mở sẵn `--remote-debugging-port=<cdp_port>`. Vì không có trình điều khiển nào gửi `Runtime.enable`, trình duyệt đạt độ tàng hình **100% giống hoặc cao hơn Patchright** mà tốn **0MB RAM** phụ trợ.
+   - **Khi người dùng mở Profile thủ công (Manual Multilogin):** Rust trực tiếp spawn tiến trình `Chromium.app` (`adryfish/fingerprint-chromium`) với bộ cờ **Patchright Stealth Args** (không truyền `--enable-automation`, không truyền `--disable-blink-features=AutomationControlled` vì Chromium 148 hiện infobar "unsupported flag", `--no-first-run`, `--fingerprint=<seed>`, v.v.) + mở sẵn `--remote-debugging-port=<cdp_port>`. Vì không có trình điều khiển nào gửi `Runtime.enable`, trình duyệt đạt độ tàng hình **100% giống hoặc cao hơn Patchright** mà tốn **0MB RAM** phụ trợ.
    - **Khi người dùng chạy kịch bản tự động hóa (`Patchright` hoặc `agent-browser`):**
      - **Với `Patchright` (Kịch bản code cố định Python/Node):** Rust cung cấp `http://127.0.0.1:<cdp_port>` (hoặc đọc `ws://...` từ `<user-data-dir>/DevToolsActivePort`) để `connect_over_cdp` nối thẳng vào profile đang mở.
      - **Với `vercel-labs/agent-browser` (`v0.41.2` — AI Agent tự hành):** Nhờ nhân C++ của `adryfish/fingerprint-chromium` đã vá sẵn leak `Runtime.enable`, CLI kết nối qua full WebSocket URL đọc từ `DevToolsActivePort`: `agent-browser --session bon_<id8> --input-mode human connect "ws://127.0.0.1:<cdp_port><ws_path>"` (kèm `AGENT_BROWSER_IDLE_TIMEOUT_MS=0`, cô lập thư mục tải về `downloads/bon_<id8>`, và `--pin-tab` nếu chạy đa agent trên cùng profile). Cách truyền thẳng `ws://...` giúp tránh lỗi `/json/version` 404 hoặc prompt trùng trên Chromium 144+ (Issue `#628`, `#1210`). Khi AI gọi `agent-browser close`, nó chỉ ngắt kết nối daemon chứ không tắt trình duyệt của người dùng.
@@ -172,7 +172,7 @@ bon-login/
 - `brand`: `BrowserBrand` (`Chrome` | `Edge` — mặc định `Chrome`)
 - `brand_version`: `String` (Mặc định `"148.0.7778.215"`)
 - `hardware_concurrency`: `u8` (`4`, `8`, `10`, `12`, `16`)
-- `gpu_spoofing`: `GpuSpoofMode` (`NativePassthrough` -> `--disable-spoofing=gpu` | `SeedGenerated` -> để `adryfish` tự fake)
+- `gpu_spoofing`: `GpuSpoofMode` (`NativePassthrough` trên macOS -> `--disable-spoofing=gpu` | `SeedGenerated`, hoặc profile Windows/Linux -> để `adryfish` tự fake GPU)
 - `proxy`: `Option<ProxyConfig>`:
   - `protocol`: `Http` | `Socks5`
   - `host`: `String`
@@ -218,15 +218,16 @@ vec![
     // 2. Cờ nhân adryfish/fingerprint-chromium (Fix Bẫy 2 & 3)
     format!("--fingerprint={}", profile.seed),
     format!("--fingerprint-platform={}", profile.os_platform.as_cli_str()),
-    format!("--fingerprint-platform-version={}", profile.os_version),
     format!("--fingerprint-brand={}", profile.brand.as_cli_str()), // "Chrome" hoặc "Edge"
-    format!("--fingerprint-brand-version={}", profile.brand_version),
     format!("--fingerprint-hardware-concurrency={}", profile.hardware_concurrency),
     format!("--timezone={}", timezone),
     format!("--lang={}", locale),
     format!("--accept-lang={}", accept_lang),
-    // Nếu trên macOS muốn BrowserScan xanh 100% GPU:
-    // "--disable-spoofing=gpu" (khi GpuSpoofMode::NativePassthrough)
+    // Không truyền `--fingerprint-brand-version` / `--fingerprint-platform-version`:
+    // adryfish 148 tự chọn Client Hints theo seed.
+    // `--disable-spoofing=gpu` chỉ khi macOS + NativePassthrough.
+    // Đúng một `--disable-features=` (OptimizationHints, thêm
+    // DisableLoadExtensionCommandLineSwitch khi có --load-extension).
     // 3. Khóa DNS qua Proxy Tunnel & Chống rò rỉ WebRTC UDP tuyệt đối (khi có Proxy)
     // (Nếu có local_proxy_port):
     // format!("--proxy-server=http://127.0.0.1:{}", local_proxy_port),
@@ -237,12 +238,18 @@ vec![
     "--enforce-webrtc-ip-permission-check".to_string(),
 
     // 4. Cờ Stealth chuẩn của Patchright (Loại bỏ dấu vết Automation)
-    "--disable-blink-features=AutomationControlled".to_string(),
+    // Không truyền --disable-blink-features=AutomationControlled (Chromium 148 báo cờ không hỗ trợ).
     "--no-first-run".to_string(),
     "--no-default-browser-check".to_string(),
     "--no-service-autorun".to_string(),
     "--password-store=basic".to_string(),
     "--use-mock-keychain".to_string(),
+    "--disable-breakpad".to_string(),
+    "--disable-crash-reporter".to_string(),
+    "--disable-background-networking".to_string(),
+    "--disable-component-update".to_string(),
+    "--no-pings".to_string(),
+    "--disable-domain-reliability".to_string(),
 
     // 5. Để Chromium tự cấp phát cổng CDP trống (tránh race condition) và ghi vào DevToolsActivePort
     "--remote-debugging-port=0".to_string(),

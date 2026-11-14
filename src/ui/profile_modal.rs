@@ -6,7 +6,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use crate::models::{
-    BrowserBrand, GpuSpoofMode, PlatformType, Profile, ProfileEditorDraft, SavedProxy,
+    BrowserBrand, GpuSpoofMode, IpPolicy, PlatformType, Profile, ProfileEditorDraft, SavedProxy,
 };
 use crate::ui::theme::{BonTheme, SfSymbol};
 use crate::ui::workspace_views::field_label;
@@ -194,6 +194,8 @@ pub fn render_edit_profile_view(
     let os_platform = p_ref.os_platform;
     let brand = p_ref.brand;
     let gpu_spoofing = p_ref.gpu_spoofing;
+    let ip_policy = p_ref.ip_policy;
+    let gpu_warn = p_ref.gpu_coherence_warning();
     let spoof_canvas = p_ref.spoof_canvas;
     let spoof_audio = p_ref.spoof_audio;
     let spoof_font = p_ref.spoof_font;
@@ -1046,6 +1048,59 @@ pub fn render_edit_profile_view(
                                                 })),
                                         ),
                                 )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .child(field_label("IP policy"))
+                                        .child(
+                                            Button::new("ip-policy-any")
+                                                .small()
+                                                .with_variant(BonTheme::toggle_pill(
+                                                    cx,
+                                                    ip_policy == IpPolicy::Any,
+                                                ))
+                                                .label("Any")
+                                                .on_click(cx.listener(|app, _, _, cx| {
+                                                    if let Some(m) = app.modal.as_mut() {
+                                                        m.draft.profile.ip_policy = IpPolicy::Any;
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("ip-policy-no-hosting")
+                                                .small()
+                                                .with_variant(BonTheme::toggle_pill(
+                                                    cx,
+                                                    ip_policy == IpPolicy::NoHosting,
+                                                ))
+                                                .label("No hosting")
+                                                .on_click(cx.listener(|app, _, _, cx| {
+                                                    if let Some(m) = app.modal.as_mut() {
+                                                        m.draft.profile.ip_policy = IpPolicy::NoHosting;
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("ip-policy-residential")
+                                                .small()
+                                                .with_variant(BonTheme::toggle_pill(
+                                                    cx,
+                                                    ip_policy == IpPolicy::ResidentialOrMobile,
+                                                ))
+                                                .label("Residential")
+                                                .on_click(cx.listener(|app, _, _, cx| {
+                                                    if let Some(m) = app.modal.as_mut() {
+                                                        m.draft.profile.ip_policy =
+                                                            IpPolicy::ResidentialOrMobile;
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        ),
+                                )
                                 .children((proxy_mode == ProxyEditMode::Direct).then(|| {
                                     div()
                                         .w_full()
@@ -1589,6 +1644,14 @@ pub fn render_edit_profile_view(
                                                 ),
                                         ),
                                 )
+                                .children(gpu_warn.map(|msg| {
+                                    div()
+                                        .w_full()
+                                        .pt_1()
+                                        .text_xs()
+                                        .text_color(BonTheme::warning())
+                                        .child(msg)
+                                }))
                                 .into_any_element(),
 
                             ProfileEditorTab::Cookies => v_flex()

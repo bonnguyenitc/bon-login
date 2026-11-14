@@ -6,6 +6,7 @@ mod db;
 mod extensions;
 mod flows;
 mod geoip;
+mod human;
 mod launcher;
 mod models;
 mod proxy_tunnel;

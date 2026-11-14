@@ -741,9 +741,18 @@ pub fn build_chromium_args_with_extensions(
             .join(",");
         args.push(format!("--disable-extensions-except={joined}"));
         args.push(format!("--load-extension={joined}"));
-        args.push("--disable-features=DisableLoadExtensionCommandLineSwitch".to_string());
     }
     args.push("--allow-file-access-from-files".to_string());
+
+    // Chromium keeps the last --disable-features value and does not merge duplicates.
+    let mut disabled_features = vec!["OptimizationHints"];
+    if !extension_dirs.is_empty() {
+        disabled_features.push("DisableLoadExtensionCommandLineSwitch");
+    }
+    args.push(format!(
+        "--disable-features={}",
+        disabled_features.join(",")
+    ));
 
     // WebRTC lock flags
     args.extend([
@@ -755,11 +764,18 @@ pub fn build_chromium_args_with_extensions(
 
     // Patchright Stealth flags
     args.extend([
+        // Chromium 148 rejects AutomationControlled and shows an unsupported-flag infobar.
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--no-service-autorun".to_string(),
         "--password-store=basic".to_string(),
         "--use-mock-keychain".to_string(),
+        "--disable-breakpad".to_string(),
+        "--disable-crash-reporter".to_string(),
+        "--disable-background-networking".to_string(),
+        "--disable-component-update".to_string(),
+        "--no-pings".to_string(),
+        "--disable-domain-reliability".to_string(),
     ]);
 
     // CDP dynamic port allocation
@@ -873,6 +889,10 @@ impl RunningProcess {
     pub fn stop_gracefully(&mut self) {
         let was_running = self.is_process_running();
         if was_running {
+            let seconds = self.launched_at.elapsed().as_secs().max(1) as i64;
+            if let Ok(db) = crate::db::Database::open_at(&self.root_dir) {
+                let _ = db.add_profile_activity(&self.profile_id, seconds, 1);
+            }
             flush_prelaunch_state_if_needed_in(
                 &self.root_dir,
                 &self.short_id,
@@ -1253,8 +1273,24 @@ pub(crate) async fn launch_profile_with_kernel_in(
         if let Some(proxy_cfg) = &profile.proxy {
             let mut tun = crate::proxy_tunnel::LocalProxyTunnel::start(proxy_cfg.clone()).await?;
             let port = tun.local_port();
-            match crate::geoip::resolve_geo_via_port(Some(port)).await {
-                Ok(geo) => Ok::<_, anyhow::Error>((Some(tun), Some(geo))),
+            let probed = crate::geoip::resolve_geo_via_port(Some(port)).await;
+            match probed {
+                Ok(geo) => {
+                    let root_for_store = root_dir.to_path_buf();
+                    let stored = geo.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(db) = crate::db::Database::open_at(&root_for_store) {
+                            let _ = db.put_ip_reputation(&stored);
+                        }
+                    })
+                    .await;
+                    if let Some(reason) = geo.launch_block_reason(profile.ip_policy) {
+                        tun.stop();
+                        Err(anyhow!("Proxy check failed (Fail-Closed): {reason}"))
+                    } else {
+                        Ok::<_, anyhow::Error>((Some(tun), Some(geo)))
+                    }
+                }
                 Err(e) => {
                     tun.stop();
                     Err(anyhow!("Proxy check failed (Fail-Closed): {e}"))
@@ -2205,7 +2241,7 @@ pub fn cdp_focus_window_in(
 
 /// Types `text` character-by-character into the focused element of a running Chromium window via
 /// page-target CDP `Input.dispatchKeyEvent` (no `Runtime.enable` or clipboard paste event).
-pub fn cdp_type_as_human(cdp_port: u16, text: &str) -> Result<usize> {
+pub fn cdp_type_as_human(cdp_port: u16, text: &str, seed: u32) -> Result<usize> {
     if text.is_empty() {
         return Ok(0);
     }
@@ -2252,7 +2288,9 @@ pub fn cdp_type_as_human(cdp_port: u16, text: &str) -> Result<usize> {
         cdp.call("Input.dispatchKeyEvent", down_params)?;
         cdp.call("Input.dispatchKeyEvent", up_params)?;
         typed += 1;
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(crate::human::key_pause_ms(
+            seed, typed, ch,
+        )));
     }
     Ok(typed)
 }
@@ -2263,7 +2301,7 @@ pub fn cdp_type_totp(profile: &Profile, cdp_port: u16) -> Result<String> {
     let (code, _) = profile
         .current_totp()
         .ok_or_else(|| anyhow!("Profile '{}' has no valid 2FA TOTP secret", profile.name))?;
-    cdp_type_as_human(cdp_port, &format!("{code}\n"))?;
+    cdp_type_as_human(cdp_port, &format!("{code}\n"), profile.seed)?;
     Ok(code)
 }
 
@@ -2302,6 +2340,43 @@ pub fn cdp_capture_screenshot_in(
     };
     std::fs::write(&out_path, png_bytes)?;
     Ok(out_path)
+}
+
+pub fn cdp_read_webdriver(cdp_port: u16) -> Result<Option<bool>> {
+    let (target_id, mut cdp) = CdpClient::connect_first_page(cdp_port)?;
+    let mut ctx = None;
+    let raw = cdp.eval_in_isolated_world(&target_id, &mut ctx, "String(navigator.webdriver)")?;
+    Ok(match raw.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    })
+}
+
+/// Opens the preflight card, screenshots it, and writes `audits/<short_id>-<ts>.{png,json}`.
+pub fn write_profile_audit(root_dir: &Path, profile: &Profile, cdp_port: u16) -> Result<serde_json::Value> {
+    let user_data_dir = profile_user_data_dir_in(root_dir, &profile.id)?;
+    let preflight = crate::bookmarks::write_profile_preflight_card(profile, &user_data_dir, None);
+    let _ = cdp_navigate_page(cdp_port, &preflight);
+    std::thread::sleep(Duration::from_millis(500));
+    let dir = root_dir.join("audits");
+    std::fs::create_dir_all(&dir)?;
+    let ts = unix_now();
+    let png_path = dir.join(format!("{}-{ts}.png", profile.short_id()));
+    let json_path = dir.join(format!("{}-{ts}.json", profile.short_id()));
+    let shot = cdp_capture_screenshot_in(root_dir, &profile.short_id(), cdp_port, Some(&png_path));
+    let webdriver = cdp_read_webdriver(cdp_port).ok().flatten();
+    let mut report = profile.audit_report();
+    report["preflight"] = serde_json::json!(preflight);
+    report["png"] = serde_json::json!(png_path.display().to_string());
+    report["json"] = serde_json::json!(json_path.display().to_string());
+    report["webdriver"] = serde_json::json!(webdriver);
+    if let Err(e) = &shot {
+        report["screenshot_error"] = serde_json::json!(e.to_string());
+    }
+    std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)?;
+    shot?;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -3293,6 +3368,51 @@ pub fn agent_import_state_or_cookies_in(
     Ok(format!("Imported {}", bundle.summary_badge()))
 }
 
+fn warmup_identity(root_dir: &Path, short_id: &str) -> (u32, u64) {
+    let Ok(db) = crate::db::Database::open_at(root_dir) else {
+        return (1, 1);
+    };
+    let Ok(profiles) = db.list_profiles() else {
+        return (1, 1);
+    };
+    let Some(p) = profiles.iter().find(|p| p.short_id() == short_id) else {
+        return (1, 1);
+    };
+    (p.seed, db.activity_sessions(&p.id).saturating_add(1))
+}
+
+fn viewport_from_metrics(v: &serde_json::Value) -> (i32, i32) {
+    let result = v.get("result").unwrap_or(v);
+    let pick = |node: &serde_json::Value| {
+        let w = node.get("clientWidth").and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
+        let h = node.get("clientHeight").and_then(|x| x.as_f64()).unwrap_or(0.0) as i32;
+        (w, h)
+    };
+    for key in ["cssLayoutViewport", "cssVisualViewport"] {
+        if let Some(node) = result.get(key) {
+            let (w, h) = pick(node);
+            if w > 1 && h > 1 {
+                return (w, h);
+            }
+        }
+    }
+    (0, 0)
+}
+
+fn play_human_steps(cdp: &mut CdpClient, steps: &[crate::human::HumanStep]) -> Result<()> {
+    for step in steps {
+        match step {
+            crate::human::HumanStep::Call { method, params } => {
+                cdp.call(method, params.clone())?;
+            }
+            crate::human::HumanStep::SleepMs(ms) => {
+                std::thread::sleep(Duration::from_millis(*ms));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Runs a Cookie Robot warm-up sequence on a running profile (`ws_url`), visiting each URL,
 /// scrolling naturally, waiting `dwell_secs`, and exporting the accumulated cookies to prelaunch storage.
 pub fn run_cookie_robot_warmup_in(
@@ -3317,37 +3437,42 @@ pub fn run_cookie_robot_warmup_in(
     if clean_urls.is_empty() {
         bail!("At least 1 warm-up URL is required");
     }
-    let session = ensure_agent_browser_connected_in(root_dir, short_id, ws_url)?;
     let cdp_port = extract_port_from_ws_url(ws_url);
+    let Some(port) = cdp_port else {
+        bail!("Warm-up needs a CDP port in {ws_url}");
+    };
+    let (seed, session_n) = warmup_identity(root_dir, short_id);
+    let (_, mut cdp) = CdpClient::connect_first_page(port)?;
     let wait_s = dwell_secs.clamp(1, 30);
     let mut visited = 0usize;
-    for url in &clean_urls {
-        if let Some(port) = cdp_port
-            && cdp_has_open_window(port) == Some(false)
-        {
+    for (page_ix, url) in clean_urls.iter().enumerate() {
+        if cdp_has_open_window(port) == Some(false) {
             break;
         }
-        let opened = agent_browser_cmd_for_short_id_in(root_dir, short_id)
-            .args(["--session", &session, "open", url])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !opened {
+        if cdp
+            .call("Page.navigate", serde_json::json!({ "url": url }))
+            .is_err()
+        {
             break;
         }
         visited += 1;
-        std::thread::sleep(Duration::from_millis(800));
-        let _ = agent_browser_cmd_for_short_id_in(root_dir, short_id)
-            .args(["--session", &session, "scroll", "down", "420"])
-            .output();
-        std::thread::sleep(Duration::from_secs(wait_s));
-        if let Some(port) = cdp_port
-            && cdp_has_open_window(port) == Some(false)
-        {
+        let metrics = cdp
+            .call("Page.getLayoutMetrics", serde_json::json!({}))
+            .unwrap_or(serde_json::Value::Null);
+        let (vw, vh) = viewport_from_metrics(&metrics);
+        let steps = crate::human::warmup_page(seed, session_n, page_ix as u64, vw, vh, wait_s);
+        if play_human_steps(&mut cdp, &steps).is_err() {
             break;
         }
-        let _ = agent_browser_cmd_for_short_id_in(root_dir, short_id)
-            .args(["--session", &session, "scroll", "up", "160"])
-            .output();
+    }
+    if visited > 0 {
+        if let Ok(db) = crate::db::Database::open_at(root_dir)
+            && let Ok(profiles) = db.list_profiles()
+            && let Some(p) = profiles.iter().find(|p| p.short_id() == short_id)
+        {
+            // shortcut: this dwell is also inside the browser session timed at stop, so attention can double-count it.
+            let _ = db.add_profile_activity(&p.id, (wait_s as i64) * visited as i64, 0);
+        }
     }
     if visited > 0
         && let Ok((_, live_json)) = agent_export_state_in(root_dir, short_id, ws_url)
@@ -3408,14 +3533,14 @@ mod tests {
         profile.gpu_spoofing = GpuSpoofMode::SeedGenerated;
         profile.startup_url = String::new();
 
-        let geo = GeoInfo {
-            ip: "203.0.113.9".to_string(),
-            country_code: "VN".to_string(),
-            timezone: "Asia/Ho_Chi_Minh".to_string(),
-            locale: "vi-VN".to_string(),
-            accept_lang: "vi-VN,vi,en-US;q=0.9,en;q=0.8".to_string(),
-            latency_ms: Some(95),
-        };
+        let geo = GeoInfo::core(
+            "203.0.113.9".to_string(),
+            "VN".to_string(),
+            "Asia/Ho_Chi_Minh".to_string(),
+            "vi-VN".to_string(),
+            "vi-VN,vi,en-US;q=0.9,en;q=0.8".to_string(),
+            Some(95),
+        );
 
         let data_dir = PathBuf::from("/tmp/bonlogin-test/profile-win");
         let args = build_chromium_args_with_extensions(&profile, Some(58123), &data_dir, Some(&geo), &[]);
@@ -3440,6 +3565,62 @@ mod tests {
             let s = Profile::random_seed();
             assert!(matches!(s % 13, 2 | 5));
         }
+    }
+
+    #[test]
+    fn test_chromium_args_one_disable_features_and_windows_native_gpu() {
+        let mut profile = Profile::new_default("Win Native", PlatformType::Windows);
+        profile.gpu_spoofing = GpuSpoofMode::NativePassthrough;
+        let data_dir = PathBuf::from("/tmp/bonlogin-test/profile-win-native");
+        let args = build_chromium_args_with_extensions(&profile, None, &data_dir, None, &[]);
+
+        let feature_flags: Vec<_> = args
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(feature_flags.len(), 1);
+        assert!(feature_flags[0].contains("OptimizationHints"));
+        assert!(!feature_flags[0].contains("DisableLoadExtensionCommandLineSwitch"));
+        assert!(!args.iter().any(|a| {
+            a.strip_prefix("--disable-spoofing=")
+                .is_some_and(|csv| csv.split(',').any(|part| part == "gpu"))
+        }));
+        assert!(!args.iter().any(|a| a.contains("AutomationControlled")));
+        for flag in [
+            "--disable-breakpad",
+            "--disable-crash-reporter",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--no-pings",
+            "--disable-domain-reliability",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}");
+        }
+
+        let ext = PathBuf::from("/tmp/bonlogin-test/ext");
+        let with_ext =
+            build_chromium_args_with_extensions(&profile, None, &data_dir, None, &[ext]);
+        let ext_flags: Vec<_> = with_ext
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(ext_flags.len(), 1);
+        assert!(ext_flags[0].contains("OptimizationHints"));
+        assert!(ext_flags[0].contains("DisableLoadExtensionCommandLineSwitch"));
+
+        let mut cli = Profile::new_default("Win Cli", PlatformType::Windows);
+        parse_profile_cli_flags(
+            &mut cli,
+            &[],
+            &[
+                "--os".to_string(),
+                "windows".to_string(),
+                "--gpu".to_string(),
+                "native".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(cli.gpu_spoofing, GpuSpoofMode::SeedGenerated);
     }
 
     #[test]
@@ -3554,6 +3735,52 @@ mod tests {
         assert!(html_patched.contains("__bon_ext_shim.js"));
         let manifest_patched = std::fs::read_to_string(tmp.join("manifest.json")).unwrap();
         assert!(manifest_patched.contains("\"<all_urls>\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn dead_proxy_is_fail_closed_when_reputation_is_cached() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bonlogin-dead-proxy-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let db = crate::db::Database::open_at(&tmp).unwrap();
+        let mut profile = Profile::new_default("Dead Proxy", PlatformType::MacOS);
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        profile.proxy = Some(ProxyConfig {
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port: closed_port,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            change_ip_url: None,
+        });
+        let geo = GeoInfo::core(
+            "203.0.113.9".to_string(),
+            "US".to_string(),
+            "America/Los_Angeles".to_string(),
+            "en-US".to_string(),
+            "en-US,en".to_string(),
+            Some(20),
+        );
+        profile.resolved_geo = Some(geo.clone());
+        db.put_ip_reputation(&geo).unwrap();
+        drop(db);
+        let kernel = tmp.join("not-a-kernel");
+        std::fs::write(&kernel, b"nope").unwrap();
+
+        let err = match launch_profile_with_kernel_in(&tmp, &profile, Some(&kernel)).await {
+            Ok(_) => panic!("dead proxy must not launch"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Proxy check failed"),
+            "cached reputation must not skip the live probe, got: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4418,7 +4645,7 @@ mod tests {
                 s2.write_all(&frame).unwrap();
             }
         });
-        let typed = cdp_type_as_human(port, "A\n").unwrap();
+        let typed = cdp_type_as_human(port, "A\n", 1).unwrap();
         assert_eq!(typed, 2);
         server.join().unwrap();
 

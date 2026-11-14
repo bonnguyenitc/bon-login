@@ -115,6 +115,14 @@ pub(crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+fn authority_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn parse_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> {
     let authority = authority.trim();
     if let Some(rest) = authority.strip_prefix('[')
@@ -251,9 +259,9 @@ async fn handle_http_upstream(
     req: ParsedClientRequest,
 ) -> Result<()> {
     if req.is_connect {
+        let authority = authority_host_port(&req.target_host, req.target_port);
         let connect_req = format!(
-            "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n{}\r\n",
-            req.target_host, req.target_port, req.target_host, req.target_port, auth_header
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{auth_header}\r\n"
         );
 
         let extra = timeout(HANDSHAKE_TIMEOUT, async {
@@ -358,13 +366,14 @@ async fn handle_socks5_upstream(
                     let k = k.trim();
                     k.eq_ignore_ascii_case("proxy-connection")
                         || k.eq_ignore_ascii_case("proxy-authorization")
+                        || k.eq_ignore_ascii_case("connection")
                 });
                 if !is_proxy_hdr {
                     out.extend_from_slice(line.as_bytes());
                     out.extend_from_slice(b"\r\n");
                 }
             }
-            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"Connection: close\r\n\r\n");
         } else {
             out.extend_from_slice(&req.rest_headers);
         }
@@ -383,35 +392,32 @@ async fn socks5_handshake_and_connect(
 ) -> Result<()> {
     if let Some(user) = proxy.username.as_deref() {
         let pass = proxy.password.as_deref().unwrap_or("");
-        upstream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
+        upstream.write_all(&[0x05, 0x01, 0x02]).await?;
         let mut greeting_resp = [0u8; 2];
         upstream.read_exact(&mut greeting_resp).await?;
-        if greeting_resp[0] != 0x05 {
-            bail!("Invalid SOCKS5 version from server: {}", greeting_resp[0]);
+        if greeting_resp != [0x05, 0x02] {
+            bail!(
+                "SOCKS5 server rejected username/password auth: {:02x?}",
+                greeting_resp
+            );
         }
-        match greeting_resp[1] {
-            0x00 => {}
-            0x02 => {
-                let u_bytes = user.as_bytes();
-                let p_bytes = pass.as_bytes();
-                if u_bytes.len() > 255 || p_bytes.len() > 255 {
-                    bail!("SOCKS5 username/password exceeds 255 bytes");
-                }
-                let mut auth_pkt = Vec::with_capacity(3 + u_bytes.len() + p_bytes.len());
-                auth_pkt.push(0x01);
-                auth_pkt.push(u_bytes.len() as u8);
-                auth_pkt.extend_from_slice(u_bytes);
-                auth_pkt.push(p_bytes.len() as u8);
-                auth_pkt.extend_from_slice(p_bytes);
-                upstream.write_all(&auth_pkt).await?;
+        let u_bytes = user.as_bytes();
+        let p_bytes = pass.as_bytes();
+        if u_bytes.len() > 255 || p_bytes.len() > 255 {
+            bail!("SOCKS5 username/password exceeds 255 bytes");
+        }
+        let mut auth_pkt = Vec::with_capacity(3 + u_bytes.len() + p_bytes.len());
+        auth_pkt.push(0x01);
+        auth_pkt.push(u_bytes.len() as u8);
+        auth_pkt.extend_from_slice(u_bytes);
+        auth_pkt.push(p_bytes.len() as u8);
+        auth_pkt.extend_from_slice(p_bytes);
+        upstream.write_all(&auth_pkt).await?;
 
-                let mut auth_resp = [0u8; 2];
-                upstream.read_exact(&mut auth_resp).await?;
-                if auth_resp[1] != 0x00 {
-                    bail!("SOCKS5 username/password authentication failed");
-                }
-            }
-            method => bail!("SOCKS5 server rejected auth methods (code 0x{method:02x})"),
+        let mut auth_resp = [0u8; 2];
+        upstream.read_exact(&mut auth_resp).await?;
+        if auth_resp[1] != 0x00 {
+            bail!("SOCKS5 username/password authentication failed");
         }
     } else {
         upstream.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -425,14 +431,29 @@ async fn socks5_handshake_and_connect(
         }
     }
 
-    // Always send ATYP = 0x03 (Domain Name) so DNS is NEVER resolved locally on the Mac
-    let host_bytes = target_host.as_bytes();
-    if host_bytes.is_empty() || host_bytes.len() > 255 {
-        bail!("Invalid SOCKS5 target host length: {}", host_bytes.len());
+    // Hostnames stay ATYP 0x03 so the Mac never resolves them. Literals are already IPs.
+    let mut connect_pkt = Vec::with_capacity(22);
+    connect_pkt.extend_from_slice(&[0x05, 0x01, 0x00]);
+    if let Ok(ip) = target_host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                connect_pkt.push(0x01);
+                connect_pkt.extend_from_slice(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                connect_pkt.push(0x04);
+                connect_pkt.extend_from_slice(&v6.octets());
+            }
+        }
+    } else {
+        let host_bytes = target_host.as_bytes();
+        if host_bytes.is_empty() || host_bytes.len() > 255 {
+            bail!("Invalid SOCKS5 target host length: {}", host_bytes.len());
+        }
+        connect_pkt.push(0x03);
+        connect_pkt.push(host_bytes.len() as u8);
+        connect_pkt.extend_from_slice(host_bytes);
     }
-    let mut connect_pkt = Vec::with_capacity(7 + host_bytes.len());
-    connect_pkt.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, host_bytes.len() as u8]);
-    connect_pkt.extend_from_slice(host_bytes);
     connect_pkt.extend_from_slice(&target_port.to_be_bytes());
     upstream.write_all(&connect_pkt).await?;
 
@@ -766,5 +787,237 @@ mod tests {
         assert_eq!(rel_req.target_host, "internal.example.org");
         assert_eq!(rel_req.target_port, 3000);
         assert_eq!(rel_req.first_line_rewritten, "GET /v1/ping HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn socks5_username_does_not_continue_when_server_picks_no_auth() {
+        let mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = mock.local_addr().unwrap().port();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = mock.accept().await else {
+                return;
+            };
+            let mut head = [0u8; 2];
+            if sock.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; head[1] as usize];
+            if sock.read_exact(&mut methods).await.is_err() {
+                return;
+            }
+            let _ = tx.send(methods);
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut next = [0u8; 8];
+            let n = timeout(Duration::from_millis(400), sock.read(&mut next))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(0);
+            let _ = tx.send(next[..n].to_vec());
+        });
+
+        let mut tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: Some("bonuser".to_string()),
+            password: Some("bonpass".to_string()),
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+            .await
+            .unwrap();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let methods = rx.recv().await.unwrap();
+        let followed = rx.recv().await.unwrap();
+        assert_eq!(methods, vec![0x02], "username must offer only RFC 1929 auth");
+        assert!(
+            followed.is_empty(),
+            "server chose no-auth, tunnel must not send CONNECT, got {followed:02x?}"
+        );
+        tunnel.stop();
+    }
+
+    #[tokio::test]
+    async fn socks5_plain_http_forces_connection_close() {
+        let mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = mock.local_addr().unwrap().port();
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = mock.accept().await else {
+                return;
+            };
+            let mut greet = [0u8; 3];
+            sock.read_exact(&mut greet).await.unwrap();
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req_head = [0u8; 4];
+            sock.read_exact(&mut req_head).await.unwrap();
+            assert_eq!(req_head[3], 0x03);
+            let mut dlen = [0u8; 1];
+            sock.read_exact(&mut dlen).await.unwrap();
+            let mut rest = vec![0u8; dlen[0] as usize + 2];
+            sock.read_exact(&mut rest).await.unwrap();
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let (hdr, _) = read_until_double_crlf(&mut sock).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&hdr).into_owned());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+
+        let mut tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: None,
+            password: None,
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", tunnel.local_port()))
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"GET http://example.com/a.js HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let forwarded = rx.recv().await.unwrap();
+        assert!(
+            forwarded.starts_with("GET /a.js HTTP/1.1\r\n"),
+            "got {forwarded}"
+        );
+        assert!(
+            forwarded.to_ascii_lowercase().contains("connection: close"),
+            "plain HTTP over SOCKS must close so the next request is rewritten, got {forwarded}"
+        );
+        assert!(!forwarded.to_ascii_lowercase().contains("keep-alive"));
+        tunnel.stop();
+    }
+
+    #[tokio::test]
+    async fn ipv6_literal_keeps_brackets_on_http_connect_and_socks_atyp_4() {
+        let http_mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_mock.local_addr().unwrap().port();
+        let (http_tx, mut http_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = http_mock.accept().await else {
+                return;
+            };
+            let Ok((hdr, _)) = read_until_double_crlf(&mut sock).await else {
+                return;
+            };
+            let _ = http_tx.send(String::from_utf8_lossy(&hdr).into_owned());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await;
+        });
+
+        let mut http_tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port: http_port,
+            username: None,
+            password: None,
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", http_tunnel.local_port()))
+            .await
+            .unwrap();
+        c.write_all(b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = read_until_double_crlf(&mut c).await;
+        let upstream = http_rx.recv().await.unwrap();
+        assert!(
+            upstream.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"),
+            "got {upstream}"
+        );
+        assert!(
+            upstream.contains("Host: [2001:db8::1]:443\r\n"),
+            "got {upstream}"
+        );
+        http_tunnel.stop();
+
+        let socks_mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = socks_mock.local_addr().unwrap().port();
+        let (atyp_tx, mut atyp_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>, u16)>();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = socks_mock.accept().await else {
+                return;
+            };
+            let mut greet = [0u8; 3];
+            sock.read_exact(&mut greet).await.unwrap();
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await.unwrap();
+            let atyp = head[3];
+            let (addr, port) = match atyp {
+                0x01 => {
+                    let mut rest = [0u8; 6];
+                    sock.read_exact(&mut rest).await.unwrap();
+                    (rest[..4].to_vec(), u16::from_be_bytes([rest[4], rest[5]]))
+                }
+                0x04 => {
+                    let mut rest = [0u8; 18];
+                    sock.read_exact(&mut rest).await.unwrap();
+                    (rest[..16].to_vec(), u16::from_be_bytes([rest[16], rest[17]]))
+                }
+                0x03 => {
+                    let mut dlen = [0u8; 1];
+                    sock.read_exact(&mut dlen).await.unwrap();
+                    let mut rest = vec![0u8; dlen[0] as usize + 2];
+                    sock.read_exact(&mut rest).await.unwrap();
+                    let port = u16::from_be_bytes([
+                        rest[rest.len() - 2],
+                        rest[rest.len() - 1],
+                    ]);
+                    rest.truncate(rest.len() - 2);
+                    (rest, port)
+                }
+                _ => (Vec::new(), 0),
+            };
+            let _ = atyp_tx.send((atyp, addr, port));
+            let _ = sock
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+        });
+
+        let mut socks_tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: socks_port,
+            username: None,
+            password: None,
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", socks_tunnel.local_port()))
+            .await
+            .unwrap();
+        s.write_all(b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = timeout(Duration::from_secs(2), read_until_double_crlf(&mut s)).await;
+        let (atyp, addr, port) = atyp_rx.recv().await.unwrap();
+        assert_eq!(atyp, 0x04);
+        assert_eq!(port, 443);
+        assert_eq!(addr, std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).octets());
+        socks_tunnel.stop();
     }
 }

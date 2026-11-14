@@ -1,6 +1,7 @@
 use crate::models::{
-    BrowserBrand, BrowserExtension, GeoInfo, GpuSpoofMode, PlatformType, Profile, ProxyConfig,
-    ProxyProtocol, SavedProxy, unix_now,
+    BrowserBrand, BrowserExtension, GeoInfo, GpuSpoofMode, IpKind, IpPolicy, PlatformType, Profile,
+    TrustStage,
+    ProxyConfig, ProxyProtocol, SavedProxy, unix_now,
 };
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
@@ -483,6 +484,7 @@ impl Database {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or(0);
         if current_version == SCHEMA_VERSION {
+            self.ensure_ip_quality_schema();
             return Ok(());
         }
 
@@ -717,7 +719,127 @@ impl Database {
             )?;
         }
         self.conn.execute_batch("RELEASE SAVEPOINT bon_init_exts; PRAGMA user_version = 1;")?;
+        self.ensure_ip_quality_schema();
 
+        Ok(())
+    }
+
+    fn ensure_ip_quality_schema(&self) {
+        for alter in [
+            "ALTER TABLE profiles ADD COLUMN ip_policy TEXT NOT NULL DEFAULT 'any'",
+            "ALTER TABLE profiles ADD COLUMN geo_quality TEXT",
+            "ALTER TABLE proxies ADD COLUMN geo_quality TEXT",
+            "ALTER TABLE profiles ADD COLUMN trust_stage TEXT NOT NULL DEFAULT 'new'",
+            "ALTER TABLE profiles ADD COLUMN seeded_at INTEGER",
+        ] {
+            let _ = self.conn.execute(alter, []);
+        }
+        let _ = self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ip_reputation (
+                ip TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                checked_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS profile_activity (
+                profile_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                attention_seconds INTEGER NOT NULL,
+                sessions INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, day)
+            );",
+        );
+    }
+
+    pub fn add_profile_activity(
+        &self,
+        profile_id: &str,
+        seconds: i64,
+        sessions: i64,
+    ) -> anyhow::Result<()> {
+        self.add_profile_activity_on(profile_id, &crate::models::utc_day_key(unix_now()), seconds, sessions)
+    }
+
+    pub fn add_profile_activity_on(
+        &self,
+        profile_id: &str,
+        day: &str,
+        seconds: i64,
+        sessions: i64,
+    ) -> anyhow::Result<()> {
+        if seconds <= 0 && sessions <= 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO profile_activity (profile_id, day, attention_seconds, sessions)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(profile_id, day) DO UPDATE SET
+               attention_seconds = attention_seconds + excluded.attention_seconds,
+               sessions = sessions + excluded.sessions",
+            params![profile_id, day, seconds.max(0), sessions.max(0)],
+        )?;
+        self.refresh_trust_stage(profile_id)
+    }
+
+    pub fn activity_sessions(&self, profile_id: &str) -> u64 {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(sessions), 0) FROM profile_activity WHERE profile_id = ?1",
+                [profile_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as u64
+    }
+
+    pub fn refresh_trust_stage(&self, profile_id: &str) -> anyhow::Result<()> {
+        let (seconds, days): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(attention_seconds), 0), COUNT(*)
+                 FROM profile_activity
+                 WHERE profile_id = ?1 AND attention_seconds > 0",
+                [profile_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+        let current: String = self
+            .conn
+            .query_row(
+                "SELECT trust_stage FROM profiles WHERE id = ?1",
+                [profile_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "new".to_string());
+        let next = TrustStage::from_cli(&current).from_activity(seconds, days);
+        self.conn.execute(
+            "UPDATE profiles SET trust_stage = ?1 WHERE id = ?2",
+            params![next.as_cli_str(), profile_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ip_reputation(&self, ip: &str) -> Option<GeoInfo> {
+        let (payload, checked_at): (String, i64) = self
+            .conn
+            .query_row(
+                "SELECT payload, checked_at FROM ip_reputation WHERE ip = ?1",
+                [ip],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()?;
+        if unix_now().saturating_sub(checked_at) > 86_400 {
+            return None;
+        }
+        serde_json::from_str(&payload).ok()
+    }
+
+    pub fn put_ip_reputation(&self, geo: &GeoInfo) -> anyhow::Result<()> {
+        let payload = serde_json::to_string(geo)?;
+        self.conn.execute(
+            "INSERT INTO ip_reputation (ip, payload, checked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(ip) DO UPDATE SET payload = excluded.payload, checked_at = excluded.checked_at",
+            params![geo.ip, payload, unix_now()],
+        )?;
         Ok(())
     }
 
@@ -732,7 +854,8 @@ impl Database {
                 startup_url, notes, created_at, last_launched_at,
                 spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
                 window_size, custom_timezone, custom_locale, geo_latency_ms,
-                tags, totp_secret, deleted_at, proxy_change_ip_url
+                tags, totp_secret, deleted_at, proxy_change_ip_url,
+                ip_policy, geo_quality, trust_stage, seeded_at
              FROM profiles
              WHERE deleted_at IS NULL
              ORDER BY created_at DESC",
@@ -749,7 +872,8 @@ impl Database {
                 startup_url, notes, created_at, last_launched_at,
                 spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
                 window_size, custom_timezone, custom_locale, geo_latency_ms,
-                tags, totp_secret, deleted_at, proxy_change_ip_url
+                tags, totp_secret, deleted_at, proxy_change_ip_url,
+                ip_policy, geo_quality, trust_stage, seeded_at
              FROM profiles
              WHERE deleted_at IS NOT NULL
              ORDER BY deleted_at DESC",
@@ -798,17 +922,28 @@ impl Database {
                     if !ip.is_empty() =>
                 {
                     let latency_ms = row.get::<_, Option<u32>>(31).ok().flatten();
-                    Some(GeoInfo {
+                    let mut geo = GeoInfo::core(
                         ip,
                         country_code,
                         timezone,
                         locale,
                         accept_lang,
                         latency_ms,
-                    })
+                    );
+                    if let Some(raw) = row.get::<_, Option<String>>(37).ok().flatten() {
+                        geo.apply_quality_json(&raw);
+                    }
+                    Some(geo)
                 }
                 _ => None,
             };
+            let ip_policy = row
+                .get::<_, Option<String>>(36)
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(IpPolicy::from_cli)
+                .unwrap_or_default();
 
             let window_size: String = row
                 .get::<_, Option<String>>(28)?
@@ -843,6 +978,15 @@ impl Database {
                     .filter(|s| !s.trim().is_empty()),
                 proxy,
                 resolved_geo,
+                ip_policy,
+                trust_stage: row
+                    .get::<_, Option<String>>(38)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    .map(TrustStage::from_cli)
+                    .unwrap_or_default(),
+                seeded_at: row.get::<_, Option<i64>>(39).ok().flatten(),
                 startup_url: row.get(20)?,
                 notes: row.get(21)?,
                 totp_secret,
@@ -879,7 +1023,7 @@ impl Database {
             None => (None, None, None, None, None, None),
         };
 
-        let (geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang, geo_latency_ms) =
+        let (geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang, geo_latency_ms, geo_quality) =
             match &profile.resolved_geo {
                 Some(g) => (
                     Some(g.ip.as_str()),
@@ -888,8 +1032,9 @@ impl Database {
                     Some(g.locale.as_str()),
                     Some(g.accept_lang.as_str()),
                     g.latency_ms,
+                    Some(g.quality_json()),
                 ),
-                None => (None, None, None, None, None, None),
+                None => (None, None, None, None, None, None, None),
             };
         let tags_csv = profile.tags_csv();
 
@@ -902,7 +1047,8 @@ impl Database {
                 proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang, geo_latency_ms,
                 startup_url, notes, created_at, last_launched_at,
-                tags, totp_secret, deleted_at, proxy_change_ip_url
+                tags, totp_secret, deleted_at, proxy_change_ip_url,
+                ip_policy, geo_quality, trust_stage, seeded_at
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
@@ -911,7 +1057,8 @@ impl Database {
                 ?18, ?19, ?20, ?21, ?22,
                 ?23, ?24, ?25, ?26, ?27, ?28,
                 ?29, ?30, ?31, ?32,
-                ?33, ?34, ?35, ?36
+                ?33, ?34, ?35, ?36,
+                ?37, ?38, ?39, ?40
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -948,7 +1095,11 @@ impl Database {
                 tags = excluded.tags,
                 totp_secret = excluded.totp_secret,
                 deleted_at = excluded.deleted_at,
-                proxy_change_ip_url = excluded.proxy_change_ip_url",
+                proxy_change_ip_url = excluded.proxy_change_ip_url,
+                ip_policy = excluded.ip_policy,
+                geo_quality = excluded.geo_quality,
+                trust_stage = excluded.trust_stage,
+                seeded_at = excluded.seeded_at",
         )?;
         stmt.execute(params![
             profile.id,
@@ -987,6 +1138,10 @@ impl Database {
             profile.totp_secret,
             profile.deleted_at,
             proxy_change_ip_url,
+            profile.ip_policy.as_cli_str(),
+            geo_quality,
+            profile.trust_stage.as_cli_str(),
+            profile.seeded_at,
         ])?;
         if !profile.group_tag.trim().is_empty() {
             let _ = self.insert_group(profile.group_tag.trim());
@@ -999,7 +1154,7 @@ impl Database {
         profile_id: &str,
         geo: Option<&GeoInfo>,
     ) -> anyhow::Result<()> {
-        let (ip, country, tz, locale, accept_lang, latency_ms) = match geo {
+        let (ip, country, tz, locale, accept_lang, latency_ms, quality) = match geo {
             Some(g) => (
                 Some(g.ip.as_str()),
                 Some(g.country_code.as_str()),
@@ -1007,15 +1162,33 @@ impl Database {
                 Some(g.locale.as_str()),
                 Some(g.accept_lang.as_str()),
                 g.latency_ms,
+                Some(g.quality_json()),
             ),
-            None => (None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None),
         };
         let mut stmt = self.conn.prepare_cached(
             "UPDATE profiles
-             SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4, geo_accept_lang = ?5, geo_latency_ms = ?6
-             WHERE id = ?7",
+             SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4, geo_accept_lang = ?5, geo_latency_ms = ?6, geo_quality = ?7
+             WHERE id = ?8",
         )?;
-        stmt.execute(params![ip, country, tz, locale, accept_lang, latency_ms, profile_id])?;
+        stmt.execute(params![
+            ip,
+            country,
+            tz,
+            locale,
+            accept_lang,
+            latency_ms,
+            quality,
+            profile_id
+        ])?;
+        Ok(())
+    }
+
+    pub fn mark_profile_seeded(&self, profile_id: &str) -> anyhow::Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE profiles SET seeded_at = ?1 WHERE id = ?2")?;
+        stmt.execute(params![unix_now(), profile_id])?;
         Ok(())
     }
 
@@ -1251,7 +1424,8 @@ impl Database {
             "SELECT
                 id, name, group_tag, protocol, host, port, username, password,
                 geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                geo_latency_ms, last_error, created_at, expired_at, change_ip_url
+                geo_latency_ms, last_error, created_at, expired_at, change_ip_url,
+                geo_quality
              FROM proxies
              ORDER BY created_at DESC",
         )?;
@@ -1268,13 +1442,19 @@ impl Database {
                 (Some(ip), Some(country_code), Some(timezone), Some(locale), Some(accept_lang))
                     if !ip.is_empty() =>
                 {
-                    Some(GeoInfo {
-                        ip,
-                        country_code,
-                        timezone,
-                        locale,
-                        accept_lang,
-                        latency_ms: row.get::<_, Option<u32>>(13).ok().flatten(),
+                    Some({
+                        let mut geo = GeoInfo::core(
+                            ip,
+                            country_code,
+                            timezone,
+                            locale,
+                            accept_lang,
+                            row.get::<_, Option<u32>>(13).ok().flatten(),
+                        );
+                        if let Some(raw) = row.get::<_, Option<String>>(18).ok().flatten() {
+                            geo.apply_quality_json(&raw);
+                        }
+                        geo
                     })
                 }
                 _ => None,
@@ -1313,17 +1493,19 @@ impl Database {
     }
 
     pub fn upsert_proxy(&self, proxy: &SavedProxy) -> anyhow::Result<()> {
-        let (geo_ip, geo_country, geo_tz, geo_loc, geo_lang, geo_ms) = match &proxy.resolved_geo {
-            Some(g) => (
-                Some(g.ip.as_str()),
-                Some(g.country_code.as_str()),
-                Some(g.timezone.as_str()),
-                Some(g.locale.as_str()),
-                Some(g.accept_lang.as_str()),
-                g.latency_ms,
-            ),
-            None => (None, None, None, None, None, None),
-        };
+        let (geo_ip, geo_country, geo_tz, geo_loc, geo_lang, geo_ms, geo_quality) =
+            match &proxy.resolved_geo {
+                Some(g) => (
+                    Some(g.ip.as_str()),
+                    Some(g.country_code.as_str()),
+                    Some(g.timezone.as_str()),
+                    Some(g.locale.as_str()),
+                    Some(g.accept_lang.as_str()),
+                    g.latency_ms,
+                    Some(g.quality_json()),
+                ),
+                None => (None, None, None, None, None, None, None),
+            };
 
         self.with_transaction(|db| {
             db.conn
@@ -1331,11 +1513,12 @@ impl Database {
                     "INSERT INTO proxies (
                         id, name, group_tag, protocol, host, port, username, password,
                         geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                        geo_latency_ms, last_error, created_at, expired_at, change_ip_url
+                        geo_latency_ms, last_error, created_at, expired_at, change_ip_url,
+                        geo_quality
                     ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                         ?9, ?10, ?11, ?12, ?13,
-                        ?14, ?15, ?16, ?17, ?18
+                        ?14, ?15, ?16, ?17, ?18, ?19
                     )
                     ON CONFLICT(id) DO UPDATE SET
                         name = excluded.name,
@@ -1353,7 +1536,8 @@ impl Database {
                         geo_latency_ms = excluded.geo_latency_ms,
                         last_error = excluded.last_error,
                         expired_at = excluded.expired_at,
-                        change_ip_url = excluded.change_ip_url",
+                        change_ip_url = excluded.change_ip_url,
+                        geo_quality = excluded.geo_quality",
                 )?
                 .execute(params![
                     proxy.id,
@@ -1374,6 +1558,7 @@ impl Database {
                     proxy.created_at,
                     proxy.expired_at,
                     proxy.config.change_ip_url.as_deref(),
+                    geo_quality,
                 ])?;
             db.conn
                 .prepare_cached(
@@ -1402,7 +1587,7 @@ impl Database {
         geo: Option<&GeoInfo>,
         err: Option<&str>,
     ) -> anyhow::Result<()> {
-        let (ip, country, tz, locale, accept_lang, latency_ms) = match geo {
+        let (ip, country, tz, locale, accept_lang, latency_ms, quality) = match geo {
             Some(g) => (
                 Some(g.ip.as_str()),
                 Some(g.country_code.as_str()),
@@ -1410,16 +1595,27 @@ impl Database {
                 Some(g.locale.as_str()),
                 Some(g.accept_lang.as_str()),
                 g.latency_ms,
+                Some(g.quality_json()),
             ),
-            None => (None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None),
         };
         let mut stmt = self.conn.prepare_cached(
             "UPDATE proxies
              SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
-                 geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = ?7
-             WHERE id = ?8",
+                 geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = ?7, geo_quality = ?8
+             WHERE id = ?9",
         )?;
-        stmt.execute(params![ip, country, tz, locale, accept_lang, latency_ms, err, proxy_id])?;
+        stmt.execute(params![
+            ip,
+            country,
+            tz,
+            locale,
+            accept_lang,
+            latency_ms,
+            err,
+            quality,
+            proxy_id
+        ])?;
         Ok(())
     }
 
@@ -1431,13 +1627,15 @@ impl Database {
     ) -> anyhow::Result<()> {
         let proto = cfg.protocol.as_str();
         let user = cfg.username.as_deref();
+        let quality = geo.quality_json();
         self.with_transaction(|db| {
             db.conn
                 .prepare_cached(
                     "UPDATE proxies
                      SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
-                         geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = NULL
-                     WHERE protocol = ?7 AND host = ?8 AND port = ?9 AND username IS ?10",
+                         geo_accept_lang = ?5, geo_latency_ms = ?6, last_error = NULL,
+                         geo_quality = ?7
+                     WHERE protocol = ?8 AND host = ?9 AND port = ?10 AND username IS ?11",
                 )?
                 .execute(params![
                     geo.ip,
@@ -1446,6 +1644,7 @@ impl Database {
                     geo.locale,
                     geo.accept_lang,
                     geo.latency_ms,
+                    quality,
                     proto,
                     cfg.host,
                     cfg.port,
@@ -1455,9 +1654,9 @@ impl Database {
                 .prepare_cached(
                     "UPDATE profiles
                      SET geo_ip = ?1, geo_country = ?2, geo_timezone = ?3, geo_locale = ?4,
-                         geo_accept_lang = ?5, geo_latency_ms = ?6
-                     WHERE proxy_protocol = ?7 AND proxy_host = ?8 AND proxy_port = ?9
-                       AND proxy_username IS ?10",
+                         geo_accept_lang = ?5, geo_latency_ms = ?6, geo_quality = ?7
+                     WHERE proxy_protocol = ?8 AND proxy_host = ?9 AND proxy_port = ?10
+                       AND proxy_username IS ?11",
                 )?
                 .execute(params![
                     geo.ip,
@@ -1466,6 +1665,7 @@ impl Database {
                     geo.locale,
                     geo.accept_lang,
                     geo.latency_ms,
+                    quality,
                     proto,
                     cfg.host,
                     cfg.port,
@@ -1661,14 +1861,15 @@ mod tests {
             password: Some("pass1".to_string()),
             change_ip_url: Some("http://rotate.local/api".to_string()),
         });
-        custom.resolved_geo = Some(GeoInfo {
-            ip: "198.51.100.10".to_string(),
-            country_code: "DE".to_string(),
-            timezone: "Europe/Berlin".to_string(),
-            locale: "de-DE".to_string(),
-            accept_lang: "de-DE,de,en-US;q=0.9".to_string(),
-            latency_ms: Some(142),
-        });
+        custom.ip_policy = IpPolicy::NoHosting;
+        custom.resolved_geo = Some(GeoInfo::core(
+            "198.51.100.10".to_string(),
+            "DE".to_string(),
+            "Europe/Berlin".to_string(),
+            "de-DE".to_string(),
+            "de-DE,de,en-US;q=0.9".to_string(),
+            Some(142),
+        ));
         db.upsert_profile(&custom).unwrap();
 
         let all = db.list_profiles().unwrap();
@@ -1678,6 +1879,24 @@ mod tests {
         assert_eq!(
             fetched.resolved_geo.as_ref().and_then(|g| g.latency_ms),
             Some(142)
+        );
+        assert_eq!(fetched.ip_policy, IpPolicy::NoHosting);
+        assert_eq!(fetched.trust_stage, TrustStage::New);
+        db.add_profile_activity(&custom.id, 30, 1).unwrap();
+        db.add_profile_activity_on(&custom.id, "2020-01-02", 20 * 60, 1)
+            .unwrap();
+        assert_eq!(
+            db.list_profiles().unwrap()[0].trust_stage,
+            TrustStage::Mature
+        );
+        let mut hosted = fetched.resolved_geo.clone().unwrap();
+        hosted.is_hosting = Some(true);
+        hosted.ip_kind = IpKind::Hosting;
+        hosted.asn = "AS16509".into();
+        db.put_ip_reputation(&hosted).unwrap();
+        assert_eq!(
+            db.get_ip_reputation(&hosted.ip).and_then(|g| g.is_hosting),
+            Some(true)
         );
 
         let json = serde_json::to_string(&vec![fetched.clone()]).unwrap();
@@ -1879,14 +2098,14 @@ mod tests {
             },
         );
         ws.upsert_proxy(&sp_us).unwrap();
-        let us_geo = GeoInfo {
-            ip: "198.51.100.1".to_string(),
-            country_code: "US".to_string(),
-            timezone: "America/New_York".to_string(),
-            locale: "en-US".to_string(),
-            accept_lang: "en-US,en;q=0.9".to_string(),
-            latency_ms: Some(45),
-        };
+        let us_geo = GeoInfo::core(
+            "198.51.100.1".to_string(),
+            "US".to_string(),
+            "America/New_York".to_string(),
+            "en-US".to_string(),
+            "en-US,en;q=0.9".to_string(),
+            Some(45),
+        );
         ws.sync_geo_for_proxy_endpoint(&sp_us.config, &us_geo).unwrap();
 
         let reloaded = ws.list_profiles().unwrap();

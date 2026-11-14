@@ -152,6 +152,13 @@ pub fn parse_profile_cli_flags(
                     next_val()?.trim().parse().context("Invalid --cores")?;
                 idx += 2;
             }
+            "--ip-policy" => {
+                let v = next_val()?.trim();
+                profile.ip_policy = crate::models::IpPolicy::from_cli(v).ok_or_else(|| {
+                    anyhow!("--ip-policy must be any|no-hosting|residential")
+                })?;
+                idx += 2;
+            }
             "--gpu" => {
                 let v = next_val()?.trim().to_ascii_lowercase();
                 profile.gpu_spoofing = if v == "native" || v == "passthrough" {
@@ -261,6 +268,11 @@ pub fn parse_profile_cli_flags(
             other => bail!("Unknown profile flag '{other}'"),
         }
     }
+    if profile.os_platform != PlatformType::MacOS
+        && profile.gpu_spoofing == GpuSpoofMode::NativePassthrough
+    {
+        profile.gpu_spoofing = GpuSpoofMode::SeedGenerated;
+    }
     if let Some(raw) = &parsed.cookies_raw
         && !raw.trim().is_empty()
     {
@@ -286,6 +298,9 @@ fn profile_summary_json_in(root_dir: &Path, p: &Profile) -> serde_json::Value {
         "brand_version": p.brand_version,
         "cores": p.hardware_concurrency,
         "gpu": p.gpu_spoofing.as_str(),
+        "ip_policy": p.ip_policy.as_cli_str(),
+        "trust_stage": p.trust_stage.as_cli_str(),
+        "seeded_at": p.seeded_at,
         "window_size": p.window_size,
         "proxy": p.proxy.as_ref().map(|px| px.display_short()).unwrap_or_else(|| "Direct".to_string()),
         "geo": p.resolved_geo.as_ref().map(|g| serde_json::json!({
@@ -294,6 +309,9 @@ fn profile_summary_json_in(root_dir: &Path, p: &Profile) -> serde_json::Value {
             "timezone": g.timezone,
             "locale": g.locale,
             "latency_ms": g.latency_ms,
+            "city": g.city,
+            "ip_kind": g.ip_kind.label(),
+            "is_hosting": g.is_hosting,
         })),
         "startup_url": p.startup_url,
         "notes": p.notes,
@@ -599,6 +617,7 @@ fn print_cli_help() {
            bon-login totp <id|name> [--type]                             Generate 6-digit 2FA code (and optionally type into browser)\n  \
            bon-login screenshot <id|name> [--out <file>]                 Capture PNG screenshot of running profile via CDP\n  \
            bon-login preflight <id|name|--group <g>|--all> [--open]      Generate zero-bandwidth Stealth & Proxy Health Preflight Card\n  \
+           bon-login audit <id|name>                                 Preflight card + PNG/JSON under audits/\n  \
            bon-login broadcast <open|type|totp> [val] [--group <g>]      Sync navigation/typing/2FA across running profiles\n  \
            bon-login synchronizer <master> [followers...|--group <g>] [--tile] [--duration <s>] Live 1-to-N mouse/key/scroll/URL mirror\n  \
            bon-login serve [--port <19820>]                              Start local HTTP JSON control plane for n8n/Python/agents\n  \
@@ -615,7 +634,7 @@ fn print_cli_help() {
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
            bon-login profile list [--group <g>] [--search <q>]\n  \
            bon-login profile show <id|name>\n  \
-           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--tags <t1,t2>] [--totp <secret>] [--proxy <saved_proxy|none>]\n                            [--proxy-tag <tag>] [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--startup-url <url>] [--notes <txt>] [--bookmarks <Name|URL,...>] [--cookies <file_or_json>]\n  \
+           bon-login profile create <name> [--os macos|windows|linux] [--brand chrome|edge]\n                            [--group <g>] [--tags <t1,t2>] [--totp <secret>] [--proxy <saved_proxy|none>]\n                            [--proxy-tag <tag>] [--seed <u32|random>] [--cores <n>] [--gpu native|seed]\n                            [--canvas on|off] [--audio on|off] [--font on|off] [--rects on|off]\n                            [--window-size <W,H>] [--timezone <tz|auto>] [--locale <loc|auto>]\n                            [--ip-policy any|no-hosting|residential]\n                            [--startup-url <url>] [--notes <txt>] [--bookmarks <Name|URL,...>] [--cookies <file_or_json>]\n  \
            bon-login profile update <id|name|--group <g>|--all> [same flags as create]\n  \
            bon-login profile bookmarks <id|name> [list|add <Name|URL>|clear]\n  \
            bon-login profile reseed <id|name|--group <g>|--all>\n  \
@@ -625,6 +644,7 @@ fn print_cli_help() {
            bon-login profile rotate-proxy <id|name|--group <g>|--all>\n  \
            bon-login profile clean-cache <id|name|--group <g>|--all>\n  \
            bon-login profile warmup <id|name|--group <g>|--all> [url1,url2...] [--dwell <secs>]\n  \
+           bon-login profile seed <id|name>                          One locale warm-up, then record seeded_at\n  \
            bon-login profile export-cookies <id|name> [--out <file>]\n  \
            bon-login profile import-cookies <id|name> <file_or_json>\n  \
            bon-login profile export-zip <id|name|--group <g>|--all>      Export full profile archive (.zip with cookies & user-data)\n  \
@@ -770,6 +790,7 @@ pub fn try_run_cli() -> Option<Result<()>> {
             "totp" | "2fa" => run_totp_cli(&args[1..]),
             "screenshot" | "shot" => run_screenshot_cli(&args[1..]),
             "preflight" | "start-page" => run_preflight_cli(&args[1..]),
+            "audit" => run_audit_cli(&args[1..]),
             "broadcast" | "multi" => run_broadcast_cli(&args[1..]),
             "synchronizer" | "sync-input" | "mirror" => run_synchronizer_cli(&args[1..]),
             "serve" | "server" => cli_tokio_handle().block_on(run_serve_cli(&args[1..])),
@@ -1474,6 +1495,37 @@ fn run_profile_subcommand(args: &[String]) -> Result<()> {
                     "id": restored.id,
                     "short_id": restored.short_id(),
                     "name": restored.name,
+                }))?
+            );
+            Ok(())
+        }
+        "seed" => {
+            let target = rest
+                .first()
+                .ok_or_else(|| anyhow!("Usage: bon-login profile seed <id|name>"))?;
+            let profiles = db.list_profiles()?;
+            let p = find_profile_by_query(&profiles, target)?;
+            let urls = p.seed_urls();
+            let info = ensure_profile_launched_via_supervisor(&db, p)?;
+            let visited = run_cookie_robot_warmup_in(
+                db.root_dir(),
+                &p.short_id(),
+                &info.ws_url,
+                &urls,
+                4,
+            )?;
+            if visited > 0 {
+                db.mark_profile_seeded(&p.id)?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": visited > 0,
+                    "short_id": p.short_id(),
+                    "name": p.name,
+                    "visited": visited,
+                    "urls": urls,
+                    "seeded_at": if visited > 0 { Some(crate::models::unix_now()) } else { None::<i64> },
                 }))?
             );
             Ok(())
@@ -2514,7 +2566,7 @@ fn run_type_cli(args: &[String]) -> Result<()> {
     let p = find_profile_by_query(&profiles, target)?;
     let rt = db.probe_live_runtime(&p.id)
         .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
-    let typed = cdp_type_as_human(rt.cdp_port, &text)?;
+    let typed = cdp_type_as_human(rt.cdp_port, &text, p.seed)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -2541,7 +2593,7 @@ fn run_totp_cli(args: &[String]) -> Result<()> {
     if do_type {
         let rt = db.probe_live_runtime(&p.id)
             .ok_or_else(|| anyhow!("Profile '{}' (bon_{}) is not running", p.name, p.short_id()))?;
-        cdp_type_as_human(rt.cdp_port, &format!("{code}\n"))?;
+        cdp_type_as_human(rt.cdp_port, &format!("{code}\n"), p.seed)?;
         typed = true;
     }
     println!(
@@ -2578,6 +2630,19 @@ fn run_screenshot_cli(args: &[String]) -> Result<()> {
             "path": path,
         }))?
     );
+    Ok(())
+}
+
+fn run_audit_cli(args: &[String]) -> Result<()> {
+    let target = args
+        .first()
+        .ok_or_else(|| anyhow!("Usage: bon-login audit <id|name>"))?;
+    let db = crate::db::Database::open_default()?;
+    let profiles = db.list_profiles()?;
+    let p = find_profile_by_query(&profiles, target)?;
+    let info = ensure_profile_launched_via_supervisor(&db, p)?;
+    let report = write_profile_audit(db.root_dir(), p, info.cdp_port)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -2650,7 +2715,7 @@ fn run_broadcast_cli(args: &[String]) -> Result<()> {
                 let v = val.clone();
                 s.spawn(move || match op {
                     "open" | "goto" | "navigate" => cdp_navigate_page(rt.cdp_port, &v).is_ok(),
-                    "type" => cdp_type_as_human(rt.cdp_port, &v).is_ok(),
+                    "type" => cdp_type_as_human(rt.cdp_port, &v, p.seed).is_ok(),
                     "totp" | "2fa" => cdp_type_totp(p, rt.cdp_port).is_ok(),
                     _ => false,
                 })
@@ -3350,9 +3415,10 @@ impl ControlEngine {
                             );
                         };
                         let body_owned = body.to_string();
+                        let seed = profile.seed;
                         Self::run_blocking_json(
                             500,
-                            move || cdp_type_as_human(rt.cdp_port, &body_owned),
+                            move || cdp_type_as_human(rt.cdp_port, &body_owned, seed),
                             |n| serde_json::json!({"ok": true, "typed_chars": n}),
                         )
                         .await
@@ -3386,6 +3452,70 @@ impl ControlEngine {
                             500,
                             move || cdp_capture_screenshot_in(&root_dir, &sid, rt.cdp_port, None),
                             |path| serde_json::json!({"ok": true, "path": path}),
+                        )
+                        .await
+                    }
+                    "seed" => {
+                        let info = match self.ensure_profile_running(&profile).await {
+                            Ok(i) => i,
+                            Err(e) => {
+                                return (
+                                    500,
+                                    serde_json::json!({"ok": false, "error": e.to_string()})
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        let urls = profile.seed_urls();
+                        let root_dir = self.supervisor.root_dir().to_path_buf();
+                        let sid = profile.short_id();
+                        let pid = profile.id.clone();
+                        let db = self.db.clone();
+                        let visited = tokio::task::spawn_blocking(move || {
+                            run_cookie_robot_warmup_in(&root_dir, &sid, &info.ws_url, &urls, 4)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow!("Warm-up task error: {e}")));
+                        match visited {
+                            Ok(n) if n > 0 => {
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.mark_profile_seeded(&pid);
+                                }
+                                self.notify_mutation();
+                                (
+                                    200,
+                                    serde_json::json!({"ok": true, "visited": n, "seeded": true})
+                                        .to_string(),
+                                )
+                            }
+                            Ok(n) => (
+                                502,
+                                serde_json::json!({"ok": false, "visited": n, "error": "No page opened"})
+                                    .to_string(),
+                            ),
+                            Err(e) => (
+                                502,
+                                serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+                            ),
+                        }
+                    }
+                    "audit" => {
+                        let info = match self.ensure_profile_running(&profile).await {
+                            Ok(i) => i,
+                            Err(e) => {
+                                return (
+                                    500,
+                                    serde_json::json!({"ok": false, "error": e.to_string()})
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        let root_dir = self.supervisor.root_dir().to_path_buf();
+                        let prof = profile.clone();
+                        Self::run_blocking_json(
+                            500,
+                            move || write_profile_audit(&root_dir, &prof, info.cdp_port),
+                            |report| report,
                         )
                         .await
                     }
@@ -3601,6 +3731,8 @@ pub const CONTROL_HTTP_ENDPOINTS: &[&str] = &[
     "POST /profiles/:id/totp",
     "POST /profiles/:id/screenshot",
     "POST /profiles/:id/preflight",
+    "POST /profiles/:id/seed",
+    "POST /profiles/:id/audit",
     "POST /profiles/:id/flow/:flow_name",
     "POST /arrange",
     "GET /synchronizer",

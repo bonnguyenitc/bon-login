@@ -727,7 +727,15 @@ pub fn render_proxies_view(
                                 let geo_str = if let Some(g) = &sp.resolved_geo {
                                     let short_tz =
                                         g.timezone.rsplit('/').next().unwrap_or(&g.timezone);
-                                    format!("{} ({}) • {short_tz}", g.compact_ip(), g.country_code)
+                                    let base = format!(
+                                        "{} ({}) • {short_tz}",
+                                        g.compact_ip(),
+                                        g.country_code
+                                    );
+                                    match g.quality_label() {
+                                        Some(q) => format!("{base} · {q}"),
+                                        None => base,
+                                    }
                                 } else if let Some(err) = &sp.last_error {
                                     err.clone()
                                 } else {
@@ -742,15 +750,23 @@ pub fn render_proxies_view(
                                     )
                                 } else if let Some(g) = &sp.resolved_geo {
                                     let ms = g.latency_ms.unwrap_or(0);
-                                    (
-                                        BonTheme::success_bg(),
-                                        BonTheme::success(),
-                                        if ms > 0 {
-                                            format!("LIVE • {ms}ms")
-                                        } else {
-                                            "LIVE".to_string()
-                                        },
-                                    )
+                                    if g.ip_kind == crate::models::IpKind::Hosting {
+                                        (
+                                            BonTheme::danger_bg(),
+                                            BonTheme::danger(),
+                                            "HOSTING".to_string(),
+                                        )
+                                    } else {
+                                        (
+                                            BonTheme::success_bg(),
+                                            BonTheme::success(),
+                                            if ms > 0 {
+                                                format!("LIVE • {ms}ms")
+                                            } else {
+                                                "LIVE".to_string()
+                                            },
+                                        )
+                                    }
                                 } else if sp.last_error.is_some() {
                                     (
                                         BonTheme::danger_bg(),

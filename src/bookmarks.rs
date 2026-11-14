@@ -269,6 +269,23 @@ pub fn write_profile_preflight_card(
     let (_, renderer) = profile
         .os_platform
         .webgl_for_seed(profile.seed, profile.gpu_spoofing);
+    let kind_label = geo.map(|g| g.ip_kind.label()).unwrap_or("Unknown");
+    let city_label = geo
+        .map(|g| g.city.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("—");
+    let asn_label = {
+        let asn = geo.map(|g| g.asn.as_str()).unwrap_or("");
+        let isp = geo.map(|g| g.isp.as_str()).unwrap_or("");
+        match (asn.is_empty(), isp.is_empty()) {
+            (true, true) => "—".to_string(),
+            (false, true) => asn.to_string(),
+            (true, false) => isp.to_string(),
+            (false, false) => format!("{asn} {isp}"),
+        }
+    };
+    let tz_ok = if profile.timezone_coherent() { "yes" } else { "MISMATCH" };
+    let loc_ok = if profile.locale_coherent() { "yes" } else { "MISMATCH" };
     let dns_lock = if profile.proxy.is_some() {
         "Locked (ATYP 0x03 Remote DNS)"
     } else {
@@ -330,6 +347,10 @@ pub fn write_profile_preflight_card(
       <h3>Network &amp; Fail-Closed Tunnel</h3>
       <div class="row"><span class="k">Proxy Endpoint</span><span class="v">{proxy}</span></div>
       <div class="row"><span class="k">Exit IP / Country</span><span class="v ok">{ip} ({cc})</span></div>
+      <div class="row"><span class="k">IP kind / City</span><span class="v">{kind} · {city}</span></div>
+      <div class="row"><span class="k">ASN / ISP</span><span class="v">{asn}</span></div>
+      <div class="row"><span class="k">Timezone coherent</span><span class="v">{tz_ok}</span></div>
+      <div class="row"><span class="k">Locale coherent</span><span class="v">{loc_ok}</span></div>
       <div class="row"><span class="k">DNS Leak Guard</span><span class="v ok">{dns}</span></div>
       <div class="row"><span class="k">WebRTC Policy</span><span class="v ok">disable_non_proxied_udp</span></div>
       <div class="row"><span class="k">Tunnel Latency</span><span class="v">{latency}</span></div>
@@ -371,6 +392,11 @@ pub fn write_profile_preflight_card(
         proxy = html_escape(&proxy_label),
         ip = html_escape(ip_label),
         cc = html_escape(cc_label),
+        kind = html_escape(kind_label),
+        city = html_escape(city_label),
+        asn = html_escape(&asn_label),
+        tz_ok = tz_ok,
+        loc_ok = loc_ok,
         dns = html_escape(dns_lock),
         latency = html_escape(&latency_label),
         seed = profile.seed,
