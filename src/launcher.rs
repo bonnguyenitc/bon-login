@@ -8,7 +8,7 @@ use crate::models::{
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Re-exports from extracted modules (callers still use crate::launcher::...)
 pub use crate::cookies::{NormalizedCookieBundle, parse_and_normalize_cookies, read_prelaunch_cookies_in, save_prelaunch_cookies_in};
@@ -2089,35 +2089,99 @@ impl CdpClient {
     }
 }
 
-fn cdp_first_page_target(cdp_port: u16) -> Result<(String, String)> {
+fn cdp_page_targets(cdp_port: u16) -> Result<Vec<(String, String)>> {
     let list_body =
         cdp_http_get_body(cdp_port, "/json/list").context("Failed to query CDP /json/list")?;
     let targets: serde_json::Value = serde_json::from_str(list_body.trim())?;
-    targets
+    let arr = targets
         .as_array()
-        .and_then(|arr| {
-            let find_page = |skip_internal: bool| {
-                arr.iter().find_map(|t| {
-                    let ty = t.get("type")?.as_str()?;
-                    let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                    let ok_url = !skip_internal
-                        || (!url.starts_with("chrome-extension://")
-                            && !url.starts_with("devtools://"));
-                    if !matches!(ty, "page" | "app") || !ok_url {
-                        return None;
-                    }
-                    let id = t.get("id")?.as_str()?.to_string();
-                    let ws = t
-                        .get("webSocketDebuggerUrl")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| format!("ws://127.0.0.1:{cdp_port}/devtools/page/{id}"));
-                    Some((id, ws))
-                })
-            };
-            find_page(true).or_else(|| find_page(false))
-        })
+        .context("CDP /json/list was not an array")?;
+    let mut pages = Vec::new();
+    let mut internal = Vec::new();
+    for t in arr {
+        let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(ty, "page" | "app") {
+            continue;
+        }
+        let Some(id) = t.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let ws = t
+            .get("webSocketDebuggerUrl")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("ws://127.0.0.1:{cdp_port}/devtools/page/{id}"));
+        let slot = (id.to_string(), ws);
+        if url.starts_with("chrome-extension://") || url.starts_with("devtools://") {
+            internal.push(slot);
+        } else {
+            pages.push(slot);
+        }
+    }
+    if pages.is_empty() {
+        pages = internal;
+    }
+    if pages.is_empty() {
+        bail!("No open browser page target found");
+    }
+    Ok(pages)
+}
+
+fn cdp_first_page_target(cdp_port: u16) -> Result<(String, String)> {
+    cdp_page_targets(cdp_port)?
+        .into_iter()
+        .next()
         .context("No open browser page target found")
+}
+
+const SYNC_PAGE_RANK_JS: &str =
+    "document.visibilityState==='visible'?(document.hasFocus()?'2':'1'):'0'";
+
+fn sync_page_rank(cdp: &mut CdpClient, target_id: &str) -> i32 {
+    let mut ctx = None;
+    match cdp
+        .eval_in_isolated_world(target_id, &mut ctx, SYNC_PAGE_RANK_JS)
+        .ok()
+        .as_deref()
+    {
+        Some("2") => 2,
+        Some("1") => 1,
+        _ => 0,
+    }
+}
+
+/// Page session for the tab the user is actually on.
+/// Rank 2: visible and focused. Rank 1: selected tab of an unfocused window.
+/// One tab skips the probe. Losing sockets are closed before the next dial.
+fn connect_focused_page(cdp_port: u16) -> Result<(String, CdpClient)> {
+    let pages = cdp_page_targets(cdp_port)?;
+    if pages.len() == 1 {
+        let (id, ws) = pages.into_iter().next().unwrap();
+        return Ok((id, CdpClient::connect(cdp_port, &ws)?));
+    }
+    let mut best_visible: Option<(String, String)> = None;
+    for (id, ws) in &pages {
+        let mut cdp = match CdpClient::connect(cdp_port, ws) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        cdp.set_read_timeout(Duration::from_millis(250));
+        let rank = sync_page_rank(&mut cdp, id);
+        if rank >= 2 {
+            return Ok((id.clone(), cdp));
+        }
+        drop(cdp);
+        if rank == 1 && best_visible.is_none() {
+            best_visible = Some((id.clone(), ws.clone()));
+        }
+    }
+    let (id, ws) = best_visible
+        .or_else(|| pages.into_iter().next())
+        .context("No open browser page target found")?;
+    let mut cdp = CdpClient::connect(cdp_port, &ws)?;
+    cdp.set_read_timeout(Duration::from_millis(250));
+    Ok((id, cdp))
 }
 
 /// Resizes, restores, or activates a running Chromium window via Browser-domain CDP (`Browser.setWindowBounds`),
@@ -2383,51 +2447,88 @@ pub fn write_profile_audit(root_dir: &Path, profile: &Profile, cdp_port: u16) ->
 // Multi-Profile Synchronizer (1-to-N Live Input & Navigation Mirror via CDP)
 // ---------------------------------------------------------------------------
 
+// shortcut: listeners sit on the top frame only. A click inside a cross-origin iframe is invisible until the pointer is on the parent page.
 const MASTER_SYNC_RECORDER_JS: &str = r#"(() => {
-  const st = window.__bonSyncState || (window.__bonSyncState = { q: [], hooked: false, lastUrl: location.href });
+  const st = window.__bonSyncState || (window.__bonSyncState = { q: [], hooked: false, buttons: 0 });
   if (!st.hooked) {
     st.hooked = true;
+    const mods = (e) => (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0);
+    const mask = (b) => (b === 1 ? 4 : b === 2 ? 2 : 1);
+    const pageBox = () => {
+      const de = document.documentElement;
+      const w = (de && de.clientWidth) || window.innerWidth || 1;
+      const h = (de && de.clientHeight) || window.innerHeight || 1;
+      return [w, h];
+    };
+    const at = (e) => {
+      const b = pageBox();
+      return { x: Math.round(e.clientX), y: Math.round(e.clientY), rx: e.clientX / b[0], ry: e.clientY / b[1], vw: b[0], vh: b[1] };
+    };
     const push = (ev) => {
-      ev.vw = window.innerWidth || 1280;
-      ev.vh = window.innerHeight || 800;
+      if (!ev.vw) {
+        const b = pageBox();
+        ev.vw = b[0];
+        ev.vh = b[1];
+      }
       if (st.q.length < 256) st.q.push(ev);
     };
+    window.addEventListener('mousemove', (e) => {
+      if (!e.isTrusted) return;
+      const p = at(e);
+      const ev = { k: 'mouse', sub: 'move', x: p.x, y: p.y, rx: p.rx, ry: p.ry, bt: st.buttons || 0, m: mods(e), vw: p.vw, vh: p.vh };
+      const tail = st.q[st.q.length - 1];
+      if (tail && tail.k === 'mouse' && tail.sub === 'move') st.q[st.q.length - 1] = ev;
+      else push(ev);
+    }, true);
     window.addEventListener('mousedown', (e) => {
       if (!e.isTrusted) return;
-      push({ k: 'mouse', sub: 'down', x: Math.round(e.clientX), y: Math.round(e.clientY), b: e.button || 0, c: e.detail || 1, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+      const p = at(e);
+      st.buttons |= mask(e.button || 0);
+      push({ k: 'mouse', sub: 'down', x: p.x, y: p.y, rx: p.rx, ry: p.ry, b: e.button || 0, bt: st.buttons, c: e.detail || 1, m: mods(e), vw: p.vw, vh: p.vh });
     }, true);
     window.addEventListener('mouseup', (e) => {
       if (!e.isTrusted) return;
-      push({ k: 'mouse', sub: 'up', x: Math.round(e.clientX), y: Math.round(e.clientY), b: e.button || 0, c: e.detail || 1, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+      const p = at(e);
+      st.buttons &= ~mask(e.button || 0);
+      push({ k: 'mouse', sub: 'up', x: p.x, y: p.y, rx: p.rx, ry: p.ry, b: e.button || 0, bt: Math.max(st.buttons, 0), c: e.detail || 1, m: mods(e), vw: p.vw, vh: p.vh });
     }, true);
-    let wt = null, wx = 0, wy = 0, lx = 0, ly = 0;
+    let wt = null, wx = 0, wy = 0, lx = 0, ly = 0, lm = 0;
     window.addEventListener('wheel', (e) => {
       if (!e.isTrusted) return;
-      wx += e.deltaX; wy += e.deltaY; lx = Math.round(e.clientX); ly = Math.round(e.clientY);
+      wx += e.deltaX; wy += e.deltaY; lx = e.clientX; ly = e.clientY; lm = mods(e);
       if (!wt) {
         wt = setTimeout(() => {
-          push({ k: 'wheel', x: lx, y: ly, dx: Math.round(wx), dy: Math.round(wy) });
+          const b = pageBox();
+          push({ k: 'wheel', x: Math.round(lx), y: Math.round(ly), rx: lx / b[0], ry: ly / b[1], dx: Math.round(wx), dy: Math.round(wy), m: lm, vw: b[0], vh: b[1] });
           wx = 0; wy = 0; wt = null;
         }, 45);
       }
     }, { capture: true, passive: true });
+    const skipKey = (e) => !e.isTrusted || e.isComposing || e.key === 'Process' || e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta';
     window.addEventListener('keydown', (e) => {
-      if (!e.isTrusted) return;
-      if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
-      push({ k: 'key', sub: 'down', key: e.key || '', code: e.code || '', vk: e.keyCode || 0, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+      if (skipKey(e)) return;
+      push({ k: 'key', sub: 'down', key: e.key || '', code: e.code || '', vk: e.keyCode || 0, m: mods(e) });
     }, true);
     window.addEventListener('keyup', (e) => {
-      if (!e.isTrusted) return;
-      if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return;
-      push({ k: 'key', sub: 'up', key: e.key || '', code: e.code || '', vk: e.keyCode || 0, m: (e.altKey?1:0)|(e.ctrlKey?2:0)|(e.metaKey?4:0)|(e.shiftKey?8:0) });
+      if (skipKey(e)) return;
+      push({ k: 'key', sub: 'up', key: e.key || '', code: e.code || '', vk: e.keyCode || 0, m: mods(e) });
+    }, true);
+    window.addEventListener('compositionend', (e) => {
+      if (!e.isTrusted || !e.data) return;
+      push({ k: 'text', text: e.data });
     }, true);
   }
-  if (location.href !== st.lastUrl) {
-    st.lastUrl = location.href;
-  }
   const out = st.q.splice(0, 64);
-  return JSON.stringify({ url: location.href, vw: window.innerWidth || 1280, vh: window.innerHeight || 800, events: out });
+  return JSON.stringify({ url: location.href, vw: window.innerWidth || 1280, vh: window.innerHeight || 800, f: document.hasFocus(), events: out });
 })()"#;
+
+fn default_sync_focus() -> bool {
+    true
+}
+
+fn missing_ratio() -> f64 {
+    -1.0
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SyncCapturedEvent {
@@ -2439,12 +2540,19 @@ pub struct SyncCapturedEvent {
     pub x: i32,
     #[serde(default)]
     pub y: i32,
+    /// Fraction of the page box (`clientX / clientWidth`). `-1` means raw pixels only.
+    #[serde(default = "missing_ratio")]
+    pub rx: f64,
+    #[serde(default = "missing_ratio")]
+    pub ry: f64,
     #[serde(default)]
     pub vw: i32,
     #[serde(default)]
     pub vh: i32,
     #[serde(rename = "b", default)]
     pub button: u8,
+    #[serde(rename = "bt", default)]
+    pub buttons: i32,
     #[serde(rename = "c", default)]
     pub click_count: i32,
     #[serde(rename = "m", default)]
@@ -2459,6 +2567,8 @@ pub struct SyncCapturedEvent {
     pub code: String,
     #[serde(default)]
     pub vk: i32,
+    #[serde(default)]
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -2469,6 +2579,9 @@ pub struct SyncMasterPollBatch {
     pub vw: i32,
     #[serde(default)]
     pub vh: i32,
+    /// Missing `f` means "stay on this tab". The recorder sends an explicit false when the tab is blurred.
+    #[serde(rename = "f", default = "default_sync_focus")]
+    pub focus: bool,
     #[serde(default)]
     pub events: Vec<SyncCapturedEvent>,
 }
@@ -2558,35 +2671,131 @@ pub fn scale_sync_point(
     (sx.clamp(0, dst_vw.max(1)), sy.clamp(0, dst_vh.max(1)))
 }
 
+/// Maps a fraction of the master page box onto the follower page box.
+pub fn scale_sync_ratio(rx: f64, ry: f64, dst_vw: i32, dst_vh: i32) -> (i32, i32) {
+    let dw = dst_vw.max(1);
+    let dh = dst_vh.max(1);
+    let sx = (rx.clamp(0.0, 1.0) * dw as f64).round() as i32;
+    let sy = (ry.clamp(0.0, 1.0) * dh as f64).round() as i32;
+    (sx.clamp(0, dw), sy.clamp(0, dh))
+}
+
+fn pointer_on_page(ev: &SyncCapturedEvent, dst_vw: i32, dst_vh: i32) -> (i32, i32) {
+    if ev.rx >= 0.0 && ev.ry >= 0.0 {
+        scale_sync_ratio(ev.rx, ev.ry, dst_vw, dst_vh)
+    } else {
+        scale_sync_point(ev.x, ev.y, ev.vw, ev.vh, dst_vw, dst_vh)
+    }
+}
+
+/// Scales a wheel delta from the master viewport edge to the follower edge.
+/// A non-zero delta that would round to 0 stays at one pixel so a slow tick still scrolls.
+pub fn scale_sync_delta(delta: i32, src: i32, dst: i32) -> i32 {
+    if delta == 0 || src <= 0 || dst <= 0 {
+        return delta;
+    }
+    let scaled = ((delta as f64) * (dst as f64) / (src as f64)).round() as i32;
+    if scaled == 0 { delta.signum() } else { scaled }
+}
+
+struct SyncSurface {
+    vw: i32,
+    vh: i32,
+    url: Option<String>,
+}
+
+fn parse_sync_surface(raw: &str) -> Option<SyncSurface> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if let Some(arr) = v.as_array() {
+        let vw = arr.first()?.as_i64()? as i32;
+        let vh = arr.get(1)?.as_i64()? as i32;
+        if vw <= 0 || vh <= 0 {
+            return None;
+        }
+        return Some(SyncSurface {
+            vw,
+            vh,
+            url: None,
+        });
+    }
+    let vw = v.get("w").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+    let vh = v.get("h").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+    if vw <= 0 || vh <= 0 {
+        return None;
+    }
+    Some(SyncSurface {
+        vw,
+        vh,
+        url: v
+            .get("u")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn sync_input_drove_navigation(events: &[SyncCapturedEvent]) -> bool {
+    events.iter().any(|e| {
+        (e.kind == "mouse" && matches!(e.sub.as_str(), "down" | "up"))
+            || (e.kind == "key" && e.key == "Enter")
+    })
+}
+
 /// Dispatches a batch of `SyncCapturedEvent`s (and optional URL navigation) onto a Follower CDP client.
 fn dispatch_sync_batch_to_follower(
     cdp: &mut CdpClient,
     follower_target_id: &str,
     follower_ctx_id: &mut Option<i64>,
     follower_vw_vh: &mut (i32, i32),
+    follower_url: &mut Option<String>,
+    vp_at: &mut Instant,
     nav_url: Option<&str>,
     events: &[SyncCapturedEvent],
 ) -> Result<usize> {
     let mut applied = 0usize;
+    let need_surface = follower_vw_vh.0 <= 0
+        || vp_at.elapsed() > Duration::from_millis(150)
+        || nav_url.is_some();
+    if need_surface
+        && let Ok(raw_vp) = cdp.eval_in_isolated_world(
+            follower_target_id,
+            follower_ctx_id,
+            "JSON.stringify({w:window.innerWidth||1280,h:window.innerHeight||800,u:location.href,f:document.hasFocus()})",
+        )
+        && let Some(surface) = parse_sync_surface(&raw_vp)
+    {
+        *follower_vw_vh = (surface.vw.max(200), surface.vh.max(200));
+        if surface.url.is_some() {
+            *follower_url = surface.url;
+        }
+        *vp_at = Instant::now();
+    }
     if let Some(u) = nav_url.filter(|u| {
-        !u.is_empty() && !u.starts_with("devtools://") && !u.starts_with("chrome-extension://")
+        !u.is_empty()
+            && !u.starts_with("devtools://")
+            && !u.starts_with("chrome-extension://")
+            && follower_url.as_deref() != Some(*u)
     }) {
         cdp.call("Page.navigate", serde_json::json!({ "url": u }))?;
         *follower_ctx_id = None;
+        *follower_url = Some(u.to_string());
+        *vp_at = Instant::now() - Duration::from_secs(1);
         applied += 1;
     }
     if events.is_empty() {
         return Ok(applied);
     }
-    if follower_vw_vh.0 <= 0
-        && let Ok(raw_vp) = cdp.eval_in_isolated_world(
-            follower_target_id,
-            follower_ctx_id,
-            "JSON.stringify([window.innerWidth||1280, window.innerHeight||800])",
-        )
-        && let Ok(pair) = serde_json::from_str::<[i32; 2]>(&raw_vp)
+    let has_pointer = events
+        .iter()
+        .any(|e| matches!(e.kind.as_str(), "mouse" | "wheel"));
+    if has_pointer
+        && let Ok(metrics) = cdp.call("Page.getLayoutMetrics", serde_json::json!({}))
     {
-        *follower_vw_vh = (pair[0].max(200), pair[1].max(200));
+        let (w, h) = viewport_from_metrics(&metrics);
+        if w > 1 && h > 1 {
+            *follower_vw_vh = (w, h);
+            *vp_at = Instant::now();
+        }
     }
     let (dst_vw, dst_vh) = if follower_vw_vh.0 > 0 {
         *follower_vw_vh
@@ -2597,63 +2806,95 @@ fn dispatch_sync_batch_to_follower(
     for ev in events {
         match ev.kind.as_str() {
             "mouse" => {
-                let (tx, ty) = scale_sync_point(ev.x, ev.y, ev.vw, ev.vh, dst_vw, dst_vh);
+                let (tx, ty) = pointer_on_page(ev, dst_vw, dst_vh);
                 let (btn_name, buttons_mask) = match ev.button {
                     2 => ("right", 2),
                     1 => ("middle", 4),
                     _ => ("left", 1),
                 };
-                if ev.sub == "down" {
-                    let _ = cdp.call(
-                        "Input.dispatchMouseEvent",
-                        serde_json::json!({
-                            "type": "mouseMoved",
-                            "x": tx,
-                            "y": ty,
-                            "modifiers": ev.modifiers,
-                        }),
-                    );
-                    cdp.call(
-                        "Input.dispatchMouseEvent",
-                        serde_json::json!({
-                            "type": "mousePressed",
-                            "x": tx,
-                            "y": ty,
-                            "button": btn_name,
-                            "buttons": buttons_mask,
-                            "clickCount": ev.click_count.max(1),
-                            "modifiers": ev.modifiers,
-                        }),
-                    )?;
-                } else {
-                    cdp.call(
-                        "Input.dispatchMouseEvent",
-                        serde_json::json!({
-                            "type": "mouseReleased",
-                            "x": tx,
-                            "y": ty,
-                            "button": btn_name,
-                            "buttons": 0,
-                            "clickCount": ev.click_count.max(1),
-                            "modifiers": ev.modifiers,
-                        }),
-                    )?;
+                let held = if ev.buttons != 0 { ev.buttons } else { buttons_mask };
+                match ev.sub.as_str() {
+                    "move" => {
+                        cdp.call(
+                            "Input.dispatchMouseEvent",
+                            serde_json::json!({
+                                "type": "mouseMoved",
+                                "x": tx,
+                                "y": ty,
+                                "button": "none",
+                                "buttons": ev.buttons,
+                                "modifiers": ev.modifiers,
+                            }),
+                        )?;
+                    }
+                    "down" => {
+                        let _ = cdp.call(
+                            "Input.dispatchMouseEvent",
+                            serde_json::json!({
+                                "type": "mouseMoved",
+                                "x": tx,
+                                "y": ty,
+                                "button": "none",
+                                "buttons": 0,
+                                "modifiers": ev.modifiers,
+                            }),
+                        );
+                        cdp.call(
+                            "Input.dispatchMouseEvent",
+                            serde_json::json!({
+                                "type": "mousePressed",
+                                "x": tx,
+                                "y": ty,
+                                "button": btn_name,
+                                "buttons": held,
+                                "clickCount": ev.click_count.max(1),
+                                "modifiers": ev.modifiers,
+                            }),
+                        )?;
+                    }
+                    "up" => {
+                        cdp.call(
+                            "Input.dispatchMouseEvent",
+                            serde_json::json!({
+                                "type": "mouseReleased",
+                                "x": tx,
+                                "y": ty,
+                                "button": btn_name,
+                                "buttons": ev.buttons,
+                                "clickCount": ev.click_count.max(1),
+                                "modifiers": ev.modifiers,
+                            }),
+                        )?;
+                    }
+                    _ => {}
                 }
                 applied += 1;
             }
             "wheel" => {
-                let (tx, ty) = scale_sync_point(ev.x, ev.y, ev.vw, ev.vh, dst_vw, dst_vh);
+                let (tx, ty) = pointer_on_page(ev, dst_vw, dst_vh);
                 cdp.call(
                     "Input.dispatchMouseEvent",
                     serde_json::json!({
                         "type": "mouseWheel",
                         "x": tx,
                         "y": ty,
-                        "deltaX": ev.dx,
-                        "deltaY": ev.dy,
+                        "deltaX": scale_sync_delta(ev.dx, ev.vw, dst_vw),
+                        "deltaY": scale_sync_delta(ev.dy, ev.vh, dst_vh),
+                        "modifiers": ev.modifiers,
                     }),
                 )?;
                 applied += 1;
+            }
+            "text" => {
+                let s = if ev.text.is_empty() {
+                    ev.key.as_str()
+                } else {
+                    ev.text.as_str()
+                };
+                if !s.is_empty() {
+                    cdp.call("Input.insertText", serde_json::json!({ "text": s }))?;
+                    applied += 1;
+                }
             }
             "key" => {
                 let is_down = ev.sub == "down";
@@ -2725,7 +2966,38 @@ struct FollowerConnState {
     target_id: String,
     ctx_id: Option<i64>,
     vw_vh: (i32, i32),
+    url: Option<String>,
+    vp_at: Instant,
     client: Option<CdpClient>,
+}
+
+fn attach_sync_page(port: u16) -> Option<(String, CdpClient)> {
+    let (id, mut cdp) = connect_focused_page(port).ok()?;
+    cdp.set_read_timeout(Duration::from_millis(250));
+    Some((id, cdp))
+}
+
+/// Another tab that currently has focus. `None` when every tab is blurred, so a click in BonLogin
+/// does not yank the mirror onto the oldest tab.
+fn other_focused_page(port: u16, current_id: &str) -> Option<(String, CdpClient)> {
+    let pages = cdp_page_targets(port).ok()?;
+    if pages.len() < 2 {
+        return None;
+    }
+    for (id, ws) in pages {
+        if id == current_id {
+            continue;
+        }
+        let Ok(mut cdp) = CdpClient::connect(port, &ws) else {
+            continue;
+        };
+        cdp.set_read_timeout(Duration::from_millis(250));
+        if sync_page_rank(&mut cdp, &id) >= 2 {
+            return Some((id, cdp));
+        }
+        drop(cdp);
+    }
+    None
 }
 
 /// Runs the blocking Master -> Followers CDP input & navigation synchronizer loop until `stop_flag` is set
@@ -2740,25 +3012,29 @@ pub fn run_multi_profile_synchronizer_loop(
     if follower_ports.is_empty() {
         bail!("At least 1 follower profile is required for Synchronizer");
     }
-    let (mut master_target_id, mut master_cdp) = CdpClient::connect_first_page(master_port)
+    let (mut master_target_id, mut master_cdp) = connect_focused_page(master_port)
         .with_context(|| format!("Failed to connect to Master profile CDP port {master_port}"))?;
+    master_cdp.set_read_timeout(Duration::from_millis(400));
     let mut master_ctx_id: Option<i64> = None;
     let mut last_master_url = String::new();
+    let mut last_focus_scan = Instant::now() - Duration::from_secs(1);
 
     let mut followers: Vec<FollowerConnState> = follower_ports
         .iter()
         .copied()
         .filter(|&p| p != master_port)
         .map(|port| {
-            let (tid, client) = match CdpClient::connect_first_page(port) {
-                Ok((t, c)) => (t, Some(c)),
-                Err(_) => (String::new(), None),
+            let (target_id, client) = match attach_sync_page(port) {
+                Some((id, cdp)) => (id, Some(cdp)),
+                None => (String::new(), None),
             };
             FollowerConnState {
                 port,
-                target_id: tid,
+                target_id,
                 ctx_id: None,
                 vw_vh: (0, 0),
+                url: None,
+                vp_at: Instant::now() - Duration::from_secs(1),
                 client,
             }
         })
@@ -2786,7 +3062,7 @@ pub fn run_multi_profile_synchronizer_loop(
                 if consecutive_master_errs > 12 {
                     break;
                 }
-                if let Ok((new_tid, new_c)) = CdpClient::connect_first_page(master_port) {
+                if let Some((new_tid, new_c)) = attach_sync_page(master_port) {
                     master_target_id = new_tid;
                     master_cdp = new_c;
                     master_ctx_id = None;
@@ -2797,45 +3073,72 @@ pub fn run_multi_profile_synchronizer_loop(
         };
 
         let batch: SyncMasterPollBatch = serde_json::from_str(&raw_json).unwrap_or_default();
-        let nav_url = if !batch.url.is_empty() && batch.url != last_master_url {
-            let changed = !last_master_url.is_empty();
-            last_master_url = batch.url.clone();
-            changed.then_some(last_master_url.as_str())
+        if !batch.focus && !batch.url.is_empty() && last_focus_scan.elapsed() > Duration::from_millis(400)
+        {
+            last_focus_scan = Instant::now();
+            if let Some((id, cdp)) = other_focused_page(master_port, &master_target_id) {
+                master_target_id = id;
+                master_cdp = cdp;
+                master_ctx_id = None;
+                continue;
+            }
+        }
+        // A click or Enter already asks the follower to navigate. Page.navigate on top of that reloads the page.
+        let driven = sync_input_drove_navigation(&batch.events);
+        let nav_url = if !batch.url.is_empty() && batch.url != last_master_url && !driven {
+            Some(batch.url.clone())
         } else {
             None
         };
+        if !batch.url.is_empty() {
+            last_master_url = batch.url.clone();
+        }
 
         if nav_url.is_some() || !batch.events.is_empty() {
-            for fl in &mut followers {
-                if fl.client.is_none()
-                    && let Ok((tid, c)) = CdpClient::connect_first_page(fl.port)
-                {
-                    fl.target_id = tid;
-                    fl.client = Some(c);
-                    fl.ctx_id = None;
-                    fl.vw_vh = (0, 0);
-                }
-                if let Some(cdp) = &mut fl.client {
-                    match dispatch_sync_batch_to_follower(
-                        cdp,
-                        &fl.target_id,
-                        &mut fl.ctx_id,
-                        &mut fl.vw_vh,
-                        nav_url,
-                        &batch.events,
-                    ) {
-                        Ok(n) => {
-                            total_mirrored = total_mirrored.saturating_add(n as u64);
-                            if let Some(cnt) = event_counter {
-                                cnt.fetch_add(n as u64, Ordering::Relaxed);
+            let added = std::sync::atomic::AtomicU64::new(0);
+            std::thread::scope(|scope| {
+                for fl in &mut followers {
+                    let added = &added;
+                    let nav_url = nav_url.clone();
+                    let events = &batch.events;
+                    scope.spawn(move || {
+                        if fl.client.is_none()
+                            && let Some((tid, cdp)) = attach_sync_page(fl.port)
+                        {
+                            fl.target_id = tid;
+                            fl.client = Some(cdp);
+                            fl.ctx_id = None;
+                            fl.vw_vh = (0, 0);
+                            fl.url = None;
+                            fl.vp_at = Instant::now() - Duration::from_secs(1);
+                        }
+                        if let Some(cdp) = &mut fl.client {
+                            match dispatch_sync_batch_to_follower(
+                                cdp,
+                                &fl.target_id,
+                                &mut fl.ctx_id,
+                                &mut fl.vw_vh,
+                                &mut fl.url,
+                                &mut fl.vp_at,
+                                nav_url.as_deref(),
+                                events,
+                            ) {
+                                Ok(n) => {
+                                    added.fetch_add(n as u64, Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    fl.client = None;
+                                    fl.ctx_id = None;
+                                }
                             }
                         }
-                        Err(_) => {
-                            fl.client = None;
-                            fl.ctx_id = None;
-                        }
-                    }
+                    });
                 }
+            });
+            let n = added.load(Ordering::Relaxed);
+            total_mirrored = total_mirrored.saturating_add(n);
+            if let Some(cnt) = event_counter {
+                cnt.fetch_add(n, Ordering::Relaxed);
             }
         }
         std::thread::sleep(Duration::from_millis(35));
@@ -6111,6 +6414,12 @@ mod tests {
 
         assert_eq!(scale_sync_point(500, 400, 1000, 800, 1920, 1080), (960, 540));
         assert_eq!(scale_sync_point(-10, 9999, 1000, 800, 1280, 720), (0, 720));
+        assert_eq!(scale_sync_delta(100, 800, 1600), 200);
+        assert_eq!(scale_sync_delta(1, 800, 100), 1);
+        assert_eq!(scale_sync_delta(0, 800, 1600), 0);
+        // 25% across a 2000px page, 50% down a 1600px page.
+        assert_eq!(scale_sync_ratio(0.25, 0.5, 2000, 1600), (500, 800));
+        assert_eq!(scale_sync_ratio(1.2, -0.2, 800, 600), (800, 0));
 
         fn spawn_mock_cdp(is_master: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6168,14 +6477,22 @@ mod tests {
                                 serde_json::from_slice(&payload).unwrap_or_default();
                             let id = msg["id"].as_u64().unwrap_or(1);
                             let method = msg["method"].as_str().unwrap_or("").to_string();
-                            log_cl.lock().unwrap().push(method.clone());
+                            let ty = msg["params"]["type"].as_str().unwrap_or("");
+                            let dy = msg["params"]["deltaY"].as_i64().unwrap_or(-1);
+                            let text = msg["params"]["text"].as_str().unwrap_or("");
+                            let x = msg["params"]["x"].as_i64().unwrap_or(-1);
+                            let y = msg["params"]["y"].as_i64().unwrap_or(-1);
+                            log_cl
+                                .lock()
+                                .unwrap()
+                                .push(format!("{method}|{ty}|{dy}|{text}|{x}|{y}"));
                             let reply = if method == "Page.createIsolatedWorld" {
                                 serde_json::json!({"id": id, "result": {"executionContextId": 77}})
                             } else if method == "Runtime.evaluate" {
                                 let val_str = if is_master {
                                     poll_count += 1;
                                     if poll_count == 1 {
-                                        r#"{"url":"https://example.com/a","vw":1000,"vh":800,"events":[{"k":"mouse","sub":"down","x":500,"y":400,"vw":1000,"vh":800,"b":0,"c":1,"m":0},{"k":"key","sub":"down","key":"a","code":"KeyA","vk":65,"m":0}]}"#
+                                        r#"{"url":"https://example.com/a","vw":1000,"vh":800,"events":[{"k":"mouse","sub":"move","x":500,"y":400,"rx":0.25,"ry":0.5,"vw":1000,"vh":800,"bt":0,"m":0},{"k":"mouse","sub":"down","x":500,"y":400,"vw":1000,"vh":800,"b":0,"c":1,"m":0},{"k":"wheel","x":10,"y":10,"vw":1000,"vh":800,"dx":0,"dy":100},{"k":"text","text":"à"},{"k":"key","sub":"down","key":"a","code":"KeyA","vk":65,"m":0}]}"#
                                     } else {
                                         r#"{"url":"https://example.com/b","vw":1000,"vh":800,"events":[]}"#
                                     }
@@ -6217,11 +6534,171 @@ mod tests {
         assert!(mirrored >= 3, "expected mouse + key + url navigation mirrored, got {mirrored}");
         let master_methods = m_log.lock().unwrap().clone();
         let follower_methods = f_log.lock().unwrap().clone();
-        assert!(!master_methods.iter().any(|m| m == "Runtime.enable"));
-        assert!(!follower_methods.iter().any(|m| m == "Runtime.enable"));
-        assert!(follower_methods.iter().any(|m| m == "Input.dispatchMouseEvent"));
-        assert!(follower_methods.iter().any(|m| m == "Input.dispatchKeyEvent"));
-        assert!(follower_methods.iter().any(|m| m == "Page.navigate"));
+        assert!(!master_methods.iter().any(|m| m.starts_with("Runtime.enable")));
+        assert!(!follower_methods.iter().any(|m| m.starts_with("Runtime.enable")));
+        assert!(
+            follower_methods
+                .iter()
+                .any(|m| m.starts_with("Input.dispatchMouseEvent|mouseMoved|")),
+            "pointer move must be mirrored, got {follower_methods:?}"
+        );
+        assert!(
+            follower_methods.iter().any(|m| m.contains("mouseMoved|") && m.ends_with("|500|800")),
+            "move must be a fraction of the page, got {follower_methods:?}"
+        );
+        assert!(
+            !follower_methods
+                .iter()
+                .any(|m| m.starts_with("Input.dispatchMouseEvent|mouseReleased|")),
+            "a move is not a mouseup, got {follower_methods:?}"
+        );
+        assert!(
+            follower_methods
+                .iter()
+                .any(|m| m.starts_with("Input.dispatchMouseEvent|mousePressed|"))
+        );
+        assert!(
+            follower_methods
+                .iter()
+                .any(|m| m.starts_with("Input.dispatchMouseEvent|mouseWheel|") && m.contains("|200|")),
+            "wheel delta must scale with viewport, got {follower_methods:?}"
+        );
+        assert!(
+            follower_methods
+                .iter()
+                .any(|m| m.starts_with("Input.insertText|") && m.contains("|à")),
+            "IME commit must use insertText, got {follower_methods:?}"
+        );
+        assert!(follower_methods.iter().any(|m| m.starts_with("Input.dispatchKeyEvent|")));
+        assert!(follower_methods.iter().any(|m| m.starts_with("Page.navigate|")));
+    }
+
+    #[test]
+    fn test_synchronizer_attaches_focused_tab_not_first_target() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn serve(is_master: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log_cl = log.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut s = stream;
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if req.starts_with("GET /json/list") {
+                        let body = format!(
+                            r#"[{{"id":"stale","type":"page","url":"https://example.com/stale","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/stale"}},{{"id":"live","type":"page","url":"https://example.com/live","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/page/live"}}]"#
+                        );
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                        continue;
+                    }
+                    if !req.contains("Upgrade: websocket") {
+                        continue;
+                    }
+                    let live = req.contains("/devtools/page/live");
+                    let _ = s.write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    );
+                    while let Ok(h) = {
+                        let mut b = [0u8; 2];
+                        s.read_exact(&mut b).map(|_| b)
+                    } {
+                        let len0 = (h[1] & 0x7f) as usize;
+                        let len = if len0 == 126 {
+                            let mut ext = [0u8; 2];
+                            if s.read_exact(&mut ext).is_err() {
+                                break;
+                            }
+                            u16::from_be_bytes(ext) as usize
+                        } else {
+                            len0
+                        };
+                        let mut mask = [0u8; 4];
+                        if s.read_exact(&mut mask).is_err() {
+                            break;
+                        }
+                        let mut payload = vec![0u8; len];
+                        if s.read_exact(&mut payload).is_err() {
+                            break;
+                        }
+                        for (i, b) in payload.iter_mut().enumerate() {
+                            *b ^= mask[i & 3];
+                        }
+                        let msg: serde_json::Value =
+                            serde_json::from_slice(&payload).unwrap_or_default();
+                        let id = msg["id"].as_u64().unwrap_or(1);
+                        let method = msg["method"].as_str().unwrap_or("");
+                        if is_master {
+                            log_cl.lock().unwrap().push(format!(
+                                "{}:{method}",
+                                if live { "live" } else { "stale" }
+                            ));
+                        } else if method.starts_with("Input.") || method == "Page.navigate" {
+                            log_cl.lock().unwrap().push(method.to_string());
+                        }
+                        let expr = msg["params"]["expression"].as_str().unwrap_or("");
+                        let value = if expr.contains("visibilityState") {
+                            if live { "2" } else { "0" }
+                        } else if live {
+                            r#"{"url":"https://example.com/live","vw":800,"vh":600,"f":true,"events":[{"k":"mouse","sub":"down","x":10,"y":10,"vw":800,"vh":600,"b":0,"c":1}]}"#
+                        } else {
+                            r#"{"url":"https://example.com/stale","vw":800,"vh":600,"f":false,"events":[]}"#
+                        };
+                        let reply = if method == "Page.createIsolatedWorld" {
+                            serde_json::json!({"id": id, "result": {"executionContextId": 3}})
+                        } else if method == "Runtime.evaluate" {
+                            serde_json::json!({"id": id, "result": {"result": {"type": "string", "value": value}}})
+                        } else {
+                            serde_json::json!({"id": id, "result": {}})
+                        };
+                        let r_bytes = reply.to_string().into_bytes();
+                        let mut frame = if r_bytes.len() < 126 {
+                            vec![0x81, r_bytes.len() as u8]
+                        } else {
+                            let l = (r_bytes.len() as u16).to_be_bytes();
+                            vec![0x81, 126, l[0], l[1]]
+                        };
+                        frame.extend_from_slice(&r_bytes);
+                        if s.write_all(&frame).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            (port, log)
+        }
+
+        let (m_port, m_log) = serve(true);
+        let (f_port, f_log) = serve(false);
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = stop_flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(350));
+            stop_bg.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let mirrored =
+            run_multi_profile_synchronizer_loop(m_port, &[f_port], &stop_flag, None).unwrap();
+        let master = m_log.lock().unwrap().clone();
+        let follower = f_log.lock().unwrap().clone();
+        assert!(
+            mirrored >= 1,
+            "focused tab events were not mirrored; master={master:?} follower={follower:?}"
+        );
+        assert!(
+            master.iter().any(|m| m.starts_with("live:")),
+            "synchronizer stayed on the first unfocused target: {master:?}"
+        );
+        assert!(follower.iter().any(|m| m == "Input.dispatchMouseEvent"));
     }
 
     #[test]
