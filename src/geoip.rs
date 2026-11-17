@@ -7,6 +7,7 @@ use tokio::task::JoinSet;
 
 const GEO_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const GEO_TIMEOUT: Duration = Duration::from_secs(6);
+const GEO_TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
 
 static DIRECT_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -265,12 +266,49 @@ fn parse_ipapi_json(body: &str, latency_ms: Option<u32>) -> Result<GeoInfo> {
     Ok(geo)
 }
 
+/// Reads at most `cap` body bytes of a 2xx response; a proxy or provider streaming more is rejected, not buffered.
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>> {
+    if !resp.status().is_success() {
+        bail!("HTTP {}", resp.status());
+    }
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        bail!("response body exceeds {cap} bytes");
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > cap {
+            bail!("response body exceeds {cap} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+const GEO_BODY_CAP: usize = 64 * 1024;
+const FREE_LIST_BODY_CAP: usize = 16 * 1024 * 1024;
+
+async fn read_text_capped(resp: reqwest::Response, cap: usize) -> Result<String> {
+    Ok(String::from_utf8_lossy(&read_body_capped(resp, cap).await?).into_owned())
+}
+
+/// Waits for all providers (the one carrying `is_hosting` wins) but never past `deadline`;
+/// at the deadline the first plain success is used, otherwise the check fails closed.
 async fn finish_geo_race(
     mut set: JoinSet<std::result::Result<GeoInfo, String>>,
+    deadline: tokio::time::Instant,
 ) -> std::result::Result<GeoInfo, String> {
     let mut fallback = None;
     let mut errors = Vec::new();
-    while let Some(joined) = set.join_next().await {
+    loop {
+        let joined = match tokio::time::timeout_at(deadline, set.join_next()).await {
+            Ok(Some(joined)) => joined,
+            Ok(None) => break,
+            Err(_) => {
+                set.abort_all();
+                errors.push("GeoIP deadline exceeded".to_string());
+                break;
+            }
+        };
         match joined {
             Ok(Ok(geo)) if geo.is_hosting.is_some() => {
                 set.abort_all();
@@ -292,7 +330,10 @@ async fn finish_geo_race(
 }
 
 pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoInfo> {
+    // The 8s budget starts once a permit is held. Queue wait is unbounded on purpose: "Check all" and bulk
+    // launch queue dozens of checks, and a queue timeout would mark live proxies dead.
     let _permit = GEO_SEM.acquire().await;
+    let deadline = tokio::time::Instant::now() + GEO_TOTAL_TIMEOUT;
     let client = if let Some(port) = local_proxy_port {
         geo_client_for_port(port)?
     } else {
@@ -320,8 +361,7 @@ pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoIn
                 .send()
                 .await
                 .map_err(|e| format!("{name} req: {e}"))?;
-            let text = resp
-                .text()
+            let text = read_text_capped(resp, GEO_BODY_CAP)
                 .await
                 .map_err(|e| format!("{name} body: {e}"))?;
             let ms = t0.elapsed().as_millis() as u32;
@@ -329,7 +369,7 @@ pub async fn resolve_geo_via_port(local_proxy_port: Option<u16>) -> Result<GeoIn
         });
     }
 
-    finish_geo_race(set)
+    finish_geo_race(set, deadline)
         .await
         .map_err(|errors| anyhow!("Fail-closed: all GeoIP providers failed ({errors})"))
 }
@@ -401,15 +441,14 @@ pub async fn resolve_geo_via_port_fast(local_proxy_port: u16) -> Result<GeoInfo>
                 .send()
                 .await
                 .map_err(|e| format!("{name}: {e}"))?;
-            let text = resp
-                .text()
+            let text = read_text_capped(resp, GEO_BODY_CAP)
                 .await
                 .map_err(|e| format!("{name} body: {e}"))?;
             let ms = t0.elapsed().as_millis() as u32;
             parser(&text, Some(ms)).map_err(|e| format!("{name}: {e}"))
         });
     }
-    finish_geo_race(set)
+    finish_geo_race(set, tokio::time::Instant::now() + Duration::from_millis(4500))
         .await
         .map_err(|errors| anyhow!("Proxy check failed ({errors})"))
 }
@@ -643,7 +682,8 @@ pub async fn fetch_free_proxy_candidates() -> Result<Vec<FreeProxyCandidate>> {
         let c = DIRECT_CLIENT.clone();
         set.spawn(async move {
             let url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&timeout=3500";
-            let text = c.get(url).send().await.ok()?.text().await.ok()?;
+            let resp = c.get(url).send().await.ok()?;
+            let text = read_text_capped(resp, FREE_LIST_BODY_CAP).await.ok()?;
             Some(parse_proxyscrape_free_json(&text))
         });
     }
@@ -652,7 +692,8 @@ pub async fn fetch_free_proxy_candidates() -> Result<Vec<FreeProxyCandidate>> {
         let c = DIRECT_CLIENT.clone();
         set.spawn(async move {
             let url = "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt";
-            let text = c.get(url).send().await.ok()?.text().await.ok()?;
+            let resp = c.get(url).send().await.ok()?;
+            let text = read_text_capped(resp, FREE_LIST_BODY_CAP).await.ok()?;
             Some(parse_plain_free_proxy_lines(
                 &text,
                 ProxyProtocol::Socks5,
@@ -666,7 +707,8 @@ pub async fn fetch_free_proxy_candidates() -> Result<Vec<FreeProxyCandidate>> {
         let c = DIRECT_CLIENT.clone();
         set.spawn(async move {
             let url = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.json";
-            let text = c.get(url).send().await.ok()?.text().await.ok()?;
+            let resp = c.get(url).send().await.ok()?;
+            let text = read_text_capped(resp, FREE_LIST_BODY_CAP).await.ok()?;
             Some(parse_proxifly_free_json(&text))
         });
     }

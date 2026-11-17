@@ -3,6 +3,7 @@ use crate::models::{
     TrustStage,
     ProxyConfig, ProxyProtocol, SavedProxy, unix_now,
 };
+use anyhow::Context as _;
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -319,7 +320,8 @@ impl Database {
             && !is_live
         {
             let user_data_dir = self.profile_user_data_dir(&profile.id)?;
-            crate::launcher::write_profile_bookmarks_items(&user_data_dir, bms);
+            crate::launcher::write_profile_bookmarks_items(&user_data_dir, bms)
+                .context("Profile saved, but Bookmarks were not written")?;
         }
         Ok(normalized_cookies)
     }
@@ -456,7 +458,7 @@ impl Database {
         if !src_bms.is_empty() {
             for c in &created {
                 if let Ok(user_data_dir) = self.profile_user_data_dir(&c.id) {
-                    crate::launcher::write_profile_bookmarks_items(&user_data_dir, &src_bms);
+                    let _ = crate::launcher::write_profile_bookmarks_items(&user_data_dir, &src_bms);
                 }
             }
         }
@@ -484,7 +486,7 @@ impl Database {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or(0);
         if current_version == SCHEMA_VERSION {
-            self.ensure_ip_quality_schema();
+            self.ensure_ip_quality_schema()?;
             return Ok(());
         }
 
@@ -593,7 +595,7 @@ impl Database {
             "ALTER TABLE profiles ADD COLUMN proxy_change_ip_url TEXT",
             "ALTER TABLE proxies ADD COLUMN change_ip_url TEXT",
         ] {
-            let _ = self.conn.execute(alter, []);
+            self.add_column_idempotent(alter)?;
         }
 
         let default_extensions: &[(&str, &str, &str, i64, &str, i64)] = &[
@@ -719,12 +721,23 @@ impl Database {
             )?;
         }
         self.conn.execute_batch("RELEASE SAVEPOINT bon_init_exts; PRAGMA user_version = 1;")?;
-        self.ensure_ip_quality_schema();
+        self.ensure_ip_quality_schema()?;
 
         Ok(())
     }
 
-    fn ensure_ip_quality_schema(&self) {
+    /// Only "column already exists" is ignored: any other failure (e.g. SQLITE_BUSY from another
+    /// process) must abort before `user_version` is bumped, or the column is never added.
+    fn add_column_idempotent(&self, alter: &str) -> anyhow::Result<()> {
+        match self.conn.execute(alter, []) {
+            Err(e) if !e.to_string().contains("duplicate column name") => {
+                Err(anyhow::Error::new(e).context(format!("Migration failed: {alter}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn ensure_ip_quality_schema(&self) -> anyhow::Result<()> {
         for alter in [
             "ALTER TABLE profiles ADD COLUMN ip_policy TEXT NOT NULL DEFAULT 'any'",
             "ALTER TABLE profiles ADD COLUMN geo_quality TEXT",
@@ -732,9 +745,9 @@ impl Database {
             "ALTER TABLE profiles ADD COLUMN trust_stage TEXT NOT NULL DEFAULT 'new'",
             "ALTER TABLE profiles ADD COLUMN seeded_at INTEGER",
         ] {
-            let _ = self.conn.execute(alter, []);
+            self.add_column_idempotent(alter)?;
         }
-        let _ = self.conn.execute_batch(
+        self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS ip_reputation (
                 ip TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
@@ -747,7 +760,8 @@ impl Database {
                 sessions INTEGER NOT NULL,
                 PRIMARY KEY (profile_id, day)
             );",
-        );
+        )?;
+        Ok(())
     }
 
     pub fn add_profile_activity(
@@ -1268,7 +1282,12 @@ impl Database {
         self.with_transaction(|db| {
             let mut count = 0;
             for mut p in parsed {
-                if uuid::Uuid::parse_str(&p.id).is_err() || !existing_ids.insert(p.id.clone()) {
+                let invalid_id = uuid::Uuid::parse_str(&p.id).is_err();
+                if invalid_id || !existing_ids.insert(p.id.clone()) {
+                    if !invalid_id {
+                        // A copy of an existing profile must not share its fingerprint seed.
+                        p.reseed();
+                    }
                     p.id = uuid::Uuid::new_v4().to_string();
                     existing_ids.insert(p.id.clone());
                 }
@@ -1330,35 +1349,6 @@ impl Database {
 
     /// Imports profiles from CSV or TSV text (`name,group,os,brand,proxy,totp_secret,tags,startup_url,notes`).
     pub fn import_profiles_csv(&self, raw_csv: &str) -> anyhow::Result<usize> {
-        fn split_row(line: &str, delim: char) -> Vec<String> {
-            let mut cols = Vec::new();
-            let mut cur = String::new();
-            let mut in_q = false;
-            let mut chars = line.chars().peekable();
-            while let Some(c) = chars.next() {
-                if in_q {
-                    if c == '"' {
-                        if chars.peek() == Some(&'"') {
-                            cur.push('"');
-                            let _ = chars.next();
-                        } else {
-                            in_q = false;
-                        }
-                    } else {
-                        cur.push(c);
-                    }
-                } else if c == '"' {
-                    in_q = true;
-                } else if c == delim {
-                    cols.push(std::mem::take(&mut cur).trim().to_string());
-                } else {
-                    cur.push(c);
-                }
-            }
-            cols.push(cur.trim().to_string());
-            cols
-        }
-
         let mut rows_to_insert = Vec::new();
         let non_empty: Vec<&str> = raw_csv.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         let delim = if non_empty.first().is_some_and(|l| l.contains('\t')) {
@@ -1367,7 +1357,7 @@ impl Database {
             ','
         };
         for (idx, raw_line) in non_empty.into_iter().enumerate() {
-            let cols = split_row(raw_line, delim);
+            let cols = crate::flows::split_csv_line(raw_line, delim);
             let first = cols.first().map(String::as_str).unwrap_or("");
             if idx == 0 && first.eq_ignore_ascii_case("name") {
                 continue;
@@ -1388,10 +1378,10 @@ impl Database {
                 p.brand = BrowserBrand::from_str_lossy(b);
                 p.brand_version = p.brand.version_for_seed(p.seed).to_string();
             }
-            if let Some(px) = cols.get(4).filter(|s| !s.is_empty())
-                && let Ok(Some(cfg)) = ProxyConfig::parse_flexible(px)
-            {
-                p.proxy = Some(cfg);
+            // A bad proxy must fail the import: importing it as "no proxy" would launch on the real IP.
+            if let Some(px) = cols.get(4).filter(|s| !s.is_empty()) {
+                p.proxy = ProxyConfig::parse_flexible(px)
+                    .with_context(|| format!("CSV row {}: invalid proxy '{px}'", idx + 1))?;
             }
             if let Some(totp) = cols.get(5).filter(|s| !s.is_empty()) {
                 p.totp_secret = totp.clone();
@@ -2040,6 +2030,23 @@ mod tests {
         assert_eq!(ver, 1);
         db.init_schema().unwrap();
         assert_eq!(db.list_profiles().unwrap().len(), list_after.len());
+    }
+
+    #[test]
+    fn test_csv_import_rejects_bad_proxy_instead_of_dropping_it() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "bonlogin-csv-test-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let ws = Workspace::open_at(&tmp_root).unwrap();
+        let before = ws.list_profiles().unwrap().len();
+        let csv = "name,group,os,brand,proxy\nGood,,macos,chrome,1.2.3.4:8080\nBad,,macos,chrome,host:notaport";
+        let err = ws.import_profiles_csv(csv).unwrap_err();
+        assert!(format!("{err:#}").contains("CSV row 3"), "{err:#}");
+        // Nothing imported: a half-imported batch would leave the bad row's sibling rows behind.
+        assert_eq!(ws.list_profiles().unwrap().len(), before);
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[test]

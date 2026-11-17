@@ -1,5 +1,5 @@
 use crate::cookies::{read_prelaunch_cookies_in, save_prelaunch_cookies_in};
-use crate::extensions::clonefile_or_copy;
+use crate::extensions::copy_dir_filtered;
 use crate::models::Profile;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -26,31 +26,8 @@ fn is_chromium_ephemeral_entry(name: &str) -> bool {
             | "SingletonCookie"
             | "DevToolsActivePort"
             | "RunningChromeVersion"
+            | ".bon_launch.lock"
     ) || name.ends_with(".tmp")
-}
-
-fn copy_dir_filtered(src: &Path, dst: &Path) -> Result<()> {
-    if !src.is_dir() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if is_chromium_ephemeral_entry(&name_str) {
-            continue;
-        }
-        let src_path = entry.path();
-        let dst_path = dst.join(&file_name);
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            copy_dir_filtered(&src_path, &dst_path)?;
-        } else if ft.is_file() {
-            let _ = clonefile_or_copy(&src_path, &dst_path);
-        }
-    }
-    Ok(())
 }
 
 /// Exports a full profile archive (`.zip`) containing `profile_metadata.json`, `prelaunch_cookies.json`,
@@ -67,6 +44,10 @@ pub fn export_profile_archive_zip_in(
     backups_out_dir: &Path,
     profile: &Profile,
 ) -> Result<PathBuf> {
+    // Chromium rewrites Cookies/IndexedDB SQLite files while running, so a live copy can be torn.
+    if crate::launcher::probe_live_runtime_in(root_dir, &profile.id).is_some() {
+        bail!("Stop the profile before exporting it");
+    }
     std::fs::create_dir_all(backups_out_dir)?;
     let clean_name: String = profile
         .name
@@ -102,7 +83,8 @@ pub fn export_profile_archive_zip_in(
 
     let user_data_src = root_dir.join("profiles").join(&profile.id);
     if user_data_src.is_dir() {
-        let _ = copy_dir_filtered(&user_data_src, &stage_dir.join("user_data"));
+        copy_dir_filtered(&user_data_src, &stage_dir.join("user_data"), is_chromium_ephemeral_entry)
+            .context("Failed to stage profile data for export")?;
     }
 
     let status = Command::new("/usr/bin/zip")
@@ -162,6 +144,8 @@ pub fn import_profile_archive_zip_in(
         profile.id = uuid::Uuid::new_v4().to_string();
         if !invalid_uuid {
             profile.name = format!("{} (Restored)", profile.name);
+            // The original still exists; sharing its seed would link both fingerprints.
+            profile.reseed();
         }
     }
 
@@ -170,13 +154,14 @@ pub fn import_profile_archive_zip_in(
     if let Ok(pre_raw) = std::fs::read_to_string(&pre_path)
         && !pre_raw.trim().is_empty()
     {
-        let _ = save_prelaunch_cookies_in(root_dir, &short_id, &pre_raw);
+        save_prelaunch_cookies_in(root_dir, &short_id, &pre_raw)?;
     }
 
     let user_data_stage = stage_dir.join("user_data");
     if user_data_stage.is_dir() {
         let dst_dir = root_dir.join("profiles").join(&profile.id);
-        let _ = copy_dir_filtered(&user_data_stage, &dst_dir);
+        copy_dir_filtered(&user_data_stage, &dst_dir, is_chromium_ephemeral_entry)
+            .context("Failed to restore profile data from archive")?;
     }
 
     Ok(profile)

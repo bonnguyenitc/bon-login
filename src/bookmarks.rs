@@ -1,6 +1,6 @@
 use crate::launcher::{probe_live_runtime_in, profile_user_data_dir_in};
 use crate::models::{GeoInfo, Profile};
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use std::path::Path;
 
 pub fn read_profile_bookmarks_in(root_dir: &Path, profile: &Profile) -> Vec<(String, String)> {
@@ -82,17 +82,34 @@ pub fn write_profile_bookmarks_checked_in(
         );
     }
     let user_data_dir = profile_user_data_dir_in(root_dir, &profile.id)?;
-    write_profile_bookmarks_items(&user_data_dir, items);
-    Ok(())
+    write_profile_bookmarks_items(&user_data_dir, items)
+        .with_context(|| format!("Bookmarks of '{}' were not saved", profile.name))
 }
 
-pub fn write_profile_bookmarks_items(user_data_dir: &Path, items: &[(String, String)]) {
+/// Reads a Chromium JSON file. `Ok(None)` when it does not exist; `Err` when it exists but cannot be
+/// read or parsed (e.g. mid-flush), so callers skip the write instead of replacing user data with `{}`.
+fn read_chromium_json(path: &Path) -> std::io::Result<Option<serde_json::Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).map(Some).map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_chromium_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    let s = serde_json::to_string(value).map_err(std::io::Error::other)?;
+    crate::extensions::replace_file_atomically(path, s.as_bytes())
+}
+
+/// Errors (and writes nothing) when the existing `Bookmarks` file cannot be read, so it is never wiped.
+pub fn write_profile_bookmarks_items(
+    user_data_dir: &Path,
+    items: &[(String, String)],
+) -> std::io::Result<()> {
     let def_dir = user_data_dir.join("Default");
-    let _ = std::fs::create_dir_all(&def_dir);
+    std::fs::create_dir_all(&def_dir)?;
     let bm_path = def_dir.join("Bookmarks");
-    let existing = std::fs::read_to_string(&bm_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let existing = read_chromium_json(&bm_path)?;
     let roots = existing.as_ref().and_then(|v| v.get("roots"));
     let other_children = roots
         .and_then(|r| r.get("other")?.get("children").cloned())
@@ -134,18 +151,17 @@ pub fn write_profile_bookmarks_items(user_data_dir: &Path, items: &[(String, Str
         },
         "version": 1
     });
-    if let Ok(s) = serde_json::to_string_pretty(&bm_json) {
-        let _ = std::fs::write(bm_path, s);
-    }
+    write_chromium_json(&bm_path, &bm_json)?;
     ensure_bookmark_bar_visible(&def_dir);
+    Ok(())
 }
 
 fn ensure_bookmark_bar_visible(def_dir: &Path) {
     let pref_path = def_dir.join("Preferences");
-    let mut prefs: serde_json::Value = std::fs::read_to_string(&pref_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let Ok(prefs) = read_chromium_json(&pref_path) else {
+        return;
+    };
+    let mut prefs = prefs.unwrap_or_else(|| serde_json::json!({}));
     if prefs
         .get("bookmark_bar")
         .and_then(|b| b.get("show_on_all_tabs"))
@@ -161,9 +177,7 @@ fn ensure_bookmark_bar_visible(def_dir: &Path) {
         if let Some(bar_obj) = bar.as_object_mut() {
             bar_obj.insert("show_on_all_tabs".to_string(), serde_json::Value::Bool(true));
         }
-        if let Ok(s) = serde_json::to_string(&prefs) {
-            let _ = std::fs::write(pref_path, s);
-        }
+        let _ = write_chromium_json(&pref_path, &prefs);
     }
 }
 
@@ -178,13 +192,11 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
     let avatar_idx = 26 + ((profile.seed as usize) % 29);
 
     let pref_path = def_dir.join("Preferences");
-    let mut prefs: serde_json::Value = std::fs::read_to_string(&pref_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !prefs.is_object() {
-        prefs = serde_json::json!({});
-    }
+    // Unreadable existing files are left alone rather than replaced with `{}` (would wipe all settings).
+    let Ok(prefs) = read_chromium_json(&pref_path) else {
+        return;
+    };
+    let mut prefs = prefs.filter(serde_json::Value::is_object).unwrap_or_else(|| serde_json::json!({}));
     prefs["bookmark_bar"]["show_on_all_tabs"] = serde_json::Value::Bool(true);
     prefs["profile"]["name"] = serde_json::Value::String(badge_name.clone());
     prefs["profile"]["is_using_default_name"] = serde_json::Value::Bool(false);
@@ -193,18 +205,15 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
         "color_variant": 1,
         "user_color2": skcolor
     });
-    if let Ok(s) = serde_json::to_string(&prefs) {
-        let _ = std::fs::write(&pref_path, s);
-    }
+    let _ = write_chromium_json(&pref_path, &prefs);
 
     let local_state_path = user_data_dir.join("Local State");
-    let mut local_state: serde_json::Value = std::fs::read_to_string(&local_state_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let Ok(local_state) = read_chromium_json(&local_state_path) else {
+        return;
+    };
+    let mut local_state = local_state
+        .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    if !local_state.is_object() {
-        local_state = serde_json::json!({});
-    }
     let def_info = &mut local_state["profile"]["info_cache"]["Default"];
     def_info["name"] = serde_json::Value::String(badge_name);
     def_info["is_using_default_name"] = serde_json::Value::Bool(false);
@@ -214,9 +223,7 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
     def_info["profile_color_seed"] = serde_json::json!(skcolor);
     def_info["profile_highlight_color"] = serde_json::json!(skcolor);
     def_info["default_avatar_fill_color"] = serde_json::json!(skcolor);
-    if let Ok(s) = serde_json::to_string(&local_state) {
-        let _ = std::fs::write(&local_state_path, s);
-    }
+    let _ = write_chromium_json(&local_state_path, &local_state);
 }
 
 fn html_escape(s: &str) -> String {
@@ -413,3 +420,28 @@ pub fn write_profile_preflight_card(
     format!("file://{}", card_path.to_string_lossy())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_bookmarks_file_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "bon_bm_corrupt_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let bm_path = dir.join("Default").join("Bookmarks");
+        std::fs::create_dir_all(bm_path.parent().unwrap()).unwrap();
+        std::fs::write(&bm_path, "{").unwrap();
+        let items = [("A".to_string(), "https://a.com".to_string())];
+        assert!(write_profile_bookmarks_items(&dir, &items).is_err());
+        assert_eq!(std::fs::read_to_string(&bm_path).unwrap(), "{");
+        // A missing file is fine and gets created.
+        std::fs::remove_file(&bm_path).unwrap();
+        write_profile_bookmarks_items(&dir, &items).unwrap();
+        assert!(std::fs::read_to_string(&bm_path).unwrap().contains("https://a.com"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

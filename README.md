@@ -363,6 +363,7 @@ Toggle **`🔌 Local API`** in the top header bar or run `bon-login serve [--por
 | `GET /health` | Health check (`{"ok": true, "service": "bon-login"}`) |
 | `GET /profiles` | List all profiles, proxy metadata, tags, and live runtime status |
 | `GET /flows` | List all saved Agent Flows, required `{{vars}}`, and DOM steps |
+| `GET /proxies/free` | Discover and live-check up to 30 free public proxies |
 | `POST /profiles/<id\|name>/launch` | Launch profile via supervisor and return `{pid, cdp_port, ws_url}` |
 | `POST /profiles/<id\|name>/stop` | Gracefully stop running profile and flush cookies |
 | `POST /profiles/<id\|name>/rotate-proxy` | Trigger proxy IP rotation webhook and return new `GeoInfo` |
@@ -371,6 +372,8 @@ Toggle **`🔌 Local API`** in the top header bar or run `bon-login serve [--por
 | `POST /profiles/<id\|name>/totp` | Generate and human-type the profile's 6-digit 2FA TOTP code |
 | `POST /profiles/<id\|name>/screenshot` | Capture a PNG screenshot and return its file path |
 | `POST /profiles/<id\|name>/preflight` | Generate local Stealth & Proxy Preflight Card HTML and navigate if running |
+| `POST /profiles/<id\|name>/seed` | Launch/attach profile and warm up cookies by visiting its seed URLs |
+| `POST /profiles/<id\|name>/audit` | Launch/attach profile and run a fingerprint coherence audit |
 | `POST /profiles/<id\|name>/flow/<flow_name>` | Launch/attach profile and replay saved Agent Flow (JSON `{"vars":{...}}` or `k=v` body) |
 | `POST /arrange` | Tile all running browser windows (optional body `"960,600"`) |
 | `GET /synchronizer` | Query active 1-to-N Multi-Profile Synchronizer status & mirrored event count |

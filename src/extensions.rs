@@ -396,7 +396,7 @@ fn inject_html_shim_recursive(dir: &Path) -> bool {
     ok
 }
 
-fn replace_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn replace_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp_path = path.with_file_name(format!(
         ".{name}.bon-tmp-{}-{}",
@@ -1017,18 +1017,25 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
             return Ok(());
         }
     }
+    copy_dir_filtered(src, dst, |_| false)
+}
+
+/// Copies `src` into `dst`, skipping symlinks and entries `skip` names. Any file copy error aborts the copy.
+pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, skip: fn(&str) -> bool) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_symlink() {
+        let name = entry.file_name();
+        if skip(&name.to_string_lossy()) {
             continue;
         }
-        let dest_path = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        let dest_path = dst.join(&name);
         if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest_path)?;
+            copy_dir_filtered(&entry.path(), &dest_path, skip)?;
         } else if ty.is_file() {
-            let _ = clonefile_or_copy(&entry.path(), &dest_path);
+            clonefile_or_copy(&entry.path(), &dest_path)
+                .with_context(|| format!("Failed to copy {}", entry.path().display()))?;
         }
     }
     Ok(())
@@ -1123,7 +1130,10 @@ pub fn install_extension_from_bytes_cancellable_in(
         .unwrap_or_else(|| format!("ext-{}", unix_now()));
 
     let nonce = rand::random::<u32>();
-    let stage_dir = std::env::temp_dir().join(format!("bonlogin_stage_{ext_id}_{nonce}"));
+    let ext_root = root_dir.join("extensions");
+    std::fs::create_dir_all(&ext_root)?;
+    // Staged next to the final folder (same volume) so the swap below is a plain rename.
+    let stage_dir = ext_root.join(format!(".stage_{ext_id}_{nonce}"));
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir)?;
 
@@ -1167,15 +1177,19 @@ pub fn install_extension_from_bytes_cancellable_in(
         bail!("Extension download cancelled");
     }
 
-    let ext_root = root_dir.join("extensions");
-    std::fs::create_dir_all(&ext_root)?;
+    // The installed copy is only removed after the new one is in place, so a failure keeps it.
     let dest_dir = ext_root.join(&ext_id);
-    if dest_dir.exists() {
-        let _ = std::fs::remove_dir_all(&dest_dir);
-    }
-    if std::fs::rename(&stage_dir, &dest_dir).is_err() {
-        copy_dir_recursive(&stage_dir, &dest_dir)?;
+    let old_dir = ext_root.join(format!(".old_{ext_id}_{nonce}"));
+    let had_old = std::fs::rename(&dest_dir, &old_dir).is_ok();
+    if let Err(e) = std::fs::rename(&stage_dir, &dest_dir) {
+        if had_old {
+            let _ = std::fs::rename(&old_dir, &dest_dir);
+        }
         let _ = std::fs::remove_dir_all(&stage_dir);
+        return Err(e).context("Failed to move unpacked extension into place");
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(&old_dir);
     }
 
     let name = read_extension_name_from_dir(&dest_dir, &ext_id);
@@ -1193,6 +1207,8 @@ pub fn install_extension_from_bytes_cancellable_in(
     })
 }
 
+const MAX_EXTENSION_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
+
 /// Downloads an extension from a Chrome Web Store URL, 32-char ID, or direct `.crx`/`.zip` URL.
 pub async fn download_extension_from_url_in(
     root_dir: &Path,
@@ -1202,7 +1218,7 @@ pub async fn download_extension_from_url_in(
         root_dir,
         url_or_id,
         None,
-        &std::sync::atomic::AtomicBool::new(false),
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .await
 }
@@ -1213,7 +1229,7 @@ pub async fn download_extension_from_url_cancellable_in(
     root_dir: &Path,
     url_or_id: &str,
     target_id_override: Option<&str>,
-    cancelled: &std::sync::atomic::AtomicBool,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<BrowserExtension> {
     use std::sync::atomic::Ordering;
     let trimmed = url_or_id.trim();
@@ -1245,7 +1261,7 @@ pub async fn download_extension_from_url_cancellable_in(
     if !resp.status().is_success() {
         bail!("Download returned HTTP {}", resp.status());
     }
-    let bytes = resp.bytes().await?;
+    let bytes = crate::geoip::read_body_capped(resp, MAX_EXTENSION_DOWNLOAD_BYTES).await?;
     if cancelled.load(Ordering::SeqCst) {
         bail!("Extension download cancelled");
     }
@@ -1257,9 +1273,8 @@ pub async fn download_extension_from_url_cancellable_in(
         .map(ToString::to_string)
         .or(store_id_opt);
     let trimmed_owned = trimmed.to_string();
-    let cancelled_arc = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-        cancelled.load(Ordering::SeqCst),
-    ));
+    // The real flag, so Cancel pressed during unpack is still seen before the final rename.
+    let cancelled_arc = cancelled.clone();
     let res = tokio::task::spawn_blocking(move || {
         install_extension_from_bytes_cancellable_in(
             &root_owned,
@@ -1271,10 +1286,6 @@ pub async fn download_extension_from_url_cancellable_in(
     })
     .await
     .context("Extension unpack task panicked")??;
-    if cancelled.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_dir_all(&res.folder_path);
-        bail!("Extension download cancelled");
-    }
     Ok(res)
 }
 
@@ -1417,7 +1428,7 @@ pub async fn sync_enabled_remote_extensions_in(root_dir: &Path) {
             if !still_enabled() {
                 return;
             }
-            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Ok(downloaded) = download_extension_from_url_cancellable_in(
                 &root_owned,
                 &store_url,
@@ -1480,7 +1491,7 @@ pub fn needs_remote_extension_download_in(root_dir: &Path, ext: &BrowserExtensio
 pub async fn activate_extension_cancellable_in(
     root_dir: &Path,
     mut ext: BrowserExtension,
-    cancelled: &std::sync::atomic::AtomicBool,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<BrowserExtension> {
     ext.enabled = true;
     if needs_remote_extension_download_in(root_dir, &ext) {

@@ -1271,37 +1271,38 @@ pub fn parse_flow_vars_text(raw: &str) -> std::collections::HashMap<String, Stri
     map
 }
 
-/// Parses a CSV or TSV table (header row + data rows) into `Vec<HashMap<String, String>>` for batch AgentFlow runs.
-pub fn parse_flow_csv_rows(raw_csv: &str) -> Result<Vec<std::collections::HashMap<String, String>>> {
-    fn split_csv_line(line: &str, delim: char) -> Vec<String> {
-        let mut cols = Vec::new();
-        let mut cur = String::new();
-        let mut in_q = false;
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if in_q {
-                if c == '"' {
-                    if chars.peek() == Some(&'"') {
-                        cur.push('"');
-                        let _ = chars.next();
-                    } else {
-                        in_q = false;
-                    }
+/// Splits one CSV/TSV line, honouring `"quoted, cells"` and `""` escapes.
+pub(crate) fn split_csv_line(line: &str, delim: char) -> Vec<String> {
+    let mut cols = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_q {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    let _ = chars.next();
                 } else {
-                    cur.push(c);
+                    in_q = false;
                 }
-            } else if c == '"' {
-                in_q = true;
-            } else if c == delim {
-                cols.push(std::mem::take(&mut cur).trim().to_string());
             } else {
                 cur.push(c);
             }
+        } else if c == '"' {
+            in_q = true;
+        } else if c == delim {
+            cols.push(std::mem::take(&mut cur).trim().to_string());
+        } else {
+            cur.push(c);
         }
-        cols.push(cur.trim().to_string());
-        cols
     }
+    cols.push(cur.trim().to_string());
+    cols
+}
 
+/// Parses a CSV or TSV table (header row + data rows) into `Vec<HashMap<String, String>>` for batch AgentFlow runs.
+pub fn parse_flow_csv_rows(raw_csv: &str) -> Result<Vec<std::collections::HashMap<String, String>>> {
     let lines: Vec<&str> = raw_csv
         .lines()
         .map(str::trim)

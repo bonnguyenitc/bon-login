@@ -328,6 +328,7 @@ impl ProxyConfig {
                 .rsplit_once(':')
                 .ok_or_else(|| anyhow::anyhow!("Invalid proxy host:port in '{raw}'"))?;
             let port: u16 = port_str.parse()?;
+            let host = host.trim_start_matches('[').trim_end_matches(']');
             let (username, password) = match auth.split_once(':') {
                 Some((u, p)) => (
                     Some(u.to_string()).filter(|v| !v.is_empty()),
@@ -348,7 +349,11 @@ impl ProxyConfig {
             )));
         }
 
-        let parts: Vec<&str> = rest.splitn(5, ':').collect();
+        // `[v6]:port[:user:pass[:name]]`: keep the bracketed IPv6 host whole, store it bare.
+        let parts: Vec<&str> = match rest.strip_prefix('[').and_then(|a| a.split_once("]:")) {
+            Some((v6_host, tail)) => std::iter::once(v6_host).chain(tail.splitn(4, ':')).collect(),
+            None => rest.splitn(5, ':').collect(),
+        };
         match parts.as_slice() {
             [host, port_str] => Ok(Some((
                 Self {
@@ -409,10 +414,20 @@ impl ProxyConfig {
             ProxyProtocol::Http => "",
             ProxyProtocol::Socks5 => "socks5:",
         };
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         let base = match (&self.username, &self.password) {
-            (Some(u), Some(p)) => format!("{prefix}{}:{}:{u}:{p}", self.host, self.port),
-            (Some(u), None) => format!("{prefix}{}:{}:{u}:", self.host, self.port),
-            _ => format!("{prefix}{}:{}", self.host, self.port),
+            // `host:port:user:pass` cannot round-trip a ':' in the password; `user:pass@host:port` can.
+            // `@` too: the parser splits `user:pass@host` on the last '@'.
+            (Some(u), Some(p)) if u.contains([':', '@']) || p.contains([':', '@']) => {
+                format!("{prefix}{u}:{p}@{host}:{}", self.port)
+            }
+            (Some(u), Some(p)) => format!("{prefix}{host}:{}:{u}:{p}", self.port),
+            (Some(u), None) => format!("{prefix}{host}:{}:{u}:", self.port),
+            _ => format!("{prefix}{host}:{}", self.port),
         };
         match &self.change_ip_url {
             Some(url) if !url.trim().is_empty() => format!("{base}|{}", url.trim()),
@@ -630,20 +645,32 @@ impl GeoInfo {
     }
 
     pub fn locale_for_country(country_code: &str) -> (String, String) {
-        match country_code.to_ascii_uppercase().as_str() {
-            "VN" => ("vi-VN".into(), "vi-VN,vi,en-US;q=0.9,en;q=0.8".into()),
-            "JP" => ("ja-JP".into(), "ja-JP,ja,en-US;q=0.9,en;q=0.8".into()),
-            "KR" => ("ko-KR".into(), "ko-KR,ko,en-US;q=0.9,en;q=0.8".into()),
-            "CN" => ("zh-CN".into(), "zh-CN,zh,en-US;q=0.9,en;q=0.8".into()),
-            "TW" | "HK" => ("zh-TW".into(), "zh-TW,zh,en-US;q=0.9,en;q=0.8".into()),
-            "DE" | "AT" | "CH" => ("de-DE".into(), "de-DE,de,en-US;q=0.9,en;q=0.8".into()),
-            "FR" => ("fr-FR".into(), "fr-FR,fr,en-US;q=0.9,en;q=0.8".into()),
-            "ES" | "MX" | "AR" => ("es-ES".into(), "es-ES,es,en-US;q=0.9,en;q=0.8".into()),
-            "BR" | "PT" => ("pt-BR".into(), "pt-BR,pt,en-US;q=0.9,en;q=0.8".into()),
-            "RU" => ("ru-RU".into(), "ru-RU,ru,en-US;q=0.9,en;q=0.8".into()),
-            "GB" => ("en-GB".into(), "en-GB,en-US;q=0.9,en;q=0.8".into()),
-            _ => ("en-US".into(), "en-US,en;q=0.9".into()),
+        let cc = country_code.to_ascii_uppercase();
+        let locale = match cc.as_str() {
+            "VN" => "vi-VN", "JP" => "ja-JP", "KR" => "ko-KR", "CN" => "zh-CN",
+            "TW" => "zh-TW", "HK" => "zh-HK", "DE" => "de-DE", "AT" => "de-AT",
+            "CH" => "de-CH", "FR" => "fr-FR", "BE" => "fr-BE", "ES" => "es-ES",
+            "MX" => "es-MX", "AR" => "es-AR", "CO" => "es-CO", "CL" => "es-CL",
+            "PE" => "es-PE", "BR" => "pt-BR", "PT" => "pt-PT", "RU" => "ru-RU",
+            "UA" => "uk-UA", "IT" => "it-IT", "NL" => "nl-NL", "PL" => "pl-PL",
+            "TR" => "tr-TR", "TH" => "th-TH", "ID" => "id-ID", "MY" => "ms-MY",
+            "PH" => "en-PH", "SE" => "sv-SE", "NO" => "nb-NO", "DK" => "da-DK",
+            "FI" => "fi-FI", "CZ" => "cs-CZ", "RO" => "ro-RO", "HU" => "hu-HU",
+            "GR" => "el-GR", "IL" => "he-IL", "SA" => "ar-SA", "AE" => "ar-AE", "EG" => "ar-EG",
+            "IN" => "en-IN", "GB" => "en-GB", "AU" => "en-AU", "CA" => "en-CA",
+            "IE" => "en-IE", "NZ" => "en-NZ", "SG" => "en-SG",
+            _ => "en-US",
+        };
+        if locale == "en-US" {
+            return ("en-US".into(), "en-US,en;q=0.9".into());
         }
+        let lang = locale.split('-').next().unwrap_or("en");
+        let accept = if lang == "en" {
+            format!("{locale},en-US;q=0.9,en;q=0.8")
+        } else {
+            format!("{locale},{lang},en-US;q=0.9,en;q=0.8")
+        };
+        (locale.into(), accept)
     }
 
     pub fn country_flag(country_code: &str) -> &'static str {
@@ -1503,7 +1530,8 @@ impl Profile {
         self.startup_url
             .split(['\n', '\r', ',', ' ', '\t'])
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            // A token starting with '-' would reach Chromium as a switch (e.g. `--remote-allow-origins=*`).
+            .filter(|s| !s.is_empty() && !s.starts_with('-'))
             .map(ToString::to_string)
             .collect()
     }
@@ -1860,6 +1888,29 @@ mod tests {
 
         assert!(ProxyConfig::parse_flexible("   ").unwrap().is_none());
 
+        assert_eq!(GeoInfo::locale_for_country("it").0, "it-IT");
+        assert_eq!(GeoInfo::locale_for_country("MX").1, "es-MX,es,en-US;q=0.9,en;q=0.8");
+        assert_eq!(GeoInfo::locale_for_country("GB").1, "en-GB,en-US;q=0.9,en;q=0.8");
+        assert_eq!(GeoInfo::locale_for_country("ZZ").1, "en-US,en;q=0.9");
+
+        // Editing a proxy must round-trip a ':' in the password and a bare IPv6 host.
+        let rt = ProxyConfig::parse_flexible(&p2.to_editable_string()).unwrap().unwrap();
+        assert_eq!(rt.password.as_deref(), Some("s3cr:t"));
+        let at = ProxyConfig {
+            username: Some("u@x".into()),
+            password: Some("p@ss".into()),
+            host: "1.2.3.4".into(),
+            ..p2.clone()
+        };
+        let at_rt = ProxyConfig::parse_flexible(&at.to_editable_string()).unwrap().unwrap();
+        assert_eq!((at_rt.username, at_rt.password), (at.username.clone(), at.password.clone()));
+        assert_eq!(at_rt.host, "1.2.3.4");
+        assert_eq!(rt.protocol, ProxyProtocol::Socks5);
+        let v6 = ProxyConfig::parse_flexible("[2001:db8::1]:1080:u:pw").unwrap().unwrap();
+        assert_eq!((v6.host.as_str(), v6.port), ("2001:db8::1", 1080));
+        let v6_rt = ProxyConfig::parse_flexible(&v6.to_editable_string()).unwrap().unwrap();
+        assert_eq!((v6_rt.host, v6_rt.password), (v6.host.clone(), v6.password.clone()));
+
         let p3 = ProxyConfig::parse_with_default_protocol(
             "160.250.60.55:45042:admin:pass|http://rotate.local/ip",
             ProxyProtocol::Socks5,
@@ -2145,6 +2196,8 @@ mod tests {
                 "https://youtube.com"
             ]
         );
+        p.startup_url = "https://x.com --remote-allow-origins=* -enable-automation".to_string();
+        assert_eq!(p.startup_urls(), vec!["https://x.com"]);
 
         // Case-insensitive ASCII & non-letter 0x20 bitmask boundary checks
         for pad in [0usize, 1, 14, 15, 16, 17, 31, 32, 33] {

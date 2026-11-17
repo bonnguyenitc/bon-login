@@ -24,7 +24,7 @@ impl LocalProxyTunnel {
             .context("Failed to bind local proxy listener on 127.0.0.1:0")?;
         let local_port = listener.local_addr()?.port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let upstream_addr: Arc<str> = format!("{}:{}", proxy.host, proxy.port).into();
+        let upstream_addr: Arc<str> = authority_host_port(&proxy.host, proxy.port).into();
         let auth_header: Arc<str> = build_proxy_auth_header(&proxy).unwrap_or_default().into();
         let proxy = Arc::new(proxy);
 
@@ -44,7 +44,9 @@ impl LocalProxyTunnel {
                                 let addr = Arc::clone(&upstream_addr);
                                 let auth = Arc::clone(&auth_header);
                                 join_set.spawn(async move {
-                                    let _ = handle_client(client_stream, &proxy_cfg, &addr, &auth).await;
+                                    if let Err(e) = handle_client(client_stream, &proxy_cfg, &addr, &auth).await {
+                                        eprintln!("[proxy_tunnel] {e:#}");
+                                    }
                                 });
                             }
                             Err(_) => {
@@ -116,6 +118,7 @@ pub(crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 }
 
 fn authority_host_port(host: &str, port: u16) -> String {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -226,26 +229,41 @@ async fn handle_client(
     upstream_addr: &str,
     auth_header: &str,
 ) -> Result<()> {
-    let (header_bytes, body_prefix) = timeout(HANDSHAKE_TIMEOUT, read_until_double_crlf(&mut client_stream))
-        .await
-        .context("Timeout reading client request")??;
+    // A client that closes or idles without sending a request is normal (spare connections): not an error.
+    let Ok(Ok((header_bytes, body_prefix))) =
+        timeout(HANDSHAKE_TIMEOUT, read_until_double_crlf(&mut client_stream)).await
+    else {
+        return Ok(());
+    };
 
-    let req = parse_client_request(&header_bytes, body_prefix)?;
-
-    let mut upstream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(upstream_addr))
-        .await
-        .with_context(|| format!("Timeout connecting to upstream proxy {upstream_addr}"))?
-        .with_context(|| format!("Failed connecting to upstream proxy {upstream_addr}"))?;
-    let _ = upstream.set_nodelay(true);
-
-    match proxy.protocol {
-        ProxyProtocol::Http => {
-            handle_http_upstream(&mut client_stream, &mut upstream, auth_header, &header_bytes, req).await?;
+    let handshake = async {
+        let req = parse_client_request(&header_bytes, body_prefix)?;
+        let mut upstream = timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(upstream_addr))
+            .await
+            .with_context(|| format!("Timeout connecting to upstream proxy {upstream_addr}"))?
+            .with_context(|| format!("Failed connecting to upstream proxy {upstream_addr}"))?;
+        let _ = upstream.set_nodelay(true);
+        match proxy.protocol {
+            ProxyProtocol::Http => {
+                handle_http_upstream(&mut client_stream, &mut upstream, auth_header, &header_bytes, req).await?;
+            }
+            ProxyProtocol::Socks5 => {
+                handle_socks5_upstream(&mut client_stream, &mut upstream, proxy, req).await?;
+            }
         }
-        ProxyProtocol::Socks5 => {
-            handle_socks5_upstream(&mut client_stream, &mut upstream, proxy, req).await?;
-        }
+        Ok::<_, anyhow::Error>(upstream)
     }
+    .await;
+    let mut upstream = match handshake {
+        Ok(u) => u,
+        Err(e) => {
+            // Tell Chromium the proxy failed instead of a bare ERR_EMPTY_RESPONSE.
+            let _ = client_stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(e);
+        }
+    };
 
     let _ = copy_bidirectional_with_sizes(&mut client_stream, &mut upstream, 64 * 1024, 64 * 1024).await;
     Ok(())
@@ -272,7 +290,7 @@ async fn handle_http_upstream(
                 .lines()
                 .next()
                 .unwrap_or("");
-            if !status_line.contains(" 200") {
+            if status_line.split_whitespace().nth(1) != Some("200") {
                 bail!("Upstream HTTP proxy CONNECT failed: {status_line}");
             }
             Ok::<Vec<u8>, anyhow::Error>(extra)
@@ -626,6 +644,41 @@ mod tests {
             assert_eq!(find_double_crlf(&hdr), Some(prefix_len + 7));
         }
         assert_eq!(find_double_crlf(b"\r\n\r"), None);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_407_and_fake_200_reach_client_as_502() {
+        let mock = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = mock.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for reply in [
+                &b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"[..],
+                &b"HTTP/1.1 502 Bad Gateway (upstream 200)\r\n\r\n"[..],
+            ] {
+                let (mut sock, _) = mock.accept().await.unwrap();
+                let _ = read_until_double_crlf(&mut sock).await;
+                let _ = sock.write_all(reply).await;
+            }
+        });
+        let mut tunnel = LocalProxyTunnel::start(ProxyConfig {
+            protocol: ProxyProtocol::Http,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: Some("u".to_string()),
+            password: Some("bad".to_string()),
+            change_ip_url: None,
+        })
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let mut c = TcpStream::connect(("127.0.0.1", tunnel.local_port())).await.unwrap();
+            c.write_all(b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:443\r\n\r\n")
+                .await
+                .unwrap();
+            let (hdr, _) = read_until_double_crlf(&mut c).await.unwrap();
+            assert!(String::from_utf8_lossy(&hdr).starts_with("HTTP/1.1 502"));
+        }
+        tunnel.stop();
     }
 
     #[tokio::test]

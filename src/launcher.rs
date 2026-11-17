@@ -268,9 +268,7 @@ fn unix_send_signal(pid: u32, sig: i32) {
 
 /// Checks whether a profile currently has a live Chromium instance with an open window.
 pub fn probe_live_runtime_in(root_dir: &Path, profile_id: &str) -> Option<RuntimeInfo> {
-    let mut rt_path = root_dir.join("profiles");
-    rt_path.push(profile_id);
-    rt_path.push("bon_runtime.json");
+    let mut rt_path = runtime_file_path_in(root_dir, profile_id);
 
     let Ok(raw) = std::fs::read_to_string(&rt_path) else {
         return None;
@@ -279,7 +277,9 @@ pub fn probe_live_runtime_in(root_dir: &Path, profile_id: &str) -> Option<Runtim
         return None;
     };
 
-    let pid_alive = info.pid > 0 && unix_pid_alive(info.pid);
+    let pid_alive = rt_path
+        .parent()
+        .is_some_and(|dir| runtime_pid_owns_profile(dir, info.pid));
     if info.pid > 0 && !pid_alive {
         let _ = std::fs::remove_file(&rt_path);
         rt_path.set_file_name("DevToolsActivePort");
@@ -324,6 +324,12 @@ fn singleton_lock_pid(user_data_dir: &Path) -> Option<u32> {
     unix_pid_alive(pid).then_some(pid)
 }
 
+/// A PID from bon_runtime.json is trusted only while it still holds this profile's SingletonLock,
+/// so a PID reused by an unrelated process after a crash/reboot is never reported live or signalled.
+fn runtime_pid_owns_profile(user_data_dir: &Path, pid: u32) -> bool {
+    pid > 0 && singleton_lock_pid(user_data_dir) == Some(pid)
+}
+
 fn cleanup_stale_singleton_locks(user_data_dir: &Path) {
     if singleton_lock_pid(user_data_dir).is_some() {
         return;
@@ -355,12 +361,17 @@ fn close_agent_browser_session_async_in(root_dir: &Path, short_id: &str) {
 fn terminate_pid_gracefully(pid: u32, mut has_exited: impl FnMut() -> bool) {
     #[cfg(unix)]
     if pid > 0 {
+        // Chromium with many tabs needs several seconds to flush the Cookies SQLite file before SIGKILL.
+        const GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(8);
         unix_send_signal(pid, 15);
-        for i in 0..45 {
+        let deadline = std::time::Instant::now() + GRACEFUL_EXIT_TIMEOUT;
+        let mut i = 0u32;
+        while std::time::Instant::now() < deadline {
             if has_exited() {
                 return;
             }
             let wait_ms = if i < 10 { 15 } else { 50 };
+            i += 1;
             std::thread::sleep(Duration::from_millis(wait_ms));
         }
         if !has_exited() {
@@ -393,8 +404,10 @@ pub fn stop_external_runtime_in(root_dir: &Path, profile_id: &str, short_id: &st
     if let Some(info) = maybe_info {
         flush_prelaunch_state_if_needed_in(root_dir, short_id, info.cdp_port, &info.ws_url);
         if info.pid > 0 {
-            terminate_pid_gracefully(info.pid, || !unix_pid_alive(info.pid));
-            stopped_any = true;
+            if runtime_pid_owns_profile(&prof_dir, info.pid) {
+                terminate_pid_gracefully(info.pid, || !unix_pid_alive(info.pid));
+                stopped_any = true;
+            }
         } else if let Some(list_body) = cdp_http_get_body(info.cdp_port, "/json/list")
             && let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(&list_body)
         {
@@ -407,8 +420,10 @@ pub fn stop_external_runtime_in(root_dir: &Path, profile_id: &str, short_id: &st
         }
     }
 
-    let removed_files =
-        std::fs::remove_file(&rt_path).is_ok() || std::fs::remove_file(&active_port_path).is_ok();
+    // Both removals must run: a stale DevToolsActivePort would later point `/json/close` at another browser.
+    let removed_rt = std::fs::remove_file(&rt_path).is_ok();
+    let removed_port = std::fs::remove_file(&active_port_path).is_ok();
+    let removed_files = removed_rt || removed_port;
     if stopped_any || had_files || removed_files {
         close_agent_browser_session_async_in(root_dir, short_id);
     }
@@ -1241,6 +1256,18 @@ pub async fn launch_profile_in(
     launch_profile_with_kernel_in(root_dir, profile, None).await
 }
 
+fn acquire_profile_launch_lock_in(root_dir: &Path, profile_id: &str) -> Result<std::fs::File> {
+    let dir = profile_user_data_dir_in(root_dir, profile_id)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".bon_launch.lock"))?;
+    file.try_lock()
+        .map_err(|_| anyhow!("Profile is already being launched by another BonLogin process"))?;
+    Ok(file)
+}
+
 pub(crate) async fn launch_profile_with_kernel_in(
     root_dir: &Path,
     profile: &Profile,
@@ -1257,6 +1284,13 @@ pub(crate) async fn launch_profile_with_kernel_in(
             })?
             .path,
     };
+
+    // Held until this fn returns: GUI and CLI daemon must not launch one profile at once,
+    // or the second deletes the first one's DevToolsActivePort mid-launch.
+    let _launch_lock = acquire_profile_launch_lock_in(root_dir, &profile.id)?;
+    if probe_live_runtime_in(root_dir, &profile.id).is_some() {
+        bail!("Profile is still running or shutting down. Try again in a few seconds");
+    }
 
     let kernel_path_for_prep = kernel_path.clone();
     let skip_unquarantine = kernel_override.is_some();
@@ -1452,7 +1486,10 @@ pub(crate) async fn launch_profile_with_kernel_in(
         .await;
     }
     if let Ok(json) = serde_json::to_string(&info) {
-        let _ = std::fs::write(runtime_file_path_in(root_dir, &profile.id), json);
+        let _ = crate::extensions::replace_file_atomically(
+            &runtime_file_path_in(root_dir, &profile.id),
+            json.as_bytes(),
+        );
     }
     let child = child_guard
         .child
@@ -3359,9 +3396,12 @@ pub fn agent_sync_targets_in(
 pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
     for raw in args {
         let lower_raw = raw.to_ascii_lowercase();
-        if lower_raw.contains("object.defineproperty(navigator")
-            || lower_raw.contains("navigator.__definegetter__")
-            || lower_raw.contains("object.setprototypeof(navigator")
+        // Substring match on the API name, not one exact call shape: `Reflect.defineProperty(window.navigator, ...)`
+        // and `Object.defineProperties(navigator, ...)` must be caught too.
+        if lower_raw.contains("navigator")
+            && ["defineproper", "__definegetter__", "setprototypeof"]
+                .iter()
+                .any(|api| lower_raw.contains(api))
         {
             bail!(
                 "Blocked by BonLogin Stealth Guardrail: JS prototype mutation on `navigator` triggers anti-bot detection on BrowserScan/CreepJS. BonLogin already spoofs `navigator` at the C++ Blink layer."
@@ -3399,7 +3439,7 @@ pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
             }
         }
         if lower == "set"
-            && let Some(sub) = flat_tokens.get(idx + 1)
+            && let Some(sub) = flat_tokens[idx + 1..].iter().find(|t| !t.starts_with('-'))
             && matches!(
                 sub.as_str(),
                 "viewport" | "device" | "geo" | "media" | "headers"
@@ -4279,6 +4319,14 @@ mod tests {
             ])
             .is_err()
         );
+        for bypass in [
+            vec!["eval", "Reflect.defineProperty(window.navigator, 'webdriver', {get: () => false})"],
+            vec!["eval", "Object.defineProperties(navigator, {webdriver: {get: () => false}})"],
+            vec!["set", "--json", "viewport", "390", "844"],
+        ] {
+            let args: Vec<String> = bypass.iter().map(|s| s.to_string()).collect();
+            assert!(validate_stealth_agent_args(&args).is_err(), "guardrail bypass: {args:?}");
+        }
         assert!(should_reconnect_agent_session(
             b"Error: Browser not connected. Run connect first.",
             b""
@@ -4353,7 +4401,8 @@ mod tests {
         assert_eq!(p.brand, BrowserBrand::Edge);
         assert_eq!(p.seed, 555666);
         assert_eq!(p.hardware_concurrency, 12);
-        assert_eq!(p.gpu_spoofing, GpuSpoofMode::NativePassthrough);
+        // Bẫy 3: native GPU passthrough is macOS-only, so `--os windows --gpu native` falls back to seed GPU.
+        assert_eq!(p.gpu_spoofing, GpuSpoofMode::SeedGenerated);
         assert!(!p.spoof_canvas);
         assert_eq!(p.window_size, "1920,1080");
         assert_eq!(p.custom_timezone.as_deref(), Some("America/New_York"));
@@ -4363,10 +4412,68 @@ mod tests {
         );
     }
 
+    /// Chromium's `SingletonLock` symlink (`host-<pid>`) that marks `pid` as the owner of the profile.
+    pub(crate) fn fake_singleton_lock(user_data_dir: &Path, pid: u32) {
+        let lock = user_data_dir.join("SingletonLock");
+        let _ = std::fs::remove_file(&lock);
+        std::os::unix::fs::symlink(format!("test-host-{pid}"), lock).unwrap();
+    }
+
+    #[test]
+    fn test_launch_lock_is_exclusive_until_dropped() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bon_launch_lock_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let prof = Profile::new_default("LockTest", PlatformType::MacOS);
+        let held = acquire_profile_launch_lock_in(&tmp, &prof.id).unwrap();
+        assert!(acquire_profile_launch_lock_in(&tmp, &prof.id).is_err());
+        drop(held);
+        assert!(acquire_profile_launch_lock_in(&tmp, &prof.id).is_ok());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_stop_never_signals_pid_that_does_not_own_profile() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bon_pid_reuse_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let prof = Profile::new_default("PidReuse", PlatformType::MacOS);
+        let pdir = profile_user_data_dir_in(&tmp, &prof.id).unwrap();
+        // An unrelated live process now holds the PID recorded by a crashed session.
+        let mut stranger = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(
+            runtime_file_path_in(&tmp, &prof.id),
+            serde_json::to_string(&RuntimeInfo {
+                pid: stranger.id(),
+                cdp_port: 1,
+                ws_url: "ws://127.0.0.1:1/devtools/browser/x".into(),
+                local_proxy_port: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(probe_live_runtime_in(&tmp, &prof.id).is_none());
+        std::fs::write(
+            runtime_file_path_in(&tmp, &prof.id),
+            format!(r#"{{"pid":{},"cdp_port":1,"ws_url":"ws://127.0.0.1:1/x","local_proxy_port":null}}"#, stranger.id()),
+        )
+        .unwrap();
+        stop_external_runtime_in(&tmp, &prof.id, &prof.short_id());
+        assert!(matches!(stranger.try_wait(), Ok(None)), "unrelated process was signalled");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = pdir;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn test_cancellable_extension_download_and_unpack() {
         use std::sync::atomic::AtomicBool;
-        let cancelled = AtomicBool::new(true);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(true));
         let tmp = std::env::temp_dir().join(format!(
             "bon_cancel_ext_{}_{}",
             std::process::id(),
@@ -4987,9 +5094,9 @@ mod tests {
         assert_eq!(custom_items.len(), 2);
         assert_eq!(custom_items[0], ("My Dashboard".to_string(), "https://dash.example.com".to_string()));
         assert_eq!(custom_items[1], ("shop.example.com".to_string(), "https://shop.example.com".to_string()));
-        write_profile_bookmarks_items(&bm_dir, &custom_items);
+        write_profile_bookmarks_items(&bm_dir, &custom_items).unwrap();
         assert_eq!(read_profile_bookmarks_in(&def_root, &bm_prof), custom_items);
-        write_profile_bookmarks_items(&bm_dir, &[]);
+        write_profile_bookmarks_items(&bm_dir, &[]).unwrap();
         assert!(read_profile_bookmarks_in(&def_root, &bm_prof).is_empty());
         let _ = wipe_profile_data_in(&def_root, &bm_prof.id);
         // Verify parse_flow_vars_text and save_profile_history_as_flow
@@ -5222,7 +5329,7 @@ mod tests {
             "",
         ));
         assert_eq!(code_rot_502, 502);
-        assert_eq!(crate::control::CONTROL_HTTP_ENDPOINTS.len(), 16);
+        assert_eq!(crate::control::CONTROL_HTTP_ENDPOINTS.len(), 19);
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"GET /flows"));
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /profiles/:id/totp"));
         assert!(crate::control::CONTROL_HTTP_ENDPOINTS.contains(&"POST /profiles/:id/screenshot"));
@@ -5273,6 +5380,7 @@ mod tests {
         for p in [&p1, &p2] {
             let pdir = ws_a.profile_user_data_dir(&p.id).unwrap();
             std::fs::write(pdir.join("bon_runtime.json"), &rt_json).unwrap();
+            fake_singleton_lock(&pdir, std::process::id());
         }
 
         // 1. Multi-thread `/arrange` (>=2 profiles triggers `parallel_map` worker threads)
@@ -5407,6 +5515,7 @@ mod tests {
             serde_json::to_string(&info).unwrap(),
         )
         .unwrap();
+        fake_singleton_lock(&pdir, child_pid);
         sup.insert_test_process(&p.id, &p.short_id(), child, info);
 
         // 1. Modifying bookmarks while browser is running MUST return an explicit error (not silently drop)
@@ -6013,6 +6122,7 @@ mod tests {
         let closed_p = closed_l.local_addr().unwrap().port();
         drop(closed_l);
         let rt_path = runtime_file_path_in(&tmp, &ext_prof.id);
+        fake_singleton_lock(&ext_pdir, slow_exit_child.id());
         std::fs::write(
             &rt_path,
             serde_json::to_string(&RuntimeInfo {
@@ -6025,6 +6135,8 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(30));
+        // Reap like a real parent would; an unreaped zombie still answers kill(pid, 0).
+        let reaper = std::thread::spawn(move || slow_exit_child.wait());
         let tmp_stop = tmp.clone();
         let ext_id = ext_prof.id.clone();
         let ext_sid = ext_prof.short_id();
@@ -6036,7 +6148,7 @@ mod tests {
             "bon_runtime.json must stay present while external Chromium PID is still shutting down"
         );
         assert!(stop_thread.join().unwrap());
-        let _ = slow_exit_child.wait();
+        let _ = reaper.join();
         assert!(!rt_path.exists());
         let _ = ext_pdir;
 

@@ -3248,14 +3248,19 @@ impl BonLoginApp {
             if let Ok(db) = self.db.lock() {
                 let _ = db.update_profile_quick_meta(&pid, &note, &tags, &totp);
             }
+            let mut bm_error = None;
             if self.running_session_pair(&pid).is_none()
                 && self.supervisor.live_info(&pid).is_none()
                 && let Ok(user_data_dir) =
                     crate::launcher::profile_user_data_dir_in(&self.workspace_root, &pid)
+                && let Err(e) = crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bms)
             {
-                crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bms);
+                bm_error = Some(e);
             }
-            self.banner_message = Some("Updated tags, bookmarks, note & 2FA".to_string());
+            self.banner_message = Some(match bm_error {
+                None => "Updated tags, bookmarks, note & 2FA".to_string(),
+                Some(e) => format!("Updated tags, note & 2FA, but bookmarks were not saved: {e}"),
+            });
         } else {
             let targets: Vec<Profile> = self
                 .profiles
@@ -3277,6 +3282,7 @@ impl BonLoginApp {
                 return;
             }
             let count = targets.len();
+            let mut bm_failed = 0usize;
             if let Ok(db) = self.db.lock() {
                 let _ = db.with_transaction(|db| {
                     for p in &targets {
@@ -3287,15 +3293,20 @@ impl BonLoginApp {
                         if !bms.is_empty()
                             && let Ok(user_data_dir) =
                                 crate::launcher::profile_user_data_dir_in(&self.workspace_root, &p.id)
+                            && crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bms)
+                                .is_err()
                         {
-                            crate::launcher::write_profile_bookmarks_items(&user_data_dir, &bms);
+                            bm_failed += 1;
                         }
                     }
                     Ok(())
                 });
             }
-            self.banner_message =
-                Some(format!("Updated tags, bookmarks & note on {count} profile(s)"));
+            self.banner_message = Some(if bm_failed == 0 {
+                format!("Updated tags, bookmarks & note on {count} profile(s)")
+            } else {
+                format!("Updated {count} profile(s); bookmarks not saved on {bm_failed}")
+            });
         }
         self.popup_modal = None;
         self.reload_profiles();

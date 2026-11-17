@@ -2313,7 +2313,7 @@ fn run_ext_subcommand(args: &[String]) -> Result<()> {
             let mut results = Vec::new();
             for mut ext in targets {
                 if enable {
-                    let flag = std::sync::atomic::AtomicBool::new(false);
+                    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     ext = cli_tokio_handle().block_on(
                         crate::extensions::activate_extension_cancellable_in(
                             db.root_dir(),
@@ -3723,6 +3723,7 @@ pub const CONTROL_HTTP_ENDPOINTS: &[&str] = &[
     "GET /health",
     "GET /profiles",
     "GET /flows",
+    "GET /proxies/free",
     "POST /profiles/:id/launch",
     "POST /profiles/:id/stop",
     "POST /profiles/:id/rotate-proxy",
