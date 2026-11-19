@@ -60,6 +60,7 @@ pub struct AgentFlowsModalState {
     pub save_name_input: Entity<InputState>,
     pub vars_input: Entity<InputState>,
     pub csv_input: Entity<InputState>,
+    pub add_step_input: Entity<InputState>,
     pub concurrency: usize,
 }
 
@@ -2584,6 +2585,25 @@ pub fn render_popup_modal(
                                             app.save_history_as_flow_ui(window, cx);
                                         })),
                                 ),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .child(Input::new(&af.add_step_input)),
+                                )
+                                .child(
+                                    Button::new("flw-add-step-btn")
+                                        .with_variant(BonTheme::outline_blue(cx))
+                                        .small()
+                                        .label("+ Add Step")
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            app.add_flow_step_ui(window, cx);
+                                        })),
+                                ),
                         ),
                 )
                 .child(
@@ -2629,6 +2649,24 @@ pub fn render_popup_modal(
                                 )
                             };
                             let steps_list = fl.steps.clone();
+                            // Indent if/loop/foreach bodies so block structure is readable.
+                            let mut depth = 0usize;
+                            let depths: Vec<usize> = fl
+                                .steps
+                                .iter()
+                                .map(|s| match s.op.as_str() {
+                                    "end" => {
+                                        depth = depth.saturating_sub(1);
+                                        depth
+                                    }
+                                    "else" => depth.saturating_sub(1),
+                                    "if" | "loop" | "foreach" => {
+                                        depth += 1;
+                                        depth - 1
+                                    }
+                                    _ => depth,
+                                })
+                                .collect();
                             v_flex()
                                 .w_full()
                                 .px_3()
@@ -2722,11 +2760,18 @@ pub fn render_popup_modal(
                                                     st.locators.first().cloned().unwrap_or_default();
                                                 let val_preview = st
                                                     .value
-                                                    .as_deref()
+                                                    .iter()
+                                                    .chain(&st.extra_args)
                                                     .map(|v| format!(" \"{v}\""))
+                                                    .collect::<String>();
+                                                let out_preview = st
+                                                    .out
+                                                    .as_deref()
+                                                    .map(|o| format!("  → {{{{{o}}}}}"))
                                                     .unwrap_or_default();
                                                 let summary = format!(
-                                                    "#{s_idx}  {}  {loc_preview}{val_preview}",
+                                                    "#{s_idx}  {}{}  {loc_preview}{val_preview}{out_preview}",
+                                                    "    ".repeat(depths[s_idx]),
                                                     st.op
                                                 );
                                                 let is_opt = st.optional;

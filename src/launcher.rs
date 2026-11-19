@@ -4258,6 +4258,7 @@ mod tests {
             value: None,
             extra_args: Vec::new(),
             optional: false,
+            out: None,
         };
         let sess_name = format!("bon_{short_id}");
         let mut e2e_adapter = SubprocessAgentSession {
@@ -4637,6 +4638,7 @@ mod tests {
             value: Some("https://x.com/login".to_string()),
             extra_args: Vec::new(),
             optional: false,
+            out: None,
         };
         let mut steps = vec![open_step, step];
         parameterize_flow_steps(
@@ -4655,6 +4657,7 @@ mod tests {
             value: Some("viewport".to_string()),
             extra_args: vec!["1920".to_string(), "1080".to_string()],
             optional: false,
+            out: None,
         };
         let dummy_root = std::env::temp_dir();
         let mut guard_adapter = SubprocessAgentSession {
@@ -4781,6 +4784,7 @@ mod tests {
             value: Some("https://acme-shop.example.com/login".to_string()),
             extra_args: Vec::new(),
             optional: false,
+            out: None,
         }];
         parameterize_flow_steps(
             &mut open_steps,
@@ -5165,6 +5169,7 @@ mod tests {
                 value: Some("user@test.com".to_string()),
                 extra_args: vec![],
                 optional: false,
+                out: None,
             }],
         };
         save_flow_to_path(&hist_path, &mut dummy_hist).unwrap();
@@ -5496,6 +5501,7 @@ mod tests {
                         value: None,
                         extra_args: vec![],
                         optional: false,
+                        out: None,
                     }],
                 };
                 save_flow_to_path(&hist_path, &mut h).unwrap();
@@ -5930,6 +5936,7 @@ mod tests {
                     value: None,
                     extra_args: vec![],
                     optional: false,
+                    out: None,
                 },
                 FlowStep {
                     op: "select".to_string(),
@@ -5937,6 +5944,7 @@ mod tests {
                     value: Some("{{country}}".to_string()),
                     extra_args: vec![],
                     optional: false,
+                    out: None,
                 },
                 FlowStep {
                     op: "click".to_string(),
@@ -5944,6 +5952,7 @@ mod tests {
                     value: None,
                     extra_args: vec![],
                     optional: true,
+                    out: None,
                 },
                 FlowStep {
                     op: "click".to_string(),
@@ -5951,6 +5960,7 @@ mod tests {
                     value: None,
                     extra_args: vec![],
                     optional: false,
+                    out: None,
                 },
             ],
         };
@@ -6513,6 +6523,7 @@ mod tests {
                 value: Some("https://example.com".to_string()),
                 extra_args: vec![],
                 optional: false,
+                out: None,
             }],
         );
         assert_eq!(
@@ -6534,6 +6545,7 @@ mod tests {
                     value: Some("https://example.com".to_string()),
                     extra_args: vec![],
                     optional: false,
+                    out: None,
                 },
                 FlowStep {
                     op: "click".to_string(),
@@ -6541,6 +6553,7 @@ mod tests {
                     value: None,
                     extra_args: vec![],
                     optional: false,
+                    out: None,
                 },
             ],
         };

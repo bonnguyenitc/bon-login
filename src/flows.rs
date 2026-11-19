@@ -1,10 +1,12 @@
 use crate::launcher::{
-    agent_browser_cmd_for_short_id_in, ensure_agent_browser_connected_in,
+    agent_browser_cmd_for_short_id_in, ensure_agent_browser_connected_in, runtime_file_path_in,
     should_reconnect_agent_session, validate_stealth_agent_args,
 };
-use crate::models::{Profile, unix_now};
-use anyhow::{Context, Result, bail};
+use crate::models::{Profile, RuntimeInfo, unix_now};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
 
 // Agent Flow Playbooks (Record @eN -> Stable Locators, Replay & Self-Heal)
 // ---------------------------------------------------------------------------
@@ -40,6 +42,9 @@ pub struct FlowStep {
     pub extra_args: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
+    /// Variable that receives this step's output (data-op result or agent-browser stdout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -576,6 +581,7 @@ pub fn build_flow_step_from_cmd(
                 value: Some(url),
                 extra_args: Vec::new(),
                 optional: false,
+                out: None,
             })
         }
         "click" | "dblclick" | "hover" | "focus" | "check" | "uncheck" | "scrollintoview"
@@ -592,6 +598,7 @@ pub fn build_flow_step_from_cmd(
                 value: None,
                 extra_args: tokens[2..].to_vec(),
                 optional: false,
+                out: None,
             })
         }
         "fill" | "type" | "select" | "upload" => {
@@ -603,6 +610,7 @@ pub fn build_flow_step_from_cmd(
                 value: Some(val),
                 extra_args: tokens[3..].to_vec(),
                 optional: false,
+                out: None,
             })
         }
         "press" | "key" => {
@@ -613,6 +621,7 @@ pub fn build_flow_step_from_cmd(
                 value: Some(key),
                 extra_args: Vec::new(),
                 optional: false,
+                out: None,
             })
         }
         "scroll" => {
@@ -623,6 +632,7 @@ pub fn build_flow_step_from_cmd(
                 value: Some(dir),
                 extra_args: tokens[2..].to_vec(),
                 optional: false,
+                out: None,
             })
         }
         "wait" => {
@@ -634,6 +644,7 @@ pub fn build_flow_step_from_cmd(
                     value: None,
                     extra_args: tokens[2..].to_vec(),
                     optional: false,
+                    out: None,
                 })
             } else {
                 Some(FlowStep {
@@ -642,6 +653,7 @@ pub fn build_flow_step_from_cmd(
                     value: None,
                     extra_args: tokens[1..].to_vec(),
                     optional: false,
+                    out: None,
                 })
             }
         }
@@ -674,6 +686,7 @@ pub fn build_flow_step_from_cmd(
                         value,
                         extra_args: Vec::new(),
                         optional: false,
+                        out: None,
                     })
                 }
                 "text" | "label" | "placeholder" | "testid" => {
@@ -699,6 +712,7 @@ pub fn build_flow_step_from_cmd(
                         value,
                         extra_args: Vec::new(),
                         optional: false,
+                        out: None,
                     })
                 }
                 _ => None,
@@ -851,6 +865,8 @@ pub fn extract_flow_vars(flow: &AgentFlow) -> Vec<String> {
             scan_str(a);
         }
     }
+    // Vars produced by a step's `out` are filled at runtime, not required inputs.
+    vars.retain(|v| !flow.steps.iter().any(|s| s.out.as_deref() == Some(v.as_str())));
     vars
 }
 
@@ -901,6 +917,480 @@ pub fn substitute_flow_vars(
     }
     out
 }
+
+/// Ops BonLogin executes itself (never sent to the page), like GenLogin's Data nodes.
+pub const DATA_OPS: &[&str] = &["http", "read_file", "write_file", "regex", "json", "cmd"];
+
+/// Block ops: `if … [else] … end`, `loop <n> … end`, `foreach <lines> … end`, `break`.
+pub const CONTROL_OPS: &[&str] = &["if", "else", "end", "loop", "foreach", "break"];
+
+const IF_OPERATORS: &[&str] = &["==", "!=", "contains", "!contains", "matches", "<", ">", "<=", ">="];
+const MAX_LOOP_COUNT: usize = 100_000;
+const CMD_DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+const HTTP_STEP_BODY_CAP: usize = 4 * 1024 * 1024;
+
+// One runtime for every http step: replay runs on plain threads and tokio blocking threads alike.
+static HTTP_STEP_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("Failed to start flow HTTP runtime")
+});
+
+static HTTP_STEP_CLIENTS: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Option<u16>, reqwest::Client>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Cached client per local tunnel port (`None` = direct).
+fn http_step_client(tunnel_port: Option<u16>) -> Result<reqwest::Client> {
+    let mut cache = HTTP_STEP_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cache.get(&tunnel_port) {
+        return Ok(c.clone());
+    }
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60));
+    if let Some(port) = tunnel_port {
+        builder = builder.proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))?);
+    }
+    let client = builder.build().context("Failed to build flow HTTP client")?;
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(tunnel_port, client.clone());
+    Ok(client)
+}
+
+/// Relative paths live under `<root>/files/` so GUI and CLI runs resolve the same file.
+fn data_file_path(root_dir: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root_dir.join("files").join(p)
+    }
+}
+
+fn http_step(root_dir: &Path, profile: &Profile, url: &str, args: &[String]) -> Result<String> {
+    let mut method = reqwest::Method::GET;
+    let mut headers = Vec::new();
+    let mut body = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let val = it.next().with_context(|| format!("http option {a} needs a value"));
+        match a.as_str() {
+            "--method" | "-X" => {
+                method = val?.to_uppercase().parse().context("invalid HTTP method")?
+            }
+            "--header" | "-H" => {
+                let h = val?;
+                let (k, v) = h
+                    .split_once(':')
+                    .with_context(|| format!("header '{h}' must be 'Name: value'"))?;
+                headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
+            "--body" | "-d" => body = Some(val?.clone()),
+            other => bail!("unknown http option '{other}' (expected --method, --header, --body)"),
+        }
+    }
+    // Fail-closed: a proxied profile's API calls leave through its own tunnel, never the Mac's IP.
+    let tunnel_port = match &profile.proxy {
+        None => None,
+        Some(_) => Some(
+            std::fs::read_to_string(runtime_file_path_in(root_dir, &profile.id))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<RuntimeInfo>(&raw).ok())
+                .and_then(|rt| rt.local_proxy_port)
+                .context("profile has a proxy but its tunnel is not running; refusing direct HTTP")?,
+        ),
+    };
+    let mut req = http_step_client(tunnel_port)?.request(method, url);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    if let Some(b) = body {
+        req = req.body(b);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    HTTP_STEP_RT.spawn(async move {
+        let res = async {
+            let bytes = crate::geoip::read_body_capped(req.send().await?, HTTP_STEP_BODY_CAP).await?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        .await;
+        let _ = tx.send(res);
+    });
+    rx.recv().map_err(|_| anyhow!("http step task dropped"))?
+}
+
+fn run_data_step(
+    root_dir: &Path,
+    profile: &Profile,
+    op: &str,
+    value: &str,
+    args: &[String],
+) -> Result<String> {
+    match op {
+        "http" => http_step(root_dir, profile, value, args),
+        "read_file" => {
+            let p = data_file_path(root_dir, value);
+            std::fs::read_to_string(&p).with_context(|| format!("read_file {}", p.display()))
+        }
+        "write_file" => {
+            let p = data_file_path(root_dir, value);
+            let content = args.first().context("write_file needs content")?;
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            if args.iter().skip(1).any(|a| a == "--append") {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
+                writeln!(f, "{content}")?;
+            } else {
+                std::fs::write(&p, content)?;
+            }
+            Ok(p.display().to_string())
+        }
+        "regex" => {
+            let re = regex::Regex::new(args.first().context("regex needs a pattern")?)?;
+            let caps = re.captures(value).context("regex: no match")?;
+            Ok(caps.get(1).or_else(|| caps.get(0)).map_or("", |m| m.as_str()).to_string())
+        }
+        "json" => {
+            let path = args.first().context("json needs a path like data.otp or /data/otp")?;
+            let pointer = if path.starts_with('/') {
+                path.clone()
+            } else {
+                format!("/{}", path.replace('.', "/"))
+            };
+            let doc: serde_json::Value =
+                serde_json::from_str(value).context("json: input is not valid JSON")?;
+            match doc.pointer(&pointer).with_context(|| format!("json: no field at {path}"))? {
+                serde_json::Value::String(s) => Ok(s.clone()),
+                v => Ok(v.to_string()),
+            }
+        }
+        "cmd" => run_cmd_step(root_dir, value, args),
+        other => bail!("unknown data op '{other}'"),
+    }
+}
+
+/// Single-quotes a value for `sh`, so `{{var}}` from CSV/HTTP can never inject shell syntax.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Runs `sh -c` in `<root>/files/`, killing the whole process group on timeout.
+fn run_cmd_step(root_dir: &Path, command: &str, args: &[String]) -> Result<String> {
+    use std::os::unix::process::CommandExt;
+    let timeout = match args {
+        [] => CMD_DEFAULT_TIMEOUT_SECS,
+        [flag, secs] if flag == "--timeout" => secs.parse().context("--timeout must be seconds")?,
+        _ => bail!("cmd accepts only [--timeout <secs>] after the command"),
+    };
+    let dir = root_dir.join("files");
+    std::fs::create_dir_all(&dir)?;
+    let child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .context("cmd: failed to start /bin/sh")?;
+    let pgid = child.id() as i32;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(Duration::from_secs(timeout)) {
+        Ok(res) => res?,
+        Err(_) => {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            unsafe {
+                kill(-pgid, 9);
+            }
+            bail!("cmd timed out after {timeout}s");
+        }
+    };
+    if !out.status.success() {
+        bail!(
+            "cmd failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+fn eval_flow_condition(
+    step: &FlowStep,
+    vars: &std::collections::HashMap<String, String>,
+) -> std::result::Result<bool, String> {
+    let left = substitute_flow_vars(step.value.as_deref().unwrap_or_default(), vars);
+    let [cmp, right] = step.extra_args.as_slice() else {
+        return Err("if needs <left> <operator> <right>".to_string());
+    };
+    let right = substitute_flow_vars(right, vars);
+    let num = |s: &str| {
+        s.trim()
+            .parse::<f64>()
+            .map_err(|_| format!("if: '{s}' is not a number"))
+    };
+    Ok(match cmp.as_str() {
+        "==" => left == right,
+        "!=" => left != right,
+        "contains" => left.contains(&right),
+        "!contains" => !left.contains(&right),
+        "matches" => regex::Regex::new(&right)
+            .map_err(|e| format!("if matches: {e}"))?
+            .is_match(&left),
+        "<" => num(&left)? < num(&right)?,
+        ">" => num(&left)? > num(&right)?,
+        "<=" => num(&left)? <= num(&right)?,
+        ">=" => num(&left)? >= num(&right)?,
+        other => return Err(format!("unknown if operator '{other}' ({})", IF_OPERATORS.join(", "))),
+    })
+}
+
+/// Jump table for block ops: if→else|end, else→end, loop/foreach→end, end→opener, break→loop.
+fn match_flow_blocks(steps: &[FlowStep]) -> Result<Vec<usize>> {
+    let mut jump = vec![usize::MAX; steps.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, s) in steps.iter().enumerate() {
+        match s.op.as_str() {
+            "if" | "loop" | "foreach" => stack.push(i),
+            "else" => {
+                let o = *stack
+                    .last()
+                    .filter(|&&o| steps[o].op == "if" && jump[o] == usize::MAX)
+                    .with_context(|| format!("step {i}: else without a matching if"))?;
+                jump[o] = i;
+            }
+            "end" => {
+                let o = stack
+                    .pop()
+                    .with_context(|| format!("step {i}: end without if/loop/foreach"))?;
+                // An if with an else: the else jumps to this end; otherwise the if does.
+                let from = if steps[o].op == "if" && jump[o] != usize::MAX { jump[o] } else { o };
+                jump[from] = i;
+                jump[i] = o;
+            }
+            "break" => {
+                jump[i] = *stack
+                    .iter()
+                    .rev()
+                    .find(|&&o| steps[o].op != "if")
+                    .with_context(|| format!("step {i}: break outside loop/foreach"))?;
+            }
+            _ => {}
+        }
+    }
+    if let Some(&o) = stack.last() {
+        bail!("step {o}: '{}' has no matching end", steps[o].op);
+    }
+    Ok(jump)
+}
+
+/// Next item of a loop/foreach header (`None` = finished); items are fixed on loop entry.
+fn next_loop_item(
+    step: &FlowStep,
+    idx: usize,
+    vars: &std::collections::HashMap<String, String>,
+    loops: &mut std::collections::HashMap<usize, (usize, Vec<String>)>,
+) -> std::result::Result<Option<String>, String> {
+    let state = match loops.entry(idx) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let input = substitute_flow_vars(step.value.as_deref().unwrap_or_default(), vars);
+            let items: Vec<String> = if step.op == "loop" {
+                let n: usize = input
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("loop count '{input}' is not a number"))?;
+                if n > MAX_LOOP_COUNT {
+                    return Err(format!("loop count {n} exceeds {MAX_LOOP_COUNT}"));
+                }
+                (1..=n).map(|i| i.to_string()).collect()
+            } else {
+                input
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect()
+            };
+            e.insert((0, items))
+        }
+    };
+    let item = state.1.get(state.0).cloned();
+    state.0 += 1;
+    if item.is_none() {
+        loops.remove(&idx);
+    }
+    Ok(item)
+}
+
+/// Runs a data op, or a locator-less agent-browser command whose stdout is captured (`get text`, `eval`).
+fn run_value_step(
+    root_dir: &Path,
+    profile: &Profile,
+    runner: &mut dyn AgentSession,
+    step: &FlowStep,
+    vars: &std::collections::HashMap<String, String>,
+) -> std::result::Result<String, String> {
+    let value = step.value.as_deref().map(|v| {
+        if step.op == "cmd" {
+            let quoted = vars.iter().map(|(k, v)| (k.clone(), shell_quote(v))).collect();
+            substitute_flow_vars(v, &quoted)
+        } else {
+            substitute_flow_vars(v, vars)
+        }
+    });
+    let args: Vec<String> = step.extra_args.iter().map(|a| substitute_flow_vars(a, vars)).collect();
+    if DATA_OPS.contains(&step.op.as_str()) {
+        return run_data_step(root_dir, profile, &step.op, value.as_deref().unwrap_or_default(), &args)
+            .map_err(|e| format!("{e:#}"));
+    }
+    let mut cmd = vec![step.op.clone()];
+    cmd.extend(value);
+    cmd.extend(args);
+    runner.exec(&cmd).map(|o| o.trim().to_string())
+}
+
+/// Splits a step line like a shell: whitespace separates, '…'/"…" group, `\` escapes inside "…".
+pub fn split_step_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_tok = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => cur.extend(chars.next()),
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_tok = true;
+            }
+            None if c.is_whitespace() => {
+                if in_tok {
+                    out.push(std::mem::take(&mut cur));
+                    in_tok = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                in_tok = true;
+            }
+        }
+    }
+    if in_tok {
+        out.push(cur);
+    }
+    out
+}
+
+/// Parses `[--at <idx>] [--out <var>] [--optional] <op> [args...]` into an insert index and step.
+pub fn parse_step_tokens(tokens: &[String]) -> Result<(Option<usize>, FlowStep)> {
+    let (mut at, mut out, mut optional, mut i) = (None, None, false, 0);
+    while let Some(t) = tokens.get(i) {
+        match t.as_str() {
+            "--at" => {
+                let raw = tokens.get(i + 1).context("--at needs a step index")?;
+                at = Some(raw.parse().context("--at must be a non-negative integer")?);
+                i += 2;
+            }
+            "--out" => {
+                let name = tokens.get(i + 1).context("--out needs a variable name")?.trim();
+                if name.is_empty() || name.contains(['{', '}']) {
+                    bail!("invalid --out variable name '{name}'");
+                }
+                out = Some(name.to_string());
+                i += 2;
+            }
+            "--optional" => {
+                optional = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let cmd = &tokens[i..];
+    let op = cmd.first().context("missing step op (e.g. http, read_file, click)")?;
+    let min_args = match op.as_str() {
+        "http" | "read_file" | "cmd" | "loop" | "foreach" => 1,
+        "write_file" | "regex" | "json" => 2,
+        "if" => 3,
+        _ => 0,
+    };
+    if cmd.len() - 1 < min_args {
+        bail!("'{op}' needs {min_args} argument(s); see `bon-login --help`");
+    }
+    if op == "if" && !IF_OPERATORS.contains(&cmd[2].as_str()) {
+        bail!("unknown if operator '{}' ({})", cmd[2], IF_OPERATORS.join(", "));
+    }
+    let recorded = if DATA_OPS.contains(&op.as_str()) || CONTROL_OPS.contains(&op.as_str()) {
+        None
+    } else {
+        build_flow_step_from_cmd(
+            cmd,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+    };
+    let mut step = recorded.unwrap_or_else(|| FlowStep {
+        op: op.clone(),
+        locators: Vec::new(),
+        value: cmd.get(1).cloned(),
+        extra_args: cmd.get(2..).unwrap_or_default().to_vec(),
+        optional: false,
+        out: None,
+    });
+    step.optional = optional;
+    step.out = out;
+    Ok((at, step))
+}
+
+/// Inserts a step (appends when `at` is None), creating the flow file if it does not exist.
+pub fn add_flow_step_in(
+    root_dir: &Path,
+    flow_raw: &str,
+    at: Option<usize>,
+    step: FlowStep,
+) -> Result<AgentFlow> {
+    let clean_name = sanitize_flow_name(flow_raw)?;
+    let path = flow_file_path_in(root_dir, &clean_name)?;
+    let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut flow = if path.is_file() {
+        load_flow_from_path(&path, &clean_name)?
+    } else {
+        AgentFlow {
+            name: clean_name.clone(),
+            ..Default::default()
+        }
+    };
+    let idx = at.unwrap_or(flow.steps.len());
+    if idx > flow.steps.len() {
+        bail!(
+            "--at {idx} out of range (flow '{}' has {} steps)",
+            clean_name,
+            flow.steps.len()
+        );
+    }
+    flow.steps.insert(idx, step);
+    save_flow_to_path(&path, &mut flow)?;
+    Ok(flow)
+}
+
 pub(crate) fn parse_var_flag(args: &[String], idx: usize) -> Option<((String, String), usize)> {
     if args.get(idx)? == "--var" {
         let (k, v) = args.get(idx + 1)?.split_once('=')?;
@@ -1496,12 +1986,67 @@ pub fn replay_flow_steps_with_in(
     vars.entry("profile.notes".to_string())
         .or_insert_with(|| profile.notes.clone());
 
+    let jump = match_flow_blocks(&flow.steps)?;
+    let mut loops = std::collections::HashMap::new();
     let mut executed_steps = Vec::new();
     let mut failure = None;
 
-    for step_idx in from_step..flow.steps.len() {
+    let mut pc = from_step;
+    while pc < flow.steps.len() {
+        let step_idx = pc;
+        pc += 1;
         let step = flow.steps[step_idx].clone();
-        match execute_single_flow_step_with(runner, &step, &vars) {
+        let outcome = match step.op.as_str() {
+            "if" => eval_flow_condition(&step, &vars).map(|hit| {
+                if !hit {
+                    pc = jump[step_idx] + 1;
+                }
+                (0, format!("if:{hit}"))
+            }),
+            // Reached only after the if-branch ran: skip the else-branch.
+            "else" => {
+                pc = jump[step_idx] + 1;
+                Ok((0, "else".to_string()))
+            }
+            "end" => {
+                if flow.steps[jump[step_idx]].op != "if" {
+                    pc = jump[step_idx];
+                }
+                Ok((0, "end".to_string()))
+            }
+            "break" => {
+                let header = jump[step_idx];
+                loops.remove(&header);
+                pc = jump[header] + 1;
+                Ok((0, "break".to_string()))
+            }
+            "loop" | "foreach" => {
+                next_loop_item(&step, step_idx, &vars, &mut loops).map(|item| match item {
+                    Some(v) => {
+                        if let Some(name) = &step.out {
+                            vars.insert(name.clone(), v);
+                        }
+                        (0, step.op.clone())
+                    }
+                    None => {
+                        pc = jump[step_idx] + 1;
+                        (0, format!("{} done", step.op))
+                    }
+                })
+            }
+            _ if step.locators.is_empty()
+                && (DATA_OPS.contains(&step.op.as_str()) || step.out.is_some()) =>
+            {
+                run_value_step(root_dir, profile, runner, &step, &vars).map(|output| {
+                    if let Some(name) = &step.out {
+                        vars.insert(name.clone(), output);
+                    }
+                    (0, step.op.clone())
+                })
+            }
+            _ => execute_single_flow_step_with(runner, &step, &vars),
+        };
+        match outcome {
             Ok((winning_loc_idx, matched_locator)) => {
                 if winning_loc_idx > 0 {
                     promote_flow_step_locator(&path, &clean_name, step_idx, &matched_locator);
@@ -1774,6 +2319,7 @@ mod tests {
                     value: Some("https://shop.example.com/cart".to_string()),
                     extra_args: vec![],
                     optional: false,
+                    out: None,
                 },
                 s_role,
             ],
@@ -1792,6 +2338,142 @@ mod tests {
         assert!(mutate_flow_step_in(&tmp, "mut_test", 9, "optional").is_err());
         assert!(mutate_flow_step_in(&tmp, "mut_test", 0, "invalid_op").is_err());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_data_steps_chain_out_vars_through_http_files_and_browser() {
+        use std::io::{Read, Write};
+        struct FakeAgent(Vec<Vec<String>>);
+        impl AgentSession for FakeAgent {
+            fn exec(&mut self, args: &[String]) -> std::result::Result<String, String> {
+                self.0.push(args.to_vec());
+                Ok(if args[0] == "get" { "  Hello  \n".into() } else { String::new() })
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read until headers + Content-Length body arrived (reqwest may split the writes).
+            let req = loop {
+                let n = s.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let txt = String::from_utf8_lossy(&raw).to_string();
+                if let Some((head, body)) = txt.split_once("\r\n\r\n") {
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                        .unwrap_or(0);
+                    if body.len() >= len || n == 0 {
+                        break txt;
+                    }
+                }
+            };
+            let body = r#"{"data":{"code":"Your OTP is 482913"}}"#;
+            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            req
+        });
+
+        let tmp = std::env::temp_dir().join(format!("bonlogin-data-steps-{}", rand::random::<u32>()));
+        let lines = [
+            format!("--out resp http http://127.0.0.1:{port}/otp -X POST -H 'X-Key: k1' -d '{{\"u\":\"{{{{user}}}}\"}}'"),
+            "--out code json {{resp}} data.code".to_string(),
+            r"--out otp regex {{code}} '(\d{6})'".to_string(),
+            "--out title get text h1".to_string(),
+            "fill \"#otp\" {{otp}}".to_string(),
+            "write_file out/rows.csv \"{{user}},{{title}},{{otp}}\" --append".to_string(),
+            "--out saved read_file out/rows.csv".to_string(),
+            "--optional regex {{saved}} nomatch".to_string(),
+        ];
+        for line in &lines {
+            let (at, step) = parse_step_tokens(&split_step_line(line)).unwrap();
+            add_flow_step_in(&tmp, "data_flow", at, step).unwrap();
+        }
+        let flow = load_flow_from_path(&flow_file_path_in(&tmp, "data_flow").unwrap(), "data_flow").unwrap();
+        assert_eq!(extract_flow_vars(&flow), vec!["user".to_string()]);
+
+        let prof = Profile::new_default("DataProf", crate::models::PlatformType::MacOS);
+        let vars = std::collections::HashMap::from([("user".to_string(), "alice".to_string())]);
+        let mut agent = FakeAgent(Vec::new());
+        let report = replay_flow_steps_with_in(&tmp, "data_flow", &prof, &vars, 0, &mut agent).unwrap();
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert_eq!(report.executed_steps[7]["status"], "skipped_optional");
+
+        let req = server.join().unwrap();
+        assert!(req.starts_with("POST /otp"), "{req}");
+        assert!(req.to_ascii_lowercase().contains("x-key: k1"));
+        assert!(req.ends_with(r#"{"u":"alice"}"#), "{req}");
+        assert_eq!(agent.0[0], vec!["get", "text", "h1"]);
+        assert!(agent.0[1].iter().any(|a| a == "482913"), "{:?}", agent.0[1]);
+        let csv = std::fs::read_to_string(tmp.join("files/out/rows.csv")).unwrap();
+        assert_eq!(csv, "alice,Hello,482913\n");
+
+        // Proxied profile without a live tunnel must not fall back to a direct request.
+        let mut proxied = prof.clone();
+        proxied.proxy = crate::models::ProxyConfig::parse_flexible("127.0.0.1:9").unwrap();
+        let err = run_data_step(&tmp, &proxied, "http", "http://127.0.0.1:1/", &[]).unwrap_err();
+        assert!(err.to_string().contains("refusing direct HTTP"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_control_flow_if_else_loop_foreach_break_and_quoted_cmd() {
+        struct Agent(Vec<String>);
+        impl AgentSession for Agent {
+            fn exec(&mut self, args: &[String]) -> std::result::Result<String, String> {
+                self.0.push(args.join(" "));
+                Ok(String::new())
+            }
+        }
+        let tmp = std::env::temp_dir().join(format!("bonlogin-ctl-{}", rand::random::<u32>()));
+        let lines = [
+            "--out i loop 5",
+            "if {{i}} == 4",
+            "break",
+            "else",
+            "if {{i}} >= 2",
+            "press {{i}}",
+            "end",
+            "end",
+            "end",
+            "--out who foreach {{people}}",
+            "cmd 'printf \"%s|\" {{who}} >> out.txt'",
+            "end",
+            "--out all read_file out.txt",
+            "if {{all}} matches '^a; touch pwned\\|'",
+            "press ok",
+            "end",
+        ];
+        for line in lines {
+            let (at, step) = parse_step_tokens(&split_step_line(line)).unwrap();
+            add_flow_step_in(&tmp, "ctl", at, step).unwrap();
+        }
+        let prof = Profile::new_default("CtlProf", crate::models::PlatformType::MacOS);
+        // A CSV value trying shell injection must arrive as one literal argument.
+        let vars = std::collections::HashMap::from([(
+            "people".to_string(),
+            "a; touch pwned\n\nbob's".to_string(),
+        )]);
+        let mut agent = Agent(Vec::new());
+        let report = replay_flow_steps_with_in(&tmp, "ctl", &prof, &vars, 0, &mut agent).unwrap();
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert_eq!(agent.0, vec!["press 2", "press 3", "press ok"]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("files/out.txt")).unwrap(),
+            "a; touch pwned|bob's|"
+        );
+        assert!(!tmp.join("files/pwned").exists());
+
+        // Unbalanced blocks and bad operators are rejected.
+        let (_, open_loop) = parse_step_tokens(&split_step_line("loop 2")).unwrap();
+        add_flow_step_in(&tmp, "bad", None, open_loop).unwrap();
+        assert!(replay_flow_steps_with_in(&tmp, "bad", &prof, &vars, 0, &mut agent).is_err());
+        assert!(parse_step_tokens(&split_step_line("if a =~ b")).is_err());
+        let err = run_cmd_step(&tmp, "sleep 5", &["--timeout".into(), "1".into()]).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

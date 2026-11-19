@@ -629,6 +629,15 @@ fn print_cli_help() {
            bon-login flow run <flow_name> <id|name|--group <g>|--all> [--var k=v] [--csv <file>] [--concurrency <n>] [--from-step <n>]\n  \
            bon-login flow heal <flow_name> <step_idx> <id|name> <ab args...>  Self-heal broken step & update flow\n  \
            bon-login flow step <flow_name> <step_idx> <optional|required|delete>\n  \
+           bon-login flow add <flow_name> [--at <n>] [--out <var>] [--optional] <op> [args...]  Add a step (creates the flow)\n  \
+             data ops (run by BonLogin, results -> {{{{var}}}} via --out):\n  \
+               http <url> [--method POST] [--header 'K: V'] [--body '...']   (via profile proxy tunnel, fail-closed)\n  \
+               read_file <path>   write_file <path> <content> [--append]   (relative paths -> <app>/files/)\n  \
+               regex <input> <pattern>   (group 1, else whole match)   json <input> <data.otp|/data/otp>\n  \
+               cmd '<shell>' [--timeout <s>]   (sh -c in <app>/files/, {{{{var}}}} auto-quoted; do not wrap it in quotes)\n  \
+             control ops: if <a> <==|!=|contains|!contains|matches|<|>|<=|>=> <b> ... [else ...] end\n  \
+               loop <n> [--out i] ... end   foreach <lines> [--out line] ... end   break\n  \
+             browser ops: any agent-browser command, e.g. --out title get text \"h1\"  |  fill \"#otp\" {{{{otp}}}}\n  \
            bon-login flow history <id|name> [--clear]                    Inspect or clear auto-recorded profile steps\n  \
            bon-login flow delete <flow_name>                             Delete a saved flow\n\n\
          PROFILE MANAGEMENT (`bon-login profile ...`):\n  \
@@ -4226,6 +4235,25 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
+        "add" => {
+            let flow_name = rest.first().ok_or_else(|| {
+                anyhow!(
+                    "Usage: bon-login flow add <flow_name> [--at <n>] [--out <var>] [--optional] <op> [args...]"
+                )
+            })?;
+            let (at, step) = crate::flows::parse_step_tokens(&rest[1..])?;
+            let updated = db.add_flow_step(flow_name, at, step)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "flow": updated.name,
+                    "steps_count": updated.steps.len(),
+                    "steps": updated.steps,
+                }))?
+            );
+            Ok(())
+        }
         "delete" | "rm" | "remove" => {
             let name = rest
                 .first()
@@ -4242,7 +4270,7 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => bail!(
-            "Unknown flow subcommand '{other}' (expected list, show, save, run, heal, step, history, delete)"
+            "Unknown flow subcommand '{other}' (expected list, show, save, add, run, heal, step, history, delete)"
         ),
     }
 }

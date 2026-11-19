@@ -350,6 +350,56 @@ bon-login flow heal login_playbook 2 "TikTok US 01" click @e9
 bon-login flow step login_playbook 1 optional
 ```
 
+### Data steps (`bon-login flow add`, GenLogin-style Data nodes)
+
+Flows can also call APIs, read/write files, and pass results between steps. Add steps with `bon-login flow add <flow> [--at <n>] [--out <var>] [--optional] <op> [args...]` (creates the flow if missing) or with the **+ Add Step** row in the Flows modal (same syntax, targets the flow name typed above it). `--out <var>` stores the step's result in `{{var}}` for later steps.
+
+| Op | Args | Result (`--out`) |
+|---|---|---|
+| `http` | `<url> [--method POST] [--header 'K: V']... [--body '...']` | Response body (non-2xx fails). Proxied profiles go through their own tunnel; without a live tunnel the step fails instead of using your real IP. |
+| `read_file` | `<path>` | File text |
+| `write_file` | `<path> <content> [--append]` | Written path (`--append` adds a line) |
+| `regex` | `<input> <pattern>` | Capture group 1, else whole match; no match fails (use `--optional`) |
+| `json` | `<input> <data.otp \| /data/otp>` | Field value |
+| `cmd` | `'<shell command>' [--timeout <secs>]` (default 120s) | Stdout. Runs `sh -c` in the `files/` dir; non-zero exit fails. `{{var}}` values are inserted shell-quoted, so write `echo {{email}}`, not `echo "{{email}}"`. |
+| any agent-browser command without a locator | e.g. `get text "h1"`, `get url`, `eval "document.title"` | Trimmed stdout |
+
+Relative paths resolve under `~/Library/Application Support/com.bonlogin.app/files/`.
+
+```bash
+bon-login flow add otp_login --out resp http "https://otp.example/api?user={{email}}" -H 'Authorization: Bearer {{token}}'
+bon-login flow add otp_login --out otp json {{resp}} data.code
+bon-login flow add otp_login fill "#otp" {{otp}}
+bon-login flow add otp_login --out title get text "h1"
+bon-login flow add otp_login write_file results.csv "{{profile.name}},{{title}},{{otp}}" --append
+```
+
+Control flow (`--out` sets the loop variable):
+
+| Op | Meaning |
+|---|---|
+| `if <a> <op> <b>` … `[else]` … `end` | `op`: `==`, `!=`, `contains`, `!contains`, `matches` (regex), `<`, `>`, `<=`, `>=` (numbers) |
+| `loop <n>` … `end` | Repeat `n` times (max 100000); `--out i` gets 1..n |
+| `foreach <text>` … `end` | One iteration per non-empty line, e.g. `foreach {{emails}}` after `read_file` |
+| `break` | Leave the innermost loop/foreach |
+
+```bash
+# Wait up to 30s for a captcha to disappear, then log every email from a file
+bon-login flow add f loop 30
+bon-login flow add f   --out n get count "#captcha"
+bon-login flow add f   if {{n}} == 0
+bon-login flow add f     break
+bon-login flow add f   end
+bon-login flow add f   wait 1000
+bon-login flow add f end
+bon-login flow add f --out emails read_file emails.txt
+bon-login flow add f --out email foreach {{emails}}
+bon-login flow add f   cmd 'echo {{email}} >> seen.txt'
+bon-login flow add f end
+```
+
+Resuming with `--from-step` skips earlier `--out` steps, so pass those values with `--var`.
+
 > **Stealth Guardrails:** `bon-login agent` automatically blocks any `agent-browser` command or flag that invokes CDP `Emulation.*` (`set viewport`, `set device`, `set geo`, `set media`, `set headers`, `--user-agent`, `--proxy`), ensuring your C++ fingerprint remains 100% intact. It also blocks `read <url>`, `read --llms` and `read --require-md`, which fetch over agent-browser's own HTTP client from your real IP instead of the profile proxy; use `open <url>` then plain `read`.
 
 ---

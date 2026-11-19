@@ -2355,14 +2355,55 @@ impl BonLoginApp {
         let csv_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Path to .csv file (or leave empty)")
         });
+        let add_step_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(
+                "Step for flow named above, e.g. --out otp http https://api.x/otp  or  fill \"#otp\" {{otp}}",
+            )
+        });
         self.popup_modal = Some(ActivePopupModal::AgentFlows(AgentFlowsModalState {
             target_id: profile_id,
             expanded_flow_name: None,
             save_name_input,
             vars_input,
             csv_input,
+            add_step_input,
             concurrency: 3,
         }));
+        cx.notify();
+    }
+
+    /// Same syntax as `bon-login flow add <flow> ...`; targets the flow named in the name input.
+    pub fn add_flow_step_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ActivePopupModal::AgentFlows(af)) = self.popup_modal.clone() else {
+            return;
+        };
+        let raw_name = af.save_name_input.read(cx).value().trim().to_string();
+        if raw_name.is_empty() {
+            self.banner_message = Some("Enter a flow name first".to_string());
+            cx.notify();
+            return;
+        }
+        let line = af.add_step_input.read(cx).value().to_string();
+        let tokens = crate::flows::split_step_line(&line);
+        let added = crate::flows::parse_step_tokens(&tokens).and_then(|(at, step)| {
+            crate::flows::add_flow_step_in(&self.workspace_root, &raw_name, at, step)
+        });
+        match added {
+            Ok(flow) => {
+                if let Some(ActivePopupModal::AgentFlows(m)) = self.popup_modal.as_mut() {
+                    m.add_step_input = cx.new(|cx| {
+                        InputState::new(window, cx).placeholder("Next step (same syntax)")
+                    });
+                    m.expanded_flow_name = Some(flow.name.clone());
+                }
+                self.saved_flows = crate::flows::list_saved_flows_in(&self.workspace_root);
+                self.banner_message =
+                    Some(format!("Added step to '{}' ({} steps)", flow.name, flow.steps.len()));
+            }
+            Err(e) => {
+                self.banner_message = Some(format!("Add step failed: {e:#}"));
+            }
+        }
         cx.notify();
     }
 

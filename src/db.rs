@@ -391,6 +391,15 @@ impl Database {
         crate::flows::mutate_flow_step_in(&self.root_dir, flow_raw, step_idx, action)
     }
 
+    pub fn add_flow_step(
+        &self,
+        flow_raw: &str,
+        at: Option<usize>,
+        step: crate::flows::FlowStep,
+    ) -> anyhow::Result<crate::flows::AgentFlow> {
+        crate::flows::add_flow_step_in(&self.root_dir, flow_raw, at, step)
+    }
+
     pub fn save_history_as_flow(
         &self,
         flow_raw: &str,
