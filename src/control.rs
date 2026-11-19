@@ -4013,7 +4013,7 @@ fn run_flow_subcommand(args: &[String]) -> Result<()> {
                         .with_context(|| format!("Invalid --from-step integer '{raw_n}'"))?;
                     idx += 2;
                 } else {
-                    idx += 1;
+                    bail!("Unknown argument '{}' for flow run (one target per run: id|name|--group|--all)", rest[idx]);
                 }
             }
 

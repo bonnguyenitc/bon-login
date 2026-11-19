@@ -3409,6 +3409,16 @@ pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
         }
     }
 
+    // `read <url>`, `--llms` and `--require-md` fetch over the CLI's own HTTP client: real Mac IP, no proxy tunnel.
+    if crate::flows::unpack_agent_commands(args)
+        .iter()
+        .any(|cmd| read_cmd_fetches_outside_browser(cmd))
+    {
+        bail!(
+            "Blocked by BonLogin Stealth Guardrail: 'agent-browser read <url>' (and --llms/--require-md) fetches outside Chromium, bypassing the profile proxy and leaking the real IP. Use `open <url>` then plain `read`."
+        );
+    }
+
     let flat_tokens: Vec<String> = args
         .iter()
         .flat_map(|a| a.split_whitespace())
@@ -3451,6 +3461,26 @@ pub fn validate_stealth_agent_args(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_cmd_fetches_outside_browser(cmd: &[String]) -> bool {
+    const VALUE_FLAGS: [&str; 5] = ["--max-output", "--timeout", "--filter", "--allowed-domains", "--session"];
+    let (mut word, mut extra_positional, mut http_flag) = (None, false, false);
+    let mut it = cmd.iter();
+    while let Some(t) = it.next() {
+        let t = t.as_str();
+        if t.starts_with('-') {
+            http_flag |= t == "--require-md" || t == "--llms" || t.starts_with("--llms=");
+            if VALUE_FLAGS.contains(&t) || t == "--llms" {
+                it.next();
+            }
+        } else if word.is_none() {
+            word = Some(t);
+        } else {
+            extra_positional = true;
+        }
+    }
+    word == Some("read") && (extra_positional || http_flag)
 }
 
 /// Opens an extension popup/options page inside a running profile via `agent-browser --session bon_<id> tab new <url>`.
@@ -4326,6 +4356,25 @@ mod tests {
         ] {
             let args: Vec<String> = bypass.iter().map(|s| s.to_string()).collect();
             assert!(validate_stealth_agent_args(&args).is_err(), "guardrail bypass: {args:?}");
+        }
+        for leak in [
+            vec!["read", "https://example.com"],
+            vec!["--json", "read", "--timeout", "5000", "https://example.com"],
+            vec!["--max-output", "500", "read", "https://example.com"],
+            vec!["read", "--llms", "full"],
+            vec!["read", "--require-md"],
+            vec!["batch", "click @e1", "read https://example.com"],
+        ] {
+            let args: Vec<String> = leak.iter().map(|s| s.to_string()).collect();
+            assert!(validate_stealth_agent_args(&args).is_err(), "read leak not blocked: {args:?}");
+        }
+        for ok in [
+            vec!["read"],
+            vec!["read", "--outline", "--filter", "Pricing"],
+            vec!["fill", "@e1", "read https://example.com"],
+        ] {
+            let args: Vec<String> = ok.iter().map(|s| s.to_string()).collect();
+            assert!(validate_stealth_agent_args(&args).is_ok(), "in-browser read wrongly blocked: {args:?}");
         }
         assert!(should_reconnect_agent_session(
             b"Error: Browser not connected. Run connect first.",

@@ -350,7 +350,7 @@ bon-login flow heal login_playbook 2 "TikTok US 01" click @e9
 bon-login flow step login_playbook 1 optional
 ```
 
-> **Stealth Guardrails:** `bon-login agent` automatically blocks any `agent-browser` command or flag that invokes CDP `Emulation.*` (`set viewport`, `set device`, `set geo`, `set media`, `set headers`, `--user-agent`, `--proxy`), ensuring your C++ fingerprint remains 100% intact.
+> **Stealth Guardrails:** `bon-login agent` automatically blocks any `agent-browser` command or flag that invokes CDP `Emulation.*` (`set viewport`, `set device`, `set geo`, `set media`, `set headers`, `--user-agent`, `--proxy`), ensuring your C++ fingerprint remains 100% intact. It also blocks `read <url>`, `read --llms` and `read --require-md`, which fetch over agent-browser's own HTTP client from your real IP instead of the profile proxy; use `open <url>` then plain `read`.
 
 ---
 
