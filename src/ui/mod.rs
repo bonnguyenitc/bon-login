@@ -314,7 +314,7 @@ pub struct BonLoginApp {
             String,
             Option<ProfileSortColumn>,
             bool,
-            usize,
+            u64,
             std::rc::Rc<[usize]>,
         )>,
     >,

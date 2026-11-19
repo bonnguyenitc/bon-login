@@ -6,28 +6,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn is_chromium_ephemeral_entry(name: &str) -> bool {
-    matches!(
-        name,
-        "Cache"
-            | "Code Cache"
-            | "GPUCache"
-            | "ShaderCache"
-            | "DawnCache"
-            | "DawnWebGPUCache"
-            | "DawnGraphiteCache"
-            | "GrShaderCache"
-            | "GraphiteDawnCache"
-            | "Crashpad"
-            | "BrowserMetrics"
-            | "Safe Browsing"
-            | "ComponentMetrics"
-            | "SingletonLock"
-            | "SingletonSocket"
-            | "SingletonCookie"
-            | "DevToolsActivePort"
-            | "RunningChromeVersion"
-            | ".bon_launch.lock"
-    ) || name.ends_with(".tmp")
+    crate::launcher::is_chromium_cache_entry(name)
+        || matches!(
+            name,
+            "SingletonLock"
+                | "SingletonSocket"
+                | "SingletonCookie"
+                | "DevToolsActivePort"
+                | "RunningChromeVersion"
+                | ".bon_launch.lock"
+        )
 }
 
 /// Exports a full profile archive (`.zip`) containing `profile_metadata.json`, `prelaunch_cookies.json`,
@@ -63,9 +51,9 @@ pub fn export_profile_archive_zip_in(
         .collect();
     let short_id = profile.short_id();
     let zip_path = backups_out_dir.join(format!("bonlogin_{clean_name}_{short_id}.zip"));
-    let _ = std::fs::remove_file(&zip_path);
-
     let nonce = rand::random::<u32>();
+    // Built under a temp name and renamed over the old backup only once zip succeeded.
+    let tmp_zip_path = backups_out_dir.join(format!(".bonlogin_{short_id}_{nonce}.zip"));
     let stage_dir = root_dir
         .join("backups")
         .join(format!(".stage_pack_{short_id}_{nonce}"));
@@ -89,15 +77,21 @@ pub fn export_profile_archive_zip_in(
 
     let status = Command::new("/usr/bin/zip")
         .current_dir(&stage_dir)
-        .args(["-r", "-q", &zip_path.to_string_lossy(), "."])
+        .args(["-r", "-q", &tmp_zip_path.to_string_lossy(), "."])
         .status()
         .context("Failed to execute /usr/bin/zip")?;
 
     if !status.success() {
+        let _ = std::fs::remove_file(&tmp_zip_path);
         bail!("Failed to create profile backup archive (.zip)");
     }
+    std::fs::rename(&tmp_zip_path, &zip_path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_zip_path);
+    })?;
     Ok(zip_path)
 }
+
+const MAX_ARCHIVE_UNZIPPED_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 /// Restores a profile from a `.zip` archive exported by `export_profile_archive_zip`.
 /// If `existing_ids` already contains the profile's UUID, assigns a fresh UUID so nothing is overwritten.
@@ -116,6 +110,7 @@ pub fn import_profile_archive_zip_in(
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir)?;
     let _stage_guard = StageDirGuard(stage_dir.clone());
+    crate::extensions::ensure_unzipped_size_within(zip_path, MAX_ARCHIVE_UNZIPPED_BYTES)?;
 
     let status = Command::new("/usr/bin/unzip")
         .args([

@@ -1021,6 +1021,48 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Copies `src` into `dst`, skipping symlinks and entries `skip` names. Any file copy error aborts the copy.
+/// The installed copy is only removed after the new one is in place, so a failed swap keeps it.
+fn swap_dir_into_place(stage_dir: &Path, dest_dir: &Path) -> Result<()> {
+    let name = dest_dir.file_name().unwrap_or_default().to_string_lossy();
+    let old_dir = dest_dir.with_file_name(format!(".old_{name}_{}", rand::random::<u32>()));
+    let had_old = std::fs::rename(dest_dir, &old_dir).is_ok();
+    if let Err(e) = std::fs::rename(stage_dir, dest_dir) {
+        if had_old {
+            let _ = std::fs::rename(&old_dir, dest_dir);
+        }
+        return Err(e).context("Failed to move unpacked extension into place");
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(&old_dir);
+    }
+    Ok(())
+}
+
+const MAX_EXTENSION_UNZIPPED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Refuses zip bombs before `/usr/bin/unzip` writes anything: reads the total size from the zip directory.
+/// shortcut: trusts the declared sizes in the central directory, move to a streaming capped extractor if crafted zips appear.
+pub(crate) fn ensure_unzipped_size_within(zip_path: &Path, cap: u64) -> Result<()> {
+    let out = Command::new("/usr/bin/unzip")
+        .arg("-Zt")
+        .arg(zip_path)
+        .stdin(Stdio::null())
+        .output()
+        .context("Failed to execute /usr/bin/unzip -Zt")?;
+    let total = parse_unzip_total_bytes(&String::from_utf8_lossy(&out.stdout))
+        .context("Invalid or corrupted .zip archive")?;
+    if total > cap {
+        bail!("Archive expands to {} MB, over the {} MB limit", total >> 20, cap >> 20);
+    }
+    Ok(())
+}
+
+/// Parses `unzip -Zt` output: "2 files, 1234 bytes uncompressed, 567 bytes compressed: 54.0%".
+fn parse_unzip_total_bytes(out: &str) -> Option<u64> {
+    let line = out.lines().find(|l| l.contains(" bytes uncompressed"))?;
+    line.split(" bytes uncompressed").next()?.rsplit(' ').next()?.parse().ok()
+}
+
 pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, skip: fn(&str) -> bool) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -1072,12 +1114,22 @@ pub fn install_extension_from_file_in(
         if !src_path.join("manifest.json").is_file() {
             bail!("Directory does not contain a manifest.json file");
         }
-        let dest_dir = root_dir.join("extensions").join(&ext_id);
-        if dest_dir.exists() {
-            let _ = std::fs::remove_dir_all(&dest_dir);
+        let ext_root = root_dir.join("extensions");
+        let dest_dir = ext_root.join(&ext_id);
+        if let (Ok(src), Ok(dst)) = (src_path.canonicalize(), dest_dir.canonicalize())
+            && src.starts_with(&dst)
+        {
+            bail!("This folder is already the installed copy of '{ext_id}'");
         }
-        copy_dir_recursive(src_path, &dest_dir)?;
-        patch_unpacked_extension_for_agent(&dest_dir, &ext_id, None);
+        std::fs::create_dir_all(&ext_root)?;
+        let stage_dir = ext_root.join(format!(".stage_{ext_id}_{}", rand::random::<u32>()));
+        let staged = copy_dir_recursive(src_path, &stage_dir).map(|_| {
+            patch_unpacked_extension_for_agent(&stage_dir, &ext_id, None);
+        });
+        if let Err(e) = staged.and_then(|()| swap_dir_into_place(&stage_dir, &dest_dir)) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
         let name = read_extension_name_from_dir(&dest_dir, &ext_id);
         let (icon_label, icon_bg) = pick_icon_badge(&name);
         return Ok(BrowserExtension {
@@ -1139,6 +1191,11 @@ pub fn install_extension_from_bytes_cancellable_in(
 
     let tmp_zip = std::env::temp_dir().join(format!("bonlogin_{ext_id}_{nonce}.zip"));
     std::fs::write(&tmp_zip, zip_bytes)?;
+    if let Err(e) = ensure_unzipped_size_within(&tmp_zip, MAX_EXTENSION_UNZIPPED_BYTES) {
+        let _ = std::fs::remove_file(&tmp_zip);
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        return Err(e);
+    }
 
     let status = Command::new("/usr/bin/unzip")
         .args([
@@ -1177,19 +1234,10 @@ pub fn install_extension_from_bytes_cancellable_in(
         bail!("Extension download cancelled");
     }
 
-    // The installed copy is only removed after the new one is in place, so a failure keeps it.
     let dest_dir = ext_root.join(&ext_id);
-    let old_dir = ext_root.join(format!(".old_{ext_id}_{nonce}"));
-    let had_old = std::fs::rename(&dest_dir, &old_dir).is_ok();
-    if let Err(e) = std::fs::rename(&stage_dir, &dest_dir) {
-        if had_old {
-            let _ = std::fs::rename(&old_dir, &dest_dir);
-        }
+    if let Err(e) = swap_dir_into_place(&stage_dir, &dest_dir) {
         let _ = std::fs::remove_dir_all(&stage_dir);
-        return Err(e).context("Failed to move unpacked extension into place");
-    }
-    if had_old {
-        let _ = std::fs::remove_dir_all(&old_dir);
+        return Err(e);
     }
 
     let name = read_extension_name_from_dir(&dest_dir, &ext_id);
@@ -1513,6 +1561,24 @@ pub async fn activate_extension_cancellable_in(
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn zip_size_cap_reads_unzip_totals() {
+        assert_eq!(
+            parse_unzip_total_bytes("1 file, 100000 bytes uncompressed, 114 bytes compressed:  99.9%\n"),
+            Some(100_000)
+        );
+        assert_eq!(parse_unzip_total_bytes("garbage"), None);
+        let dir = std::env::temp_dir().join(format!("bon_zipcap_{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 100_000]).unwrap();
+        let zip = dir.join("t.zip");
+        let ok = Command::new("/usr/bin/zip").current_dir(&dir).args(["-q", "t.zip", "a.bin"]).status().unwrap();
+        assert!(ok.success());
+        assert!(ensure_unzipped_size_within(&zip, 200_000).is_ok());
+        assert!(ensure_unzipped_size_within(&zip, 50_000).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn push_proto_varint(out: &mut Vec<u8>, mut val: u64) {
         loop {

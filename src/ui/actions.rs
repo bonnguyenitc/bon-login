@@ -172,13 +172,20 @@ impl BonLoginApp {
             }
         }
 
-        if let Ok(db) = self.db.lock() {
-            let _ = db.with_transaction(|db| {
+        // The pasted list is only cleared once every proxy is saved; on error the user keeps their input.
+        let saved = match self.db.lock() {
+            Ok(db) => db.with_transaction(|db| {
                 for sp in &added {
-                    let _ = db.upsert_proxy(sp);
+                    db.upsert_proxy(sp)?;
                 }
                 Ok(())
-            });
+            }),
+            Err(_) => Err(anyhow::anyhow!("DB lock error")),
+        };
+        if let Err(e) = saved {
+            self.banner_message = Some(format!("Failed to save proxies, nothing was added: {e}"));
+            cx.notify();
+            return;
         }
         let count = added.len();
         self.proxy_raw_input = cx.new(|cx| {
@@ -1092,8 +1099,9 @@ impl BonLoginApp {
                 Ok((path, json)) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(json));
                     self.banner_message = Some(format!(
-                        "Exported all profiles JSON to clipboard & {}",
-                        path.display()
+                        "Exported all profiles JSON to clipboard & {}. {}",
+                        path.display(),
+                        crate::db::EXPORT_SECRETS_WARNING
                     ));
                 }
                 Err(e) => {
@@ -1574,16 +1582,20 @@ impl BonLoginApp {
     pub fn filtered_profile_indices_rc(&self) -> std::rc::Rc<[usize]> {
         let rev = self.profile_data_rev;
         let status_sig = if self.sort_col == Some(ProfileSortColumn::Status) {
+            // Hash each (id, rank) pair: summing id lengths made A:Running->Stopped + B:Stopped->Running invisible.
             self.statuses
                 .iter()
-                .fold(0usize, |acc, (k, st)| {
-                    let r: usize = match st {
+                .fold(0u64, |acc, (k, st)| {
+                    use std::hash::{Hash, Hasher};
+                    let r: u8 = match st {
                         ProfileStatus::Running(_) => 3,
                         ProfileStatus::Starting => 2,
                         ProfileStatus::Error => 1,
                         ProfileStatus::Stopped => 0,
                     };
-                    acc.wrapping_add(k.len().wrapping_mul(31).wrapping_add(r))
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (k, r).hash(&mut h);
+                    acc.wrapping_add(h.finish())
                 })
         } else {
             0
@@ -2972,8 +2984,15 @@ impl BonLoginApp {
             .find(|p| p.id == profile_id)
             .map(|p| p.short_id())
             .unwrap_or_default();
-        if let Ok(db) = self.db.lock() {
-            let _ = db.delete_profile(profile_id);
+        // Data is wiped only after the row is gone; a busy DB must not leave a Trash entry with no data.
+        let deleted = match self.db.lock() {
+            Ok(db) => db.delete_profile(profile_id),
+            Err(_) => Err(anyhow::anyhow!("DB lock error")),
+        };
+        if let Err(e) = deleted {
+            self.banner_message = Some(format!("Delete failed, browser data kept: {e}"));
+            cx.notify();
+            return;
         }
         let sup = self.supervisor.clone();
         let wipe_id = profile_id.to_string();
@@ -3032,13 +3051,19 @@ impl BonLoginApp {
             .map(|p| (p.id.clone(), p.short_id()))
             .collect();
         let count = pairs.len();
-        if let Ok(db) = self.db.lock() {
-            let _ = db.with_transaction(|db| {
+        let deleted = match self.db.lock() {
+            Ok(db) => db.with_transaction(|db| {
                 for (id, _) in &pairs {
-                    let _ = db.delete_profile(id);
+                    db.delete_profile(id)?;
                 }
                 Ok(())
-            });
+            }),
+            Err(_) => Err(anyhow::anyhow!("DB lock error")),
+        };
+        if let Err(e) = deleted {
+            self.banner_message = Some(format!("Empty Trash failed, nothing was wiped: {e}"));
+            cx.notify();
+            return;
         }
         let sup = self.supervisor.clone();
         self.tokio_handle.spawn_blocking(move || {
@@ -3390,7 +3415,10 @@ impl BonLoginApp {
                         let path_s = path.display().to_string();
                         cx.write_to_clipboard(ClipboardItem::new_string(path_s.clone()));
                         app.banner_message =
-                            Some(format!("Exported backup (.zip): {path_s} (copied path)"));
+                            Some(format!(
+                                "Exported backup (.zip): {path_s} (copied path). {}",
+                                crate::db::EXPORT_SECRETS_WARNING
+                            ));
                     }
                     Err(e) => {
                         app.banner_message = Some(format!("Backup export failed: {e}"));
@@ -3524,7 +3552,10 @@ impl BonLoginApp {
         if let Some((path, _)) = res {
             let path_s = path.display().to_string();
             cx.write_to_clipboard(ClipboardItem::new_string(path_s.clone()));
-            self.banner_message = Some(format!("Exported CSV: {path_s} (copied path)"));
+            self.banner_message = Some(format!(
+                "Exported CSV: {path_s} (copied path). {}",
+                crate::db::EXPORT_SECRETS_WARNING
+            ));
         } else {
             self.banner_message = Some("Failed to export profiles CSV".to_string());
         }
@@ -3729,7 +3760,10 @@ impl BonLoginApp {
             let _ = this.update(cx, |app, cx| {
                 let (ok, dir) = res;
                 app.banner_message =
-                    Some(format!("Exported {ok}/{count} .zip archive(s) to {dir}"));
+                    Some(format!(
+                        "Exported {ok}/{count} .zip archive(s) to {dir}. {}",
+                        crate::db::EXPORT_SECRETS_WARNING
+                    ));
                 cx.notify();
             });
         })
@@ -3790,9 +3824,19 @@ impl BonLoginApp {
         cx.spawn(async move |this, cx| {
             let res = tokio_handle
                 .spawn_blocking(move || {
-                    db.lock()
-                        .map_err(|_| anyhow::anyhow!("DB lock error"))?
-                        .import_profile_archive_zip(std::path::Path::new(&raw))
+                    // The DB lock is held only for the id lookup and the final upsert, never during unzip/copy.
+                    let lock_err = || anyhow::anyhow!("DB lock error");
+                    let (root_dir, existing_ids) = {
+                        let guard = db.lock().map_err(|_| lock_err())?;
+                        (guard.root_dir().to_path_buf(), guard.all_profile_ids()?)
+                    };
+                    let restored = crate::launcher::import_profile_archive_zip_in(
+                        &root_dir,
+                        std::path::Path::new(&raw),
+                        &existing_ids,
+                    )?;
+                    db.lock().map_err(|_| lock_err())?.upsert_profile(&restored)?;
+                    Ok(restored)
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("Join error: {e}")));
@@ -4594,13 +4638,19 @@ impl BonLoginApp {
                 handle.abort();
             }
         }
-        if let Ok(db) = self.db.lock() {
-            let _ = db.with_transaction(|db| {
+        let trashed = match self.db.lock() {
+            Ok(db) => db.with_transaction(|db| {
                 for id in &deletable_ids {
-                    let _ = db.soft_delete_profile(id);
+                    db.soft_delete_profile(id)?;
                 }
                 Ok(())
-            });
+            }),
+            Err(_) => Err(anyhow::anyhow!("DB lock error")),
+        };
+        if let Err(e) = trashed {
+            self.banner_message = Some(format!("Move to Trash failed, nothing was moved: {e}"));
+            cx.notify();
+            return;
         }
         for id in &deletable_ids {
             self.statuses.remove(id);
@@ -5003,13 +5053,14 @@ impl BonLoginApp {
         self.copy_agent_browser_cli(&id, cx);
     }
 
-    pub fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_selected(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected_profile_id.clone() else {
             self.banner_message = Some("No profile selected".to_string());
             cx.notify();
             return;
         };
-        self.delete_profile(&id, window, cx);
+        // Same confirm dialog as the row button: delete stops a running browser, so a stray Cmd+Backspace must not.
+        self.request_delete(PendingDeleteAction::Profile(id), cx);
     }
 
     pub fn open_synchronizer_modal(&mut self, cx: &mut Context<Self>) {

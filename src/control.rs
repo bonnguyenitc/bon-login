@@ -28,10 +28,20 @@ fn find_profile_by_query<'a>(profiles: &'a [Profile], query: &str) -> Result<&'a
         return Ok(p);
     }
     let q_lower = q.to_ascii_lowercase();
-    profiles
-        .iter()
-        .find(|p| p.name.to_ascii_lowercase().contains(&q_lower))
-        .ok_or_else(|| anyhow!("No profile found matching '{query}'"))
+    unique_partial(
+        profiles.iter().filter(|p| p.name.to_ascii_lowercase().contains(&q_lower)),
+        "profile",
+        query,
+    )
+}
+
+/// Partial matches drive delete/wipe/stop, so an ambiguous query must fail instead of picking the first hit.
+fn unique_partial<'a, T>(mut hits: impl Iterator<Item = &'a T>, kind: &str, query: &str) -> Result<&'a T> {
+    let first = hits.next().ok_or_else(|| anyhow!("No {kind} found matching '{query}'"))?;
+    if hits.next().is_some() {
+        bail!("'{query}' matches more than one {kind}; use the exact name or id");
+    }
+    Ok(first)
 }
 
 fn find_saved_proxy_by_query<'a>(proxies: &'a [SavedProxy], query: &str) -> Result<&'a SavedProxy> {
@@ -54,13 +64,14 @@ fn find_saved_proxy_by_query<'a>(proxies: &'a [SavedProxy], query: &str) -> Resu
         return Ok(p);
     }
     let q_lower = q.to_ascii_lowercase();
-    proxies
-        .iter()
-        .find(|p| {
+    unique_partial(
+        proxies.iter().filter(|p| {
             p.name.to_ascii_lowercase().contains(&q_lower)
                 || p.config.host.to_ascii_lowercase().contains(&q_lower)
-        })
-        .ok_or_else(|| anyhow!("No saved proxy found matching '{query}' in Proxy Manager"))
+        }),
+        "saved proxy",
+        query,
+    )
 }
 
 fn find_extension_by_query<'a>(
@@ -79,12 +90,14 @@ fn find_extension_by_query<'a>(
         return Ok(e);
     }
     let q_lower = q.to_ascii_lowercase();
-    exts.iter()
-        .find(|e| {
+    unique_partial(
+        exts.iter().filter(|e| {
             e.id.to_ascii_lowercase().contains(&q_lower)
                 || e.name.to_ascii_lowercase().contains(&q_lower)
-        })
-        .ok_or_else(|| anyhow!("No extension found matching '{query}'"))
+        }),
+        "extension",
+        query,
+    )
 }
 
 fn parse_bool_flag(val: &str) -> Result<bool> {
@@ -371,7 +384,8 @@ pub fn ensure_profile_launched_via_supervisor(
         .spawn()
         .context("Failed to spawn background profile supervisor")?;
 
-    for _ in 0..80 {
+    // Launcher worst case: queued + 8s GeoIP + 5s DevToolsActivePort + kernel prep; 12s cut off live launches.
+    for _ in 0..200 {
         if let Ok(err_txt) = std::fs::read_to_string(&err_file)
             && !err_txt.trim().is_empty()
         {
@@ -396,7 +410,10 @@ pub fn ensure_profile_launched_via_supervisor(
         }
         std::thread::sleep(Duration::from_millis(150));
     }
-    bail!("Timed out (12s) waiting for profile '{}' to launch", profile.name)
+    bail!(
+        "Timed out (30s) waiting for profile '{}' to launch; it may still open, check `bon-login list` before retrying",
+        profile.name
+    )
 }
 
 pub async fn check_proxy_config_live(cfg: &ProxyConfig) -> Result<GeoInfo> {
@@ -1388,8 +1405,7 @@ fn run_profile_subcommand(args: &[String]) -> Result<()> {
             for p in targets {
                 db.stop_external_runtime(&p.id, &p.short_id());
                 if permanent {
-                    let _ = db.wipe_profile_data(&p.id);
-                    db.delete_profile(&p.id)?;
+                    db.purge_profile(&p.id)?;
                 } else {
                     db.soft_delete_profile(&p.id)?;
                 }
@@ -1416,6 +1432,7 @@ fn run_profile_subcommand(args: &[String]) -> Result<()> {
                     "ok": true,
                     "path": final_path,
                     "count": db.list_profiles()?.len(),
+                    "warning": crate::db::EXPORT_SECRETS_WARNING,
                 }))?
             );
             Ok(())
@@ -1447,6 +1464,7 @@ fn run_profile_subcommand(args: &[String]) -> Result<()> {
                     "ok": true,
                     "path": final_path,
                     "count": db.list_profiles()?.len(),
+                    "warning": crate::db::EXPORT_SECRETS_WARNING,
                 }))?
             );
             Ok(())
@@ -1483,6 +1501,7 @@ fn run_profile_subcommand(args: &[String]) -> Result<()> {
                     "short_id": p.short_id(),
                     "name": p.name,
                     "path": path,
+                    "warning": crate::db::EXPORT_SECRETS_WARNING,
                 }));
             }
             if exported.len() == 1 {
@@ -1664,17 +1683,25 @@ fn run_profile_subcommand(args: &[String]) -> Result<()> {
                 }
                 "empty" => {
                     let trashed = db.list_trashed_profiles()?;
+                    let mut emptied = 0usize;
+                    let mut errors = Vec::new();
                     for t in &trashed {
-                        let _ = db.wipe_profile_data(&t.id);
-                        let _ = db.delete_profile(&t.id);
+                        match db.purge_profile(&t.id) {
+                            Ok(()) => emptied += 1,
+                            Err(e) => errors.push(format!("{}: {e:#}", t.short_id())),
+                        }
                     }
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "ok": true,
-                            "emptied": trashed.len(),
+                            "ok": errors.is_empty(),
+                            "emptied": emptied,
+                            "errors": errors,
                         }))?
                     );
+                    if !errors.is_empty() {
+                        bail!("Failed to empty {} trashed profile(s)", errors.len());
+                    }
                     Ok(())
                 }
                 other => bail!("Unknown trash action '{other}' (expected list, restore, or empty)"),
@@ -2103,6 +2130,9 @@ fn run_proxy_subcommand(args: &[String]) -> Result<()> {
             let prof_args = &after[to_idx + 1..];
             let profiles = db.list_profiles()?;
             let (mut target_profiles, _) = select_profiles_by_target(&profiles, prof_args)?;
+            if !clear_proxy && proxy_pool.is_empty() {
+                bail!("No saved proxies matched; add proxies first or use 'none' to clear");
+            }
             let mut assigned = Vec::new();
             for (idx, mut p) in target_profiles.drain(..).enumerate() {
                 if clear_proxy {
@@ -4281,6 +4311,17 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn ambiguous_partial_name_never_picks_a_profile() {
+        let profiles = vec![
+            Profile::new_default("Test Account 1", crate::models::PlatformType::MacOS),
+            Profile::new_default("Test Account 2", crate::models::PlatformType::MacOS),
+        ];
+        assert!(find_profile_by_query(&profiles, "test").is_err());
+        assert_eq!(find_profile_by_query(&profiles, "account 2").unwrap().id, profiles[1].id);
+        assert_eq!(find_profile_by_query(&profiles, "Test Account 1").unwrap().id, profiles[0].id);
+    }
 
     #[test]
     fn test_target_selectors_and_cli_lookup_helpers() {

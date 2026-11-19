@@ -89,14 +89,13 @@ pub fn read_saved_cookies_in(root_dir: &Path, short_id: &str) -> Option<String> 
     if short_id.is_empty() {
         return None;
     }
-    let states_dir = root_dir.join("states");
-    let pre_path = states_dir.join(format!("bon_{short_id}_prelaunch.json"));
+    let pre_path = crate::cookies::prelaunch_cookies_path_in(root_dir, short_id);
     if let Ok(s) = std::fs::read_to_string(&pre_path)
         && !s.trim().is_empty()
     {
         return Some(s);
     }
-    let state_path = states_dir.join(format!("bon_{short_id}_state.json"));
+    let state_path = crate::cookies::state_cookies_path_in(root_dir, short_id);
     std::fs::read_to_string(&state_path)
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -191,6 +190,23 @@ impl Drop for Database {
 
 #[cfg(test)]
 pub type Workspace = Database;
+
+/// Shown by every UI and CLI export: the files carry proxy passwords and TOTP secrets in plain text.
+pub const EXPORT_SECRETS_WARNING: &str =
+    "Contains proxy passwords and 2FA (TOTP) secrets in plain text - do not share it";
+
+/// `query_profiles_sql` reads these by position, so every profile query must share this one column list.
+const PROFILE_SELECT: &str = "SELECT
+    id, name, group_tag, seed, os_platform, os_version,
+    brand, brand_version, hardware_concurrency, gpu_spoofing,
+    proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
+    geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
+    startup_url, notes, created_at, last_launched_at,
+    spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
+    window_size, custom_timezone, custom_locale, geo_latency_ms,
+    tags, totp_secret, deleted_at, proxy_change_ip_url,
+    ip_policy, geo_quality, trust_stage, seeded_at
+ FROM profiles";
 
 impl Database {
     pub fn open_default() -> anyhow::Result<Self> {
@@ -350,13 +366,18 @@ impl Database {
         )
     }
 
-    pub fn import_profile_archive_zip(&self, zip_path: &Path) -> anyhow::Result<Profile> {
-        let existing_ids: HashSet<String> = self
+    /// Ids of active and trashed profiles, so an import never reuses one.
+    pub fn all_profile_ids(&self) -> anyhow::Result<HashSet<String>> {
+        Ok(self
             .list_profiles()?
             .into_iter()
             .chain(self.list_trashed_profiles()?)
             .map(|p| p.id)
-            .collect();
+            .collect())
+    }
+
+    pub fn import_profile_archive_zip(&self, zip_path: &Path) -> anyhow::Result<Profile> {
+        let existing_ids = self.all_profile_ids()?;
         let restored = crate::launcher::import_profile_archive_zip_in(
             &self.root_dir,
             zip_path,
@@ -447,8 +468,8 @@ impl Database {
             Ok(())
         })?;
         let states = self.states_dir();
-        let src_cookie = states.join(format!("bon_{src_sid}_prelaunch.json"));
-        let fallback_cookie = states.join(format!("bon_{src_sid}_state.json"));
+        let src_cookie = crate::cookies::prelaunch_cookies_path_in(&self.root_dir, &src_sid);
+        let fallback_cookie = crate::cookies::state_cookies_path_in(&self.root_dir, &src_sid);
         let cookie_src = if src_cookie.is_file() {
             Some(src_cookie)
         } else if fallback_cookie.is_file() {
@@ -459,7 +480,7 @@ impl Database {
         if let Some(cs) = cookie_src {
             let _ = std::fs::create_dir_all(&states);
             for c in &created {
-                let dst = states.join(format!("bon_{}_prelaunch.json", c.short_id()));
+                let dst = crate::cookies::prelaunch_cookies_path_in(&self.root_dir, &c.short_id());
                 let _ = crate::extensions::clonefile_or_copy(&cs, &dst);
             }
         }
@@ -869,37 +890,13 @@ impl Database {
 
     pub fn list_profiles(&self) -> anyhow::Result<Vec<Profile>> {
         self.query_profiles_sql(
-            "SELECT
-                id, name, group_tag, seed, os_platform, os_version,
-                brand, brand_version, hardware_concurrency, gpu_spoofing,
-                proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
-                geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                startup_url, notes, created_at, last_launched_at,
-                spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
-                window_size, custom_timezone, custom_locale, geo_latency_ms,
-                tags, totp_secret, deleted_at, proxy_change_ip_url,
-                ip_policy, geo_quality, trust_stage, seeded_at
-             FROM profiles
-             WHERE deleted_at IS NULL
-             ORDER BY created_at DESC",
+            &format!("{PROFILE_SELECT} WHERE deleted_at IS NULL ORDER BY created_at DESC"),
         )
     }
 
     pub fn list_trashed_profiles(&self) -> anyhow::Result<Vec<Profile>> {
         self.query_profiles_sql(
-            "SELECT
-                id, name, group_tag, seed, os_platform, os_version,
-                brand, brand_version, hardware_concurrency, gpu_spoofing,
-                proxy_protocol, proxy_host, proxy_port, proxy_username, proxy_password,
-                geo_ip, geo_country, geo_timezone, geo_locale, geo_accept_lang,
-                startup_url, notes, created_at, last_launched_at,
-                spoof_canvas, spoof_audio, spoof_font, spoof_client_rects,
-                window_size, custom_timezone, custom_locale, geo_latency_ms,
-                tags, totp_secret, deleted_at, proxy_change_ip_url,
-                ip_policy, geo_quality, trust_stage, seeded_at
-             FROM profiles
-             WHERE deleted_at IS NOT NULL
-             ORDER BY deleted_at DESC",
+            &format!("{PROFILE_SELECT} WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC"),
         )
     }
 
@@ -1114,15 +1111,11 @@ impl Database {
                 startup_url = excluded.startup_url,
                 notes = excluded.notes,
                 created_at = excluded.created_at,
-                last_launched_at = excluded.last_launched_at,
                 tags = excluded.tags,
                 totp_secret = excluded.totp_secret,
-                deleted_at = excluded.deleted_at,
                 proxy_change_ip_url = excluded.proxy_change_ip_url,
                 ip_policy = excluded.ip_policy,
-                geo_quality = excluded.geo_quality,
-                trust_stage = excluded.trust_stage,
-                seeded_at = excluded.seeded_at",
+                geo_quality = excluded.geo_quality",
         )?;
         stmt.execute(params![
             profile.id,
@@ -1261,6 +1254,12 @@ impl Database {
         stmt.execute(params![profile_id])?;
         Ok(())
     }
+
+    /// Permanent delete: the row goes first, so a busy DB never leaves a Trash entry whose data is already wiped.
+    pub fn purge_profile(&self, profile_id: &str) -> anyhow::Result<()> {
+        self.delete_profile(profile_id)?;
+        self.wipe_profile_data(profile_id)
+    }
     /// Exports all profiles to `~/Downloads/bonlogin_profiles_backup.json`.
     pub fn export_profiles_json(&self) -> anyhow::Result<(PathBuf, String)> {
         self.export_profiles_json_to(None)
@@ -1275,7 +1274,7 @@ impl Database {
         let path = custom_out
             .map(PathBuf::from)
             .unwrap_or_else(|| self.backups_dir().join("bonlogin_profiles_backup.json"));
-        std::fs::write(&path, &json)?;
+        crate::extensions::replace_file_atomically(&path, json.as_bytes())?;
         Ok((path, json))
     }
 
@@ -1352,7 +1351,7 @@ impl Database {
         let path = custom_out
             .map(PathBuf::from)
             .unwrap_or_else(|| self.backups_dir().join("bonlogin_profiles.csv"));
-        std::fs::write(&path, &csv)?;
+        crate::extensions::replace_file_atomically(&path, csv.as_bytes())?;
         Ok((path, csv))
     }
 
@@ -1837,6 +1836,18 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stale_upsert_keeps_trash_state() {
+        let db = Database::open_in_memory().unwrap();
+        let mut stale = Profile::new_default("Stale GUI copy", PlatformType::MacOS);
+        db.upsert_profile(&stale).unwrap();
+        db.soft_delete_profile(&stale.id).unwrap();
+        stale.notes = "edited from an old in-memory copy".to_string();
+        db.upsert_profile(&stale).unwrap();
+        assert!(db.list_profiles().unwrap().is_empty());
+        assert_eq!(db.list_trashed_profiles().unwrap()[0].notes, stale.notes);
+    }
 
     #[test]
     fn test_db_crud() {

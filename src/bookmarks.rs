@@ -197,6 +197,7 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
         return;
     };
     let mut prefs = prefs.filter(serde_json::Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    ensure_objects(&mut prefs, &["bookmark_bar", "profile", "browser"]);
     prefs["bookmark_bar"]["show_on_all_tabs"] = serde_json::Value::Bool(true);
     prefs["profile"]["name"] = serde_json::Value::String(badge_name.clone());
     prefs["profile"]["is_using_default_name"] = serde_json::Value::Bool(false);
@@ -214,6 +215,9 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
     let mut local_state = local_state
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
+    ensure_objects(&mut local_state, &["profile"]);
+    ensure_objects(&mut local_state["profile"], &["info_cache"]);
+    ensure_objects(&mut local_state["profile"]["info_cache"], &["Default"]);
     let def_info = &mut local_state["profile"]["info_cache"]["Default"];
     def_info["name"] = serde_json::Value::String(badge_name);
     def_info["is_using_default_name"] = serde_json::Value::Bool(false);
@@ -224,6 +228,26 @@ pub fn ensure_profile_bookmarks(profile: &Profile, user_data_dir: &Path) {
     def_info["profile_highlight_color"] = serde_json::json!(skcolor);
     def_info["default_avatar_fill_color"] = serde_json::json!(skcolor);
     let _ = write_chromium_json(&local_state_path, &local_state);
+}
+
+/// serde_json's `value[key] = ..` panics when an existing key holds a non-object, which a restored archive can contain.
+fn ensure_objects(parent: &mut serde_json::Value, keys: &[&str]) {
+    let Some(map) = parent.as_object_mut() else {
+        return;
+    };
+    for key in keys {
+        let slot = map.entry(*key).or_insert_with(|| serde_json::json!({}));
+        if !slot.is_object() {
+            *slot = serde_json::json!({});
+        }
+    }
+}
+
+/// GeoIP timezones can come from a proxy-tampered plain-HTTP response, so they enter `<script>` only as a JSON literal.
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('<', "\\u003c")
 }
 
 fn html_escape(s: &str) -> String {
@@ -387,7 +411,7 @@ pub fn write_profile_preflight_card(
     el.style.color = '#ff453a';
   }}
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  document.getElementById('live-tz').textContent = '{tz} / ' + tz;
+  document.getElementById('live-tz').textContent = {tz_js} + ' / ' + tz;
   document.getElementById('live-lang').textContent = navigator.language + ' (' + (navigator.languages || []).join(',') + ')';
   document.getElementById('live-cores').textContent = navigator.hardwareConcurrency + ' Cores (' + navigator.platform + ')';
 }})();
@@ -411,6 +435,7 @@ pub fn write_profile_preflight_card(
         os_ver = html_escape(&profile.os_version),
         brand = html_escape(profile.brand.as_cli_str()),
         tz = html_escape(tz_label),
+        tz_js = js_string_literal(tz_label),
         loc = html_escape(loc_label),
         cores = profile.hardware_concurrency,
         gpu = html_escape(renderer),
@@ -443,5 +468,25 @@ mod tests {
         write_profile_bookmarks_items(&dir, &items).unwrap();
         assert!(std::fs::read_to_string(&bm_path).unwrap().contains("https://a.com"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_prefs_and_hostile_timezone_are_safe() {
+        let dir = std::env::temp_dir().join(format!(
+            "bon_bm_prefs_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(dir.join("Default")).unwrap();
+        std::fs::write(dir.join("Default").join("Preferences"), r#"{"profile":"x","browser":[1]}"#).unwrap();
+        std::fs::write(dir.join("Local State"), r#"{"profile":{"info_cache":true}}"#).unwrap();
+        let profile = crate::models::Profile::new_default("P", crate::models::PlatformType::MacOS);
+        ensure_profile_bookmarks(&profile, &dir);
+        let prefs = std::fs::read_to_string(dir.join("Default").join("Preferences")).unwrap();
+        assert!(prefs.contains("bookmark_bar"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let js = js_string_literal("x';location='https://evil/';'</script>");
+        assert_eq!(js, r#""x';location='https://evil/';'\u003c/script>""#);
     }
 }

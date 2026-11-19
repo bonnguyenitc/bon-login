@@ -665,9 +665,17 @@ pub fn parse_and_normalize_cookies(
     })
 }
 
+/// The one place that names the per-profile cookie sidecars (db, launcher and archive all go through these).
+pub(crate) fn prelaunch_cookies_path_in(root_dir: &Path, short_id: &str) -> std::path::PathBuf {
+    root_dir.join("states").join(format!("bon_{short_id}_prelaunch.json"))
+}
+
+pub(crate) fn state_cookies_path_in(root_dir: &Path, short_id: &str) -> std::path::PathBuf {
+    root_dir.join("states").join(format!("bon_{short_id}_state.json"))
+}
+
 pub fn read_prelaunch_cookies_in(root_dir: &Path, short_id: &str) -> String {
-    let states_dir = root_dir.join("states");
-    let pre_path = states_dir.join(format!("bon_{short_id}_prelaunch.json"));
+    let pre_path = prelaunch_cookies_path_in(root_dir, short_id);
     if let Ok(s) = std::fs::read_to_string(&pre_path)
         && !s.trim().is_empty()
     {
@@ -678,16 +686,15 @@ pub fn read_prelaunch_cookies_in(root_dir: &Path, short_id: &str) -> String {
 
 
 pub fn save_prelaunch_cookies_in(root_dir: &Path, short_id: &str, raw: &str) -> Result<()> {
-    let dir = root_dir.join("states");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("bon_{short_id}_prelaunch.json"));
+    let path = prelaunch_cookies_path_in(root_dir, short_id);
+    std::fs::create_dir_all(root_dir.join("states"))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         let _ = std::fs::remove_file(path);
     } else if let Ok(bundle) = parse_and_normalize_cookies(trimmed, None) {
-        std::fs::write(path, bundle.to_state_json_pretty())?;
+        crate::extensions::replace_file_atomically(&path, bundle.to_state_json_pretty().as_bytes())?;
     } else {
-        std::fs::write(path, trimmed)?;
+        crate::extensions::replace_file_atomically(&path, trimmed.as_bytes())?;
     }
     Ok(())
 }

@@ -309,19 +309,47 @@ fn flush_prelaunch_state_if_needed_in(
     if short_id.is_empty() || cdp_has_open_window(cdp_port) != Some(true) {
         return;
     }
-    let states_dir = root_dir.join("states");
-    let pre_path = states_dir.join(format!("bon_{short_id}_prelaunch.json"));
+    let pre_path = crate::cookies::prelaunch_cookies_path_in(root_dir, short_id);
     if let Ok((_, live_json)) = agent_export_state_in(root_dir, short_id, ws_url)
         && pre_path.is_file()
     {
-        let _ = std::fs::write(pre_path, live_json);
+        let _ = crate::cookies::save_prelaunch_cookies_in(root_dir, short_id, &live_json);
     }
 }
 
 fn singleton_lock_pid(user_data_dir: &Path) -> Option<u32> {
     let target = std::fs::read_link(user_data_dir.join("SingletonLock")).ok()?;
     let pid: u32 = target.to_string_lossy().rsplit('-').next()?.parse().ok()?;
-    unix_pid_alive(pid).then_some(pid)
+    (unix_pid_alive(pid) && pid_is_chromium(pid)).then_some(pid)
+}
+
+/// After a crash or reboot the lock's PID may belong to Slack or Finder; only a Chromium binary may own it.
+#[cfg(target_os = "macos")]
+fn pid_is_chromium(pid: u32) -> bool {
+    // Tests fake the lock with the test runner's own PID or a registered stand-in child
+    // (copied system binaries are SIGKILLed by macOS, so a real `/Contents/MacOS/Chromium` path is unavailable).
+    #[cfg(test)]
+    if pid == std::process::id() || tests::FAKE_CHROMIUM_PIDS.lock().unwrap().contains(&pid) {
+        return true;
+    }
+    unsafe extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let mut buf = [0u8; 4096];
+    // SAFETY: buf is a live, writable 4096-byte buffer and its exact size is passed (PROC_PIDPATHINFO_MAXSIZE).
+    let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), buf.len() as u32) };
+    let Some(path) = usize::try_from(len).ok().filter(|&n| n > 0).and_then(|n| buf.get(..n)) else {
+        return false;
+    };
+    path.ends_with(b"/Contents/MacOS/Chromium")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_is_chromium(_pid: u32) -> bool {
+    true
 }
 
 /// A PID from bon_runtime.json is trusted only while it still holds this profile's SingletonLock,
@@ -464,9 +492,8 @@ pub fn wipe_profile_data_in(root_dir: &Path, profile_id: &str) -> Result<()> {
         .filter(|c| c.is_ascii_alphanumeric())
         .take(8)
         .collect();
-    let states_dir = root_dir.join("states");
-    let _ = std::fs::remove_file(states_dir.join(format!("bon_{short_id}_prelaunch.json")));
-    let _ = std::fs::remove_file(states_dir.join(format!("bon_{short_id}_state.json")));
+    let _ = std::fs::remove_file(crate::cookies::prelaunch_cookies_path_in(root_dir, &short_id));
+    let _ = std::fs::remove_file(crate::cookies::state_cookies_path_in(root_dir, &short_id));
     Ok(())
 }
 
@@ -565,7 +592,8 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn is_safe_cache_cleanup_entry(name: &str) -> bool {
+/// Chromium cache/crash folders that are safe to drop; shared by cache cleanup and archive export.
+pub(crate) fn is_chromium_cache_entry(name: &str) -> bool {
     matches!(
         name,
         "Cache"
@@ -581,9 +609,11 @@ fn is_safe_cache_cleanup_entry(name: &str) -> bool {
             | "BrowserMetrics"
             | "Safe Browsing"
             | "ComponentMetrics"
-            | "CacheStorage"
-            | "ScriptCache"
     ) || name.ends_with(".tmp")
+}
+
+fn is_safe_cache_cleanup_entry(name: &str) -> bool {
+    is_chromium_cache_entry(name) || matches!(name, "CacheStorage" | "ScriptCache")
 }
 
 fn clean_dir_ephemeral_recursive(dir: &Path) -> u64 {
@@ -624,8 +654,13 @@ fn clean_dir_ephemeral_recursive(dir: &Path) -> u64 {
 
 /// Removes Chromium cache/shader/crashpad bloat from a stopped profile's user-data-dir while preserving Cookies & LocalStorage.
 /// Returns `(freed_bytes, remaining_bytes)`.
+/// True while a Chromium still holds the profile, even with every window closed (probe_live_runtime_in says None then).
+fn profile_dir_in_use_in(root_dir: &Path, profile_id: &str) -> bool {
+    singleton_lock_pid(&root_dir.join("profiles").join(profile_id)).is_some()
+}
+
 pub fn clean_profile_cache_in(root_dir: &Path, profile_id: &str) -> Result<(u64, u64)> {
-    if probe_live_runtime_in(root_dir, profile_id).is_some() {
+    if probe_live_runtime_in(root_dir, profile_id).is_some() || profile_dir_in_use_in(root_dir, profile_id) {
         bail!("Cannot clean disk cache while profile '{profile_id}' is running");
     }
     let dir = root_dir.join("profiles").join(profile_id);
@@ -1288,7 +1323,7 @@ pub(crate) async fn launch_profile_with_kernel_in(
     // Held until this fn returns: GUI and CLI daemon must not launch one profile at once,
     // or the second deletes the first one's DevToolsActivePort mid-launch.
     let _launch_lock = acquire_profile_launch_lock_in(root_dir, &profile.id)?;
-    if probe_live_runtime_in(root_dir, &profile.id).is_some() {
+    if probe_live_runtime_in(root_dir, &profile.id).is_some() || profile_dir_in_use_in(root_dir, &profile.id) {
         bail!("Profile is still running or shutting down. Try again in a few seconds");
     }
 
@@ -1514,6 +1549,56 @@ pub(crate) async fn launch_profile_with_kernel_in(
 // ---------------------------------------------------------------------------
 // Built-in `vercel-labs/agent-browser` Runner, Cookie Robot & State Manager
 // ---------------------------------------------------------------------------
+
+/// A wedged agent-browser daemon must not block Stop/Quit (SIGTERM is sent after the cookie flush).
+const AGENT_BROWSER_TIMEOUT: Duration = Duration::from_secs(15);
+
+trait OutputWithin {
+    fn output_within(&mut self, limit: Duration) -> std::io::Result<std::process::Output>;
+}
+
+impl OutputWithin for Command {
+    /// `Command::output` with a deadline: the child is killed and reaped when it runs past `limit`.
+    fn output_within(&mut self, limit: Duration) -> std::io::Result<std::process::Output> {
+        use std::io::Read;
+        let mut child = self
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
+                }
+                buf
+            })
+        };
+        let out_t = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+        let err_t = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("agent-browser did not finish within {}s", limit.as_secs()),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: out_t.join().unwrap_or_default(),
+            stderr: err_t.join().unwrap_or_default(),
+        })
+    }
+}
 
 fn agent_browser_cmd() -> Command {
     static BIN: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
@@ -3317,7 +3402,7 @@ pub fn ensure_agent_browser_connected_in(
                 "connect",
                 ws_url,
             ])
-            .output()
+            .output_within(AGENT_BROWSER_TIMEOUT)
             .context("Failed to execute `agent-browser`. Is `agent-browser` installed in PATH?")
     };
     let mut out = run_connect()?;
@@ -3357,7 +3442,7 @@ pub fn ensure_agent_browser_pinned_tab_in(
             "connect",
             ws_url,
         ])
-        .output()
+        .output_within(AGENT_BROWSER_TIMEOUT)
         .context("Failed to execute `agent-browser` for pinned tab")?;
     if !out.status.success() {
         bail!(
@@ -3368,7 +3453,7 @@ pub fn ensure_agent_browser_pinned_tab_in(
     if let Some(url) = initial_url.filter(|u| !u.trim().is_empty()) {
         let _ = agent_browser_cmd_for_short_id_in(root_dir, short_id)
             .args(["--session", &session, "tab", "new", url.trim()])
-            .output();
+            .output_within(AGENT_BROWSER_TIMEOUT);
     }
     Ok(session)
 }
@@ -3382,7 +3467,7 @@ pub fn agent_sync_targets_in(
     let session = ensure_agent_browser_connected_in(root_dir, short_id, ws_url)?;
     let tabs_out = agent_browser_cmd_for_short_id_in(root_dir, short_id)
         .args(["--session", &session, "tab", "--json"])
-        .output()?;
+        .output_within(AGENT_BROWSER_TIMEOUT)?;
     let tabs_json = serde_json::from_slice::<serde_json::Value>(&tabs_out.stdout)
         .unwrap_or_else(|_| serde_json::json!({}));
     Ok(serde_json::json!({
@@ -3493,7 +3578,7 @@ pub fn agent_open_extension_tab_in(
     let session = ensure_agent_browser_connected_in(root_dir, short_id, ws_url)?;
     let out = agent_browser_cmd_for_short_id_in(root_dir, short_id)
         .args(["--session", &session, "tab", "new", ext_url])
-        .output()?;
+        .output_within(AGENT_BROWSER_TIMEOUT)?;
     if !out.status.success() {
         bail!(
             "agent-browser tab new failed: {}",
@@ -3537,7 +3622,7 @@ pub fn agent_audit_fingerprint_in(
 
     let out = agent_browser_cmd()
         .args(["--session", &session, "eval", js])
-        .output()?;
+        .output_within(AGENT_BROWSER_TIMEOUT)?;
     if !out.status.success() {
         bail!(
             "Fingerprint audit failed: {}",
@@ -3559,7 +3644,7 @@ pub fn agent_export_state_in(
     let session = ensure_agent_browser_connected_in(root_dir, short_id, ws_url)?;
     let dir = root_dir.join("states");
     std::fs::create_dir_all(&dir)?;
-    let state_path = dir.join(format!("bon_{short_id}_state.json"));
+    let state_path = crate::cookies::state_cookies_path_in(root_dir, short_id);
 
     let out = agent_browser_cmd_for_short_id_in(root_dir, short_id)
         .args([
@@ -3569,7 +3654,7 @@ pub fn agent_export_state_in(
             "save",
             &state_path.to_string_lossy(),
         ])
-        .output()?;
+        .output_within(AGENT_BROWSER_TIMEOUT)?;
     if !out.status.success() {
         bail!(
             "state save failed: {}",
@@ -3644,7 +3729,7 @@ fn apply_cookies_via_cli_set_in(
         }
         if agent_browser_cmd_for_short_id_in(root_dir, short_id)
             .args(&args)
-            .output()
+            .output_within(AGENT_BROWSER_TIMEOUT)
             .is_ok_and(|o| o.status.success())
         {
             applied += 1;
@@ -3666,8 +3751,8 @@ pub fn agent_import_state_or_cookies_in(
     let source_text = if !trimmed.is_empty() {
         trimmed.to_string()
     } else {
-        let prelaunch = dir.join(format!("bon_{short_id}_prelaunch.json"));
-        let default_state = dir.join(format!("bon_{short_id}_state.json"));
+        let prelaunch = crate::cookies::prelaunch_cookies_path_in(root_dir, short_id);
+        let default_state = crate::cookies::state_cookies_path_in(root_dir, short_id);
         if prelaunch.is_file() {
             std::fs::read_to_string(&prelaunch)?
         } else if default_state.is_file() {
@@ -3713,7 +3798,7 @@ pub fn agent_import_state_or_cookies_in(
                 "load",
                 &tmp_file.to_string_lossy(),
             ])
-            .output()?;
+            .output_within(AGENT_BROWSER_TIMEOUT)?;
         if !out.status.success() {
             // shortcut: cap per-cookie CLI fallback at 25 so malformed bundles never stall for 20s
             let cap = bundle.cookies.len().min(25);
@@ -3736,7 +3821,7 @@ pub fn agent_import_state_or_cookies_in(
     // Refresh active tab so newly injected session cookies take effect immediately
     let _ = agent_browser_cmd_for_short_id_in(root_dir, short_id)
         .args(["--session", &session, "reload"])
-        .output();
+        .output_within(AGENT_BROWSER_TIMEOUT);
 
     Ok(format!("Imported {}", bundle.summary_badge()))
 }
@@ -4467,6 +4552,15 @@ mod tests {
         let lock = user_data_dir.join("SingletonLock");
         let _ = std::fs::remove_file(&lock);
         std::os::unix::fs::symlink(format!("test-host-{pid}"), lock).unwrap();
+    }
+
+    pub(crate) static FAKE_CHROMIUM_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+    /// Spawns a stand-in process that `pid_is_chromium` accepts as a profile's browser.
+    pub(crate) fn spawn_fake_chromium(cmd: &mut Command) -> Child {
+        let child = cmd.spawn().unwrap();
+        FAKE_CHROMIUM_PIDS.lock().unwrap().push(child.id());
+        child
     }
 
     #[test]
@@ -5556,7 +5650,7 @@ mod tests {
         let closed_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let closed_port = closed_l.local_addr().unwrap().port();
         drop(closed_l);
-        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child = spawn_fake_chromium(Command::new("sleep").arg("30"));
         let child_pid = child.id();
         let info = RuntimeInfo {
             pid: child_pid,
@@ -6173,10 +6267,10 @@ mod tests {
         // --- Finding 4: `stop_external_runtime_in` keeps `bon_runtime.json` until SIGTERM finishes ---
         let ext_prof = Profile::new_default("SlowExitExt", PlatformType::MacOS);
         let ext_pdir = profile_user_data_dir_in(&tmp, &ext_prof.id).unwrap();
-        let mut slow_exit_child = Command::new("/bin/sh")
-            .args(["-c", "trap 'sleep 0.16; exit 0' TERM; while :; do sleep 0.05; done"])
-            .spawn()
-            .unwrap();
+        let mut slow_exit_child = spawn_fake_chromium(
+            Command::new("/bin/sh")
+                .args(["-c", "trap 'sleep 0.16; exit 0' TERM; while :; do sleep 0.05; done"]),
+        );
         let closed_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let closed_p = closed_l.local_addr().unwrap().port();
         drop(closed_l);

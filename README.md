@@ -74,6 +74,7 @@
 - **Backups, CSV Bulk I/O, Disk Cache Cleaner & Trash Bin:**
   - **Portable `.zip` Profile Archives:** Export/restore full profile archives (`.zip` containing metadata, pre-launch cookies, and essential `user-data-dir` Cookies/LocalStorage/IndexedDB).
   - **CSV / TSV & JSON Backup:** Bulk import/export profiles via CSV, TSV, or JSON.
+  - ⚠️ `.zip`, JSON and CSV exports contain proxy passwords and 2FA (TOTP) secrets in plain text. Do not share them.
   - **Clean Cache vs. Wipe Data:** Strip megabytes of Chromium shader/cache bloat while keeping cookies (`🧹 Clean Cache`), or reset a profile's browser directory cleanly while keeping its fingerprint config (`🧼 Wipe Data`).
   - **Soft-Delete Trash Bin:** Deleted profiles move to the `Trash` tab with full data preserved until restored or permanently wiped.
 
