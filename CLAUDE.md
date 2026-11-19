@@ -153,6 +153,7 @@ bon-login/
         ├── profile_list.rs    # Bảng Profile/Trash ảo hóa 120fps & Detail Drawer (0 disk I/O lúc render)
         ├── profile_modal.rs   # Màn hình Tạo / Sửa Profile (Overview, Fingerprint, Proxy, Cookies, Bookmarks)
         ├── workspace_views.rs # Các màn hình Quản lý Proxies, Extensions & Groups
+        ├── flow_builder.rs    # Flow Builder kéo thả (palette khối, sắp xếp, sửa tham số, chạy + highlight bước)
         └── popup_modals.rs    # Các hộp thoại Popup đóng gói trạng thái riêng (Clone, EditProxy, Flows...)
 ```
 

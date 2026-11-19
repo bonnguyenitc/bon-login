@@ -1,3 +1,4 @@
+pub mod flow_builder;
 pub mod popup_modals;
 pub mod profile_list;
 pub mod profile_modal;
@@ -182,6 +183,7 @@ pub enum ActivePopupModal {
     CloneProfile(CloneProfileModalState),
     EditProxy(EditProxyModalState),
     Synchronizer(SynchronizerModalState),
+    FlowBuilder(flow_builder::FlowBuilderState),
 }
 
 impl ActivePopupModal {
@@ -206,6 +208,7 @@ impl ActivePopupModal {
             Self::CloneProfile(_) => "CloneProfile",
             Self::EditProxy(_) => "EditProxy",
             Self::Synchronizer(_) => "Synchronizer",
+            Self::FlowBuilder(_) => "FlowBuilder",
         }
     }
 }

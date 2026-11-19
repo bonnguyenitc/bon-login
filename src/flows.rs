@@ -837,6 +837,26 @@ pub(crate) fn append_steps_to_flow_path(path: &Path, name: &str, new_steps: &[Fl
     let _ = save_flow_to_path(path, &mut flow);
 }
 
+/// Indent level per step: bodies of if/loop/foreach sit one level deeper; else/end align with the opener.
+pub fn step_depths(steps: &[FlowStep]) -> Vec<usize> {
+    let mut depth = 0usize;
+    steps
+        .iter()
+        .map(|s| match s.op.as_str() {
+            "end" => {
+                depth = depth.saturating_sub(1);
+                depth
+            }
+            "else" => depth.saturating_sub(1),
+            "if" | "loop" | "foreach" => {
+                depth += 1;
+                depth - 1
+            }
+            _ => depth,
+        })
+        .collect()
+}
+
 pub fn extract_flow_vars(flow: &AgentFlow) -> Vec<String> {
     let mut vars = Vec::new();
     let mut scan_str = |s: &str| {
@@ -1161,7 +1181,7 @@ fn eval_flow_condition(
 }
 
 /// Jump table for block ops: if→else|end, else→end, loop/foreach→end, end→opener, break→loop.
-fn match_flow_blocks(steps: &[FlowStep]) -> Result<Vec<usize>> {
+pub(crate) fn match_flow_blocks(steps: &[FlowStep]) -> Result<Vec<usize>> {
     let mut jump = vec![usize::MAX; steps.len()];
     let mut stack: Vec<usize> = Vec::new();
     for (i, s) in steps.iter().enumerate() {
@@ -1370,14 +1390,7 @@ pub fn add_flow_step_in(
     let clean_name = sanitize_flow_name(flow_raw)?;
     let path = flow_file_path_in(root_dir, &clean_name)?;
     let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut flow = if path.is_file() {
-        load_flow_from_path(&path, &clean_name)?
-    } else {
-        AgentFlow {
-            name: clean_name.clone(),
-            ..Default::default()
-        }
-    };
+    let mut flow = load_or_new_flow(&path, &clean_name)?;
     let idx = at.unwrap_or(flow.steps.len());
     if idx > flow.steps.len() {
         bail!(
@@ -1390,6 +1403,135 @@ pub fn add_flow_step_in(
     save_flow_to_path(&path, &mut flow)?;
     Ok(flow)
 }
+
+fn load_or_new_flow(path: &Path, clean_name: &str) -> Result<AgentFlow> {
+    if path.is_file() {
+        load_flow_from_path(path, clean_name)
+    } else {
+        Ok(AgentFlow {
+            name: clean_name.to_string(),
+            ..Default::default()
+        })
+    }
+}
+
+/// Replaces a flow's steps (Flow Builder edits), creating the flow file if it does not exist.
+pub fn save_flow_steps_in(root_dir: &Path, flow_raw: &str, steps: Vec<FlowStep>) -> Result<AgentFlow> {
+    let clean_name = sanitize_flow_name(flow_raw)?;
+    let path = flow_file_path_in(root_dir, &clean_name)?;
+    let _guard = FLOW_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut flow = load_or_new_flow(&path, &clean_name)?;
+    flow.steps = steps;
+    save_flow_to_path(&path, &mut flow)?;
+    Ok(flow)
+}
+
+/// Quotes a token so `split_step_line` reads it back unchanged.
+fn quote_step_token(t: &str) -> String {
+    if !t.is_empty() && !t.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\')) {
+        return t.to_string();
+    }
+    format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A step's arguments (everything after the op) in `flow add` syntax, for editing in the UI.
+pub fn step_args_line(step: &FlowStep) -> String {
+    step.locators
+        .first()
+        .into_iter()
+        .chain(&step.value)
+        .chain(&step.extra_args)
+        .map(|t| quote_step_token(t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Last index of the unit starting at `idx`: an if/loop/foreach opener spans through its `end`.
+pub fn flow_block_end(steps: &[FlowStep], idx: usize) -> usize {
+    if !matches!(steps[idx].op.as_str(), "if" | "loop" | "foreach") {
+        return idx;
+    }
+    let mut depth = 0usize;
+    for (i, s) in steps.iter().enumerate().skip(idx) {
+        match s.op.as_str() {
+            "if" | "loop" | "foreach" => depth += 1,
+            "end" => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    idx // unbalanced opener moves alone
+}
+
+/// Moves the unit at `from` (a whole block for openers) so it lands before original index `to`.
+pub fn move_flow_steps(steps: &mut Vec<FlowStep>, from: usize, to: usize) {
+    let end = flow_block_end(steps, from);
+    if (from..=end + 1).contains(&to) || to > steps.len() {
+        return;
+    }
+    let block: Vec<FlowStep> = steps.drain(from..=end).collect();
+    let at = if to > end { to - block.len() } else { to };
+    steps.splice(at..at, block);
+}
+
+/// Removes a step; an opener also drops its own `else`/`end` but keeps the body (unwrap, no data loss).
+pub fn remove_flow_step(steps: &mut Vec<FlowStep>, idx: usize) {
+    let end = flow_block_end(steps, idx);
+    let mut doomed = vec![idx];
+    if end != idx {
+        doomed.push(end);
+        let mut depth = 0usize;
+        for i in idx + 1..end {
+            match steps[i].op.as_str() {
+                "if" | "loop" | "foreach" => depth += 1,
+                "end" => depth -= 1,
+                "else" if depth == 0 => doomed.push(i),
+                _ => {}
+            }
+        }
+    }
+    doomed.sort_unstable();
+    for i in doomed.into_iter().rev() {
+        steps.remove(i);
+    }
+}
+
+/// Step currently executing per `"<flow>/<short_id>"`, for the Flow Builder's live highlight.
+static FLOW_PROGRESS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub fn flow_progress(flow_name: &str, short_id: &str) -> Option<usize> {
+    let key = format!("{flow_name}/{short_id}");
+    FLOW_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied()
+}
+
+fn set_flow_progress(key: &str, step: Option<usize>) {
+    let mut map = FLOW_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    match step {
+        Some(s) => map.insert(key.to_string(), s),
+        None => map.remove(key),
+    };
+}
+
+/// Replay error naming the failed step, so the UI can highlight it.
+#[derive(Debug)]
+pub struct FlowStepFailed {
+    pub step: usize,
+    pub op: String,
+    pub error: String,
+}
+
+impl std::fmt::Display for FlowStepFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Step #{} ({}) failed: {}", self.step, self.op, self.error)
+    }
+}
+
+impl std::error::Error for FlowStepFailed {}
 
 pub(crate) fn parse_var_flag(args: &[String], idx: usize) -> Option<((String, String), usize)> {
     if args.get(idx)? == "--var" {
@@ -1991,10 +2133,12 @@ pub fn replay_flow_steps_with_in(
     let mut executed_steps = Vec::new();
     let mut failure = None;
 
+    let progress_key = format!("{clean_name}/{short_id}");
     let mut pc = from_step;
     while pc < flow.steps.len() {
         let step_idx = pc;
         pc += 1;
+        set_flow_progress(&progress_key, Some(step_idx));
         let step = flow.steps[step_idx].clone();
         let outcome = match step.op.as_str() {
             "if" => eval_flow_condition(&step, &vars).map(|hit| {
@@ -2099,6 +2243,7 @@ pub fn replay_flow_steps_with_in(
             }
         }
     }
+    set_flow_progress(&progress_key, None);
 
     Ok(FlowReplayReport {
         executed_steps,
@@ -2134,7 +2279,7 @@ pub fn run_flow_on_live_session_in(
 ) -> Result<usize> {
     let report = replay_flow_steps_in(root_dir, flow_name, profile, ws_url, extra_vars, 0)?;
     if let Some(fail) = report.failure {
-        let idx = fail.get("failed_step").and_then(|v| v.as_u64()).unwrap_or(0);
+        let idx = fail.get("failed_step").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let op = fail
             .get("step")
             .and_then(|s| s.get("op"))
@@ -2144,7 +2289,12 @@ pub fn run_flow_on_live_session_in(
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("failed");
-        bail!("Step #{} ({}) failed: {}", idx + 1, op, err);
+        return Err(FlowStepFailed {
+            step: idx,
+            op: op.to_string(),
+            error: err.to_string(),
+        }
+        .into());
     }
     Ok(report
         .executed_steps
@@ -2475,6 +2625,43 @@ mod tests {
         let err = run_cmd_step(&tmp, "sleep 5", &["--timeout".into(), "1".into()]).unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_builder_block_move_unwrap_delete_and_args_roundtrip() {
+        let mk = |line: &str| parse_step_tokens(&split_step_line(line)).unwrap().1;
+        let ops = |s: &[FlowStep]| s.iter().map(|x| x.op.clone()).collect::<Vec<_>>().join(",");
+        // 0 open, 1 loop, 2 if, 3 press, 4 else, 5 wait, 6 end, 7 end, 8 cmd
+        let mut steps: Vec<FlowStep> = [
+            "open https://a.example", "loop 2", "if {{i}} == 1", "press A", "else", "wait 10",
+            "end", "end", "cmd 'echo hi'",
+        ]
+        .into_iter()
+        .map(mk)
+        .collect();
+        assert_eq!(step_depths(&steps), vec![0, 0, 1, 2, 1, 2, 1, 0, 0]);
+        assert_eq!(flow_block_end(&steps, 1), 7);
+
+        // Dragging the loop moves its whole block; dropping onto itself is a no-op.
+        move_flow_steps(&mut steps, 1, 9);
+        assert_eq!(ops(&steps), "open,cmd,loop,if,press,else,wait,end,end");
+        move_flow_steps(&mut steps, 2, 3);
+        assert_eq!(ops(&steps), "open,cmd,loop,if,press,else,wait,end,end");
+        move_flow_steps(&mut steps, 2, 0);
+        assert_eq!(ops(&steps), "loop,if,press,else,wait,end,end,open,cmd");
+        assert!(match_flow_blocks(&steps).is_ok());
+
+        // Deleting an if unwraps it: else/end go, the body stays, structure stays valid.
+        remove_flow_step(&mut steps, 1);
+        assert_eq!(ops(&steps), "loop,press,wait,end,open,cmd");
+        assert!(match_flow_blocks(&steps).is_ok());
+
+        // The inspector's args line parses back to the same step, including quotes and backslashes.
+        for line in [r#"regex {{resp}} "(\\d+) \"x\"""#, "fill \"#a b\" {{text}}", "--out t get text h1"] {
+            let s = mk(line);
+            let back = mk(&format!("{} {} {}", s.out.as_ref().map(|o| format!("--out {o}")).unwrap_or_default(), s.op, step_args_line(&s)));
+            assert_eq!(back, s, "{line}");
+        }
     }
 }
 

@@ -2603,6 +2603,24 @@ pub fn render_popup_modal(
                                         .on_click(cx.listener(|app, _, window, cx| {
                                             app.add_flow_step_ui(window, cx);
                                         })),
+                                )
+                                .child(
+                                    Button::new("flw-builder-btn")
+                                        .ghost()
+                                        .small()
+                                        .label(format!("{} Builder", SfSymbol::PENCIL))
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            let Some(ActivePopupModal::AgentFlows(af)) = &app.popup_modal else {
+                                                return;
+                                            };
+                                            let name = af.save_name_input.read(cx).value().trim().to_string();
+                                            if name.is_empty() {
+                                                app.banner_message = Some("Enter a flow name first".to_string());
+                                                cx.notify();
+                                                return;
+                                            }
+                                            app.open_flow_builder(&name, window, cx);
+                                        })),
                                 ),
                         ),
                 )
@@ -2629,6 +2647,7 @@ pub fn render_popup_modal(
                             let fn_exp = fl.name.clone();
                             let fn_run = fl.name.clone();
                             let fn_del = fl.name.clone();
+                            let fn_edit = fl.name.clone();
                             let fn_for_steps = fl.name.clone();
                             let vars = crate::flows::extract_flow_vars(&fl);
                             let meta = if vars.is_empty() {
@@ -2649,24 +2668,7 @@ pub fn render_popup_modal(
                                 )
                             };
                             let steps_list = fl.steps.clone();
-                            // Indent if/loop/foreach bodies so block structure is readable.
-                            let mut depth = 0usize;
-                            let depths: Vec<usize> = fl
-                                .steps
-                                .iter()
-                                .map(|s| match s.op.as_str() {
-                                    "end" => {
-                                        depth = depth.saturating_sub(1);
-                                        depth
-                                    }
-                                    "else" => depth.saturating_sub(1),
-                                    "if" | "loop" | "foreach" => {
-                                        depth += 1;
-                                        depth - 1
-                                    }
-                                    _ => depth,
-                                })
-                                .collect();
+                            let depths = crate::flows::step_depths(&fl.steps);
                             v_flex()
                                 .w_full()
                                 .px_3()
@@ -2730,6 +2732,17 @@ pub fn render_popup_modal(
                                                     .label("▶ Run")
                                                     .on_click(cx.listener(move |app, _, _, cx| {
                                                         app.run_saved_flow_ui(&fn_run, cx);
+                                                    })),
+                                                )
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "flw-edit-{fn_edit}"
+                                                    )))
+                                                    .ghost()
+                                                    .small()
+                                                    .label(SfSymbol::PENCIL)
+                                                    .on_click(cx.listener(move |app, _, window, cx| {
+                                                        app.open_flow_builder(&fn_edit, window, cx);
                                                     })),
                                                 )
                                                 .child(
@@ -2852,6 +2865,8 @@ pub fn render_popup_modal(
                         })),
                 )
         }
+
+        ActivePopupModal::FlowBuilder(fb) => crate::ui::flow_builder::render_flow_builder(fb, cx),
 
         ActivePopupModal::Synchronizer(sync_st) => {
             let live_sync = crate::launcher::current_synchronizer_status();

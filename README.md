@@ -173,7 +173,7 @@ open target/release/BonLogin.app
 
 ### 1. Top Header & Global Controls
 - **`🔌 Local API` / `🟢 API :19820`:** Starts or stops the embedded Local HTTP JSON Control Server on `127.0.0.1:19820` and copies the endpoint URL to your clipboard.
-- **`▶️ Flows (N)`:** Opens the **Agent Flow Playbooks** modal to replay saved DOM automation flows (`flows/*.json`), pass `{{var}}` overrides, or save a profile's recorded steps as a reusable flow.
+- **`▶️ Flows (N)`:** Opens the **Agent Flow Playbooks** modal to replay saved DOM automation flows (`flows/*.json`), pass `{{var}}` overrides, or save a profile's recorded steps as a reusable flow. **`✎ Builder`** (or the pencil on a saved flow) opens the drag-and-drop **Flow Builder**: drag blocks (browser actions, HTTP, files, regex/JSON, shell, if/else/loop/foreach/break) from the palette into the step list, drag steps to reorder (an if/loop/foreach moves with its body), click a step to edit its arguments and output `{{var}}`, and `▶ Run` it on the selected profile with a live step highlight and the failed step marked red. Every edit saves to the same `flows/<name>.json` that `bon-login flow add/run` use; variables and CSV still come from the Flows modal.
 - **`🖥️ Arrange (N)`:** Opens the **Window Tile & Grid Arranger** modal to tile all (or checked) running browsers across any monitor (`Auto Fit`, `2×1`, `2×2`, `3×2`, `4×2`, or custom `Width,Height`).
 - **`⚡ Quick add`:** Batch-create up to 50 profiles at once with custom name prefixes, OS (`Windows 11` / `Mac OS` / `Linux`), browser brand (`Chrome` / `Edge`), group assignment, and round-robin proxy selection.
 

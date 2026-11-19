@@ -2533,7 +2533,8 @@ impl BonLoginApp {
         cx.notify();
     }
 
-    pub fn run_saved_flow_ui(&mut self, flow_name: &str, cx: &mut Context<Self>) {
+    /// Starts the flow on the targeted profiles; returns the first target's short id (None if nothing ran).
+    pub fn run_saved_flow_ui(&mut self, flow_name: &str, cx: &mut Context<Self>) -> Option<String> {
         let (flow_target_id, extra_vars, csv_raw_input, concurrency) = match &self.popup_modal {
             Some(ActivePopupModal::AgentFlows(af)) => (
                 af.target_id.clone(),
@@ -2550,7 +2551,7 @@ impl BonLoginApp {
                     Err(e) => {
                         self.banner_message = Some(format!("Failed to read CSV file: {e}"));
                         cx.notify();
-                        return;
+                        return None;
                     }
                 }
             } else {
@@ -2561,7 +2562,7 @@ impl BonLoginApp {
                 Err(e) => {
                     self.banner_message = Some(format!("Invalid CSV data: {e}"));
                     cx.notify();
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -2585,10 +2586,14 @@ impl BonLoginApp {
         if targets.is_empty() {
             self.banner_message = Some("Select at least 1 profile to run flow".to_string());
             cx.notify();
-            return;
+            return None;
         }
         let flow_name_str = flow_name.to_string();
-        self.popup_modal = None;
+        let first_short_id = targets[0].short_id();
+        // The Flow Builder stays open to show live progress; the Flows list closes.
+        if matches!(self.popup_modal, Some(ActivePopupModal::AgentFlows(_))) {
+            self.popup_modal = None;
+        }
         self.banner_message = Some(format!(
             "Running flow '{flow_name_str}' on {} profile(s) ({}× concurrency)...",
             targets.len(),
@@ -2647,10 +2652,14 @@ impl BonLoginApp {
                     app.profile_tasks.remove(&pid_task);
                     let res = match join_res {
                         Ok(r) => r,
-                        Err(e) if e.is_cancelled() => return,
+                        Err(e) if e.is_cancelled() => {
+                            app.fb_run_finished(&fn_done, None);
+                            return;
+                        }
                         Err(e) => Err(anyhow::anyhow!("Flow task error: {e}")),
                     };
                     let live_info = app.supervisor.live_info(&pid_task);
+                    app.fb_run_finished(&fn_done, res.as_ref().err());
                     match res {
                         Ok(steps) => {
                             if let Some(info) = live_info {
@@ -2679,6 +2688,7 @@ impl BonLoginApp {
             })
             .detach();
         }
+        Some(first_short_id)
     }
 
     pub fn toggle_http_api_server(&mut self, cx: &mut Context<Self>) {
