@@ -83,13 +83,176 @@ pub fn dwell_ms(seed: u32, session: u64, kind: DwellKind) -> u64 {
     (seconds * 1000.0) as u64
 }
 
-pub fn key_pause_ms(seed: u32, index: usize, ch: char) -> u64 {
-    let mut rng = rng_for(seed, index as u64, ch as u64);
-    if matches!(ch, '.' | ',' | '!' | '?' | ';' | ':' | '\n') {
-        rng.random_range(250..=600)
-    } else {
-        rng.random_range(45..=180)
+/// US-layout key for `ch`: (`code`, `windowsVirtualKeyCode`, needs Shift). `None` = not on the keyboard (IME/paste).
+pub fn us_key(ch: char) -> Option<(String, i32, bool)> {
+    const SYMBOLS: &[(char, char, &str, i32)] = &[
+        ('`', '~', "Backquote", 192),
+        ('-', '_', "Minus", 189),
+        ('=', '+', "Equal", 187),
+        ('[', '{', "BracketLeft", 219),
+        (']', '}', "BracketRight", 221),
+        ('\\', '|', "Backslash", 220),
+        (';', ':', "Semicolon", 186),
+        ('\'', '"', "Quote", 222),
+        (',', '<', "Comma", 188),
+        ('.', '>', "Period", 190),
+        ('/', '?', "Slash", 191),
+    ];
+    const SHIFTED_DIGITS: &str = ")!@#$%^&*(";
+    match ch {
+        'a'..='z' | 'A'..='Z' => {
+            let up = ch.to_ascii_uppercase();
+            Some((format!("Key{up}"), up as i32, ch.is_ascii_uppercase()))
+        }
+        '0'..='9' => Some((format!("Digit{ch}"), ch as i32, false)),
+        ' ' => Some(("Space".into(), 32, false)),
+        _ => {
+            if let Some(d) = SHIFTED_DIGITS.find(ch) {
+                return Some((format!("Digit{d}"), b'0' as i32 + d as i32, true));
+            }
+            SYMBOLS.iter().find_map(|&(plain, shifted, code, vk)| {
+                (ch == plain || ch == shifted).then(|| (code.to_string(), vk, ch == shifted))
+            })
+        }
     }
+}
+
+/// Per character: (pause before the key in ms, key hold in ms). The persona's base pace comes from `seed`.
+pub fn keystroke_timing(seed: u32, session: u64, text: &str) -> Vec<(u64, u64)> {
+    let mut rng = rng_for(seed, session, 11);
+    let base = 95.0 + (seed % 90) as f64;
+    let mut prev: Option<char> = None;
+    text.chars()
+        .map(|ch| {
+            let mut gap = base * (0.33 * gauss(&mut rng)).exp();
+            if prev.is_some_and(|p| p == ' ' || p.is_ascii_punctuation()) {
+                gap *= 1.35;
+            }
+            if ch.is_ascii_digit() || us_key(ch).is_none_or(|k| k.2) {
+                gap *= 1.2;
+            }
+            if rng.random_ratio(1, 40) {
+                gap += rng.random_range(300.0..1100.0);
+            }
+            prev = Some(ch);
+            (gap.clamp(35.0, 1600.0) as u64, rng.random_range(55..=125))
+        })
+        .collect()
+}
+
+/// One agent-browser command line, e.g. `["mouse", "move", "10", "20"]`.
+pub type AbCmd = Vec<String>;
+
+fn ab(parts: &[&str]) -> AbCmd {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+fn ab_wait(ms: u64) -> AbCmd {
+    vec!["wait".into(), ms.to_string()]
+}
+
+/// Where a hand lands inside a `w`x`h` box at (`x`,`y`): near the centre, never on the rim.
+pub fn aim_point(seed: u32, session: u64, x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
+    let mut rng = rng_for(seed, session, 21);
+    let pick = |rng: &mut StdRng, start: f64, size: f64| {
+        let rim = (size / 4.0).min(4.0);
+        let v = start + size / 2.0 + gauss(rng) * size * 0.15;
+        v.clamp(start + rim, start + size - rim)
+    };
+    let px = pick(&mut rng, x, w);
+    (px, pick(&mut rng, y, h))
+}
+
+/// Reaction pause, then a curved approach that ends on `(x, y)`.
+pub fn approach_plan(seed: u32, session: u64, x: f64, y: f64) -> Vec<AbCmd> {
+    let mut rng = rng_for(seed, session, 22);
+    vec![
+        ab_wait(rng.random_range(120..=450)),
+        ab(&[
+            "mouse",
+            "move",
+            &format!("{x:.1}"),
+            &format!("{y:.1}"),
+            "--human",
+            "--seed",
+            &rng.random::<u32>().to_string(),
+        ]),
+    ]
+}
+
+/// Approach, settle, press, hold, release.
+pub fn click_plan(seed: u32, session: u64, x: f64, y: f64) -> Vec<AbCmd> {
+    let mut rng = rng_for(seed, session, 23);
+    let mut plan = approach_plan(seed, session, x, y);
+    plan.extend([
+        ab_wait(rng.random_range(40..=160)),
+        ab(&["mouse", "down"]),
+        ab_wait(rng.random_range(55..=140)),
+        ab(&["mouse", "up"]),
+    ]);
+    plan
+}
+
+/// Caret to the end of `current` (down past each line, then End), then one Backspace per character.
+pub fn erase_plan(seed: u32, session: u64, current: &str) -> Vec<AbCmd> {
+    let n = current.chars().count();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut rng = rng_for(seed, session, 24);
+    let mut plan = vec![ab_wait(rng.random_range(150..=400))];
+    for _ in 0..current.matches('\n').count() {
+        plan.push(ab(&["press", "ArrowDown"]));
+        plan.push(ab_wait(rng.random_range(60..=140)));
+    }
+    plan.push(ab(&["press", "End"]));
+    for i in 0..n {
+        plan.push(ab_wait(if i == 0 { rng.random_range(120..=300) } else { rng.random_range(45..=95) }));
+        plan.push(ab(&["press", "Backspace"]));
+    }
+    plan
+}
+
+/// A reader's pause before acting (`lo..=hi` ms).
+pub fn pause(seed: u32, session: u64, lo: u64, hi: u64) -> AbCmd {
+    ab_wait(rng_for(seed, session, 26).random_range(lo..=hi))
+}
+
+/// Real key events for US-layout characters; anything else is inserted like an IME commit.
+pub fn type_plan(seed: u32, session: u64, text: &str) -> Vec<AbCmd> {
+    let text: String = text.chars().filter(|c| *c != '\r').collect();
+    let mut plan = Vec::with_capacity(text.len() * 2);
+    for (ch, (gap, _hold)) in text.chars().zip(keystroke_timing(seed, session, &text)) {
+        plan.push(ab_wait(gap));
+        plan.push(match (ch, us_key(ch)) {
+            ('\n', _) => ab(&["press", "Enter"]),
+            ('\t', _) => ab(&["press", "Tab"]),
+            (' ', _) => ab(&["press", "Space"]),
+            (_, Some((_, _, true))) => vec!["press".into(), format!("Shift+{ch}")],
+            (_, Some(_)) => vec!["press".into(), ch.to_string()],
+            (_, None) => vec!["keyboard".into(), "inserttext".into(), ch.to_string()],
+        });
+    }
+    plan
+}
+
+/// Wheel ticks (momentum-shaped, sometimes overshooting back) totalling `dx`/`dy` px at the pointer.
+pub fn wheel_plan(seed: u32, session: u64, dx: i32, dy: i32) -> Vec<AbCmd> {
+    let mut rng = rng_for(seed, session, 25);
+    let horizontal = dy == 0;
+    let mut plan = Vec::new();
+    for (d, sleep) in wheel_deltas(&mut rng, if horizontal { dx } else { dy }, 30..=110) {
+        let (wx, wy) = if horizontal { (d, 0) } else { (0, d) };
+        plan.push(vec!["mouse".into(), "wheel".into(), wy.to_string(), wx.to_string()]);
+        plan.push(ab_wait(sleep));
+    }
+    plan
+}
+
+fn gauss(rng: &mut StdRng) -> f64 {
+    let u1 = rng.random::<f64>().clamp(1e-9, 1.0 - 1e-9);
+    let u2 = rng.random::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
 pub fn click_at(seed: u32, session: u64, x: i32, y: i32, vw: i32, vh: i32) -> Vec<HumanStep> {
@@ -158,6 +321,28 @@ fn mouse_path(
 }
 
 fn scroll(rng: &mut StdRng, px: i32, x: i32, y: i32) -> Vec<HumanStep> {
+    wheel_deltas(rng, px, 120..=600)
+        .into_iter()
+        .flat_map(|(d, sleep)| {
+            [
+                HumanStep::Call {
+                    method: "Input.dispatchMouseEvent",
+                    params: serde_json::json!({
+                        "type": "mouseWheel",
+                        "x": x,
+                        "y": y,
+                        "deltaX": 0,
+                        "deltaY": d,
+                    }),
+                },
+                HumanStep::SleepMs(sleep),
+            ]
+        })
+        .collect()
+}
+
+/// Signed wheel deltas summing to `px`, each with the pause after it drawn from `gap_ms`.
+fn wheel_deltas(rng: &mut StdRng, px: i32, gap_ms: std::ops::RangeInclusive<u64>) -> Vec<(i32, u64)> {
     let sign = if px >= 0 { 1 } else { -1 };
     let px = px.abs();
     if px == 0 {
@@ -205,22 +390,7 @@ fn scroll(rng: &mut StdRng, px: i32, x: i32, y: i32) -> Vec<HumanStep> {
     }
     deltas
         .into_iter()
-        .map(|d| {
-            (
-                HumanStep::Call {
-                    method: "Input.dispatchMouseEvent",
-                    params: serde_json::json!({
-                        "type": "mouseWheel",
-                        "x": x,
-                        "y": y,
-                        "deltaX": 0,
-                        "deltaY": d * sign,
-                    }),
-                },
-                HumanStep::SleepMs(rng.random_range(120..=600)),
-            )
-        })
-        .flat_map(|(ev, sleep)| [ev, sleep])
+        .map(|d| (d * sign, rng.random_range(gap_ms.clone())))
         .collect()
 }
 
@@ -328,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn dwell_and_key_pauses_stay_in_range() {
+    fn dwell_and_passive_click_stay_in_range() {
         for kind in [DwellKind::Feed, DwellKind::Article, DwellKind::Profile] {
             let (lo, hi) = match kind {
                 DwellKind::Feed => (8_000, 95_000),
@@ -340,10 +510,53 @@ mod tests {
                 assert!((lo..=hi).contains(&ms), "{ms} {kind:?}");
             }
         }
-        assert!((45..=180).contains(&key_pause_ms(3, 0, 'a')));
-        assert!((250..=600).contains(&key_pause_ms(3, 1, '.')));
         let click = click_at(3, 1, 10, 10, 200, 200);
         assert!(methods_are_passive(&click));
         assert!(!click.is_empty());
+    }
+
+    #[test]
+    fn typed_keys_spell_the_text_with_human_pauses() {
+        let ascii: String = (0x20u8..0x7f).map(char::from).collect();
+        let text = format!("{ascii}\nXin chào ệ\t😀");
+        assert!(ascii.chars().all(|c| us_key(c).is_some()), "every printable ASCII is a real key");
+        let plan = type_plan(7, 1, &format!("{text}\r"));
+        let mut decoded = String::new();
+        for cmd in &plan {
+            match cmd.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                ["wait", ms] => assert!((35..=1600).contains(&ms.parse::<u64>().unwrap()), "{ms}"),
+                ["press", "Enter"] => decoded.push('\n'),
+                ["press", "Tab"] => decoded.push('\t'),
+                ["press", "Space"] => decoded.push(' '),
+                ["press", k] => decoded.push_str(k.strip_prefix("Shift+").unwrap_or(k)),
+                ["keyboard", "inserttext", t] => decoded.push_str(t),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(decoded, text);
+        assert!(plan.iter().any(|c| c == &["press", "Shift+A"]));
+        assert!(plan.iter().any(|c| c == &["press", "Shift+_"]));
+        assert!(plan.iter().any(|c| c == &["keyboard", "inserttext", "ệ"]));
+    }
+
+    #[test]
+    fn aim_lands_inside_the_box_off_centre_and_wheel_sums() {
+        let mut spots = std::collections::HashSet::new();
+        for session in 0..50 {
+            let (x, y) = aim_point(9, session, 100.0, 40.0, 160.0, 36.0);
+            assert!((104.0..=256.0).contains(&x) && (44.0..=72.0).contains(&y), "{x},{y}");
+            spots.insert((x as i32, y as i32));
+        }
+        assert!(spots.len() > 10, "landing spots should vary per session");
+        let (x, y) = aim_point(9, 1, 5.0, 5.0, 2.0, 2.0);
+        assert!((5.0..=7.0).contains(&x) && (5.0..=7.0).contains(&y));
+        for dy in [-900, -1, 1, 437, 2000] {
+            let sum: i32 = wheel_plan(3, 4, 0, dy)
+                .iter()
+                .filter(|c| c[0] == "mouse")
+                .map(|c| c[2].parse::<i32>().unwrap())
+                .sum();
+            assert_eq!(sum, dy);
+        }
     }
 }

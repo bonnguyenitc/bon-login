@@ -638,7 +638,7 @@ fn print_cli_help() {
            bon-login broadcast <open|type|totp> [val] [--group <g>]      Sync navigation/typing/2FA across running profiles\n  \
            bon-login synchronizer <master> [followers...|--group <g>] [--tile] [--duration <s>] Live 1-to-N mouse/key/scroll/URL mirror\n  \
            bon-login serve [--port <19820>]                              Start local HTTP JSON control plane for n8n/Python/agents\n  \
-           bon-login agent <id|name> [--record <flow>] <ab args...>      Run agent-browser (auto-records DOM steps)\n\n\
+           bon-login agent <id|name> [--record <flow>] <ab args...>      Run agent-browser with human-like input (auto-records DOM steps)\n\n\
          AGENT FLOW PLAYBOOKS (`bon-login flow ...`):\n  \
            bon-login flow list                                           List saved DOM flows & required {{vars}}\n  \
            bon-login flow show <flow_name>                               Show steps & locators of a saved flow\n  \

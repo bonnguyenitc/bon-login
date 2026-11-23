@@ -2426,57 +2426,46 @@ pub fn cdp_focus_window_in(
 }
 
 /// Types `text` character-by-character into the focused element of a running Chromium window via
-/// page-target CDP `Input.dispatchKeyEvent` (no `Runtime.enable` or clipboard paste event).
+/// page-target CDP `Input.dispatchKeyEvent` (no `Runtime.enable` or clipboard paste event),
+/// with US-layout `code`/key codes, per-key hold and the profile's typing rhythm.
 pub fn cdp_type_as_human(cdp_port: u16, text: &str, seed: u32) -> Result<usize> {
+    let text: String = text.chars().filter(|c| *c != '\r').collect();
     if text.is_empty() {
         return Ok(0);
     }
+    let session = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let (_, mut cdp) = CdpClient::connect_first_page(cdp_port)?;
     let mut typed = 0usize;
-    for ch in text.chars() {
-        if ch == '\r' {
-            continue;
-        }
-        let (down_params, up_params) = if ch == '\n' {
-            (
-                serde_json::json!({
-                    "type": "rawKeyDown",
-                    "key": "Enter",
-                    "code": "Enter",
-                    "windowsVirtualKeyCode": 13,
-                    "nativeVirtualKeyCode": 13,
-                    "text": "\r",
-                    "unmodifiedText": "\r"
-                }),
-                serde_json::json!({
-                    "type": "keyUp",
-                    "key": "Enter",
-                    "code": "Enter",
-                    "windowsVirtualKeyCode": 13,
-                    "nativeVirtualKeyCode": 13
-                }),
-            )
-        } else {
-            let s = ch.to_string();
-            (
-                serde_json::json!({
-                    "type": "keyDown",
-                    "key": s,
-                    "text": s,
-                    "unmodifiedText": s
-                }),
-                serde_json::json!({
-                    "type": "keyUp",
-                    "key": s
-                }),
-            )
+    for (ch, (gap, hold)) in text.chars().zip(crate::human::keystroke_timing(seed, session, &text)) {
+        std::thread::sleep(Duration::from_millis(gap));
+        let s = ch.to_string();
+        let (down, key, code, vk, shift) = match (ch, crate::human::us_key(ch)) {
+            ('\n', _) => ("rawKeyDown", "Enter".to_string(), "Enter".to_string(), 13, false),
+            (_, Some((code, vk, shift))) => ("keyDown", s.clone(), code, vk, shift),
+            (_, None) => ("keyDown", s.clone(), String::new(), 0, false),
         };
-        cdp.call("Input.dispatchKeyEvent", down_params)?;
-        cdp.call("Input.dispatchKeyEvent", up_params)?;
+        let text_field = if ch == '\n' { "\r".to_string() } else { s };
+        let modifiers = if shift { 8 } else { 0 };
+        cdp.call(
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": down, "key": key, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+                "text": text_field, "unmodifiedText": text_field, "modifiers": modifiers,
+            }),
+        )?;
+        std::thread::sleep(Duration::from_millis(hold));
+        cdp.call(
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": "keyUp", "key": key, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "modifiers": modifiers,
+            }),
+        )?;
         typed += 1;
-        std::thread::sleep(Duration::from_millis(crate::human::key_pause_ms(
-            seed, typed, ch,
-        )));
     }
     Ok(typed)
 }

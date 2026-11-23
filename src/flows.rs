@@ -1576,6 +1576,8 @@ impl AgentSession for SubprocessAgentSession<'_> {
     }
 }
 
+/// Runs agent-browser for a profile session. Interactions (click, fill, type, hover, check, scroll,
+/// press…) are replayed as real pointer/wheel/keyboard input with human timing; the rest pass through.
 pub(crate) fn run_agent_browser_with_reconnect_in(
     root_dir: &Path,
     short_id: &str,
@@ -1584,19 +1586,322 @@ pub(crate) fn run_agent_browser_with_reconnect_in(
     args: &[String],
 ) -> Result<std::process::Output> {
     validate_stealth_agent_args(args)?;
-    let run_once = || {
-        agent_browser_cmd_for_short_id_in(root_dir, short_id)
-            .args(["--session", session, "--cdp", ws_url, "--input-mode", "human"])
-            .args(args)
-            .output()
-            .context("Failed to execute agent-browser")
+    let ab = AgentBrowser {
+        root_dir,
+        short_id,
+        session,
+        ws_url,
     };
-    let mut out = run_once()?;
-    if !out.status.success() && should_reconnect_agent_session(&out.stderr, &out.stdout) {
-        let _ = ensure_agent_browser_connected_in(root_dir, short_id, ws_url);
-        out = run_once()?;
+    let cmds = unpack_agent_commands(args);
+    if !cmds.iter().any(|c| is_human_op(c)) {
+        return ab.run(args);
     }
+    let lead = &args[..args.len() - strip_leading_agent_flags(args).len()];
+    let mut stdout = Vec::new();
+    let mut last = None;
+    for cmd in &cmds {
+        let out = if is_human_op(cmd) {
+            ab.human(cmd)?
+        } else {
+            ab.run(&[lead, cmd.as_slice()].concat())?
+        };
+        stdout.extend_from_slice(&out.stdout);
+        let ok = out.status.success();
+        last = Some(out);
+        if !ok {
+            break;
+        }
+    }
+    let mut out = last.context("no agent-browser command to run")?;
+    out.stdout = stdout;
     Ok(out)
+}
+
+fn is_human_op(cmd: &[String]) -> bool {
+    match cmd.first().map(String::as_str) {
+        Some(
+            "click" | "dblclick" | "hover" | "fill" | "type" | "check" | "uncheck" | "select"
+            | "scroll" | "scrollintoview" | "scrollinto" | "press" | "key" | "find",
+        ) => true,
+        Some("keyboard") => cmd.get(1).is_some_and(|s| s == "type"),
+        _ => false,
+    }
+}
+
+/// `find testid|placeholder|alttext|title <v> <action> [value]` as a plain CSS-selector command.
+/// role/text/label need the AX tree, so they return `None` and run through `find` itself.
+fn find_as_selector_cmd(cmd: &[String]) -> Option<Vec<String>> {
+    let attr = match cmd.get(1)?.as_str() {
+        "testid" => "data-testid",
+        "placeholder" => "placeholder",
+        "alttext" | "alt" => "alt",
+        "title" => "title",
+        _ => return None,
+    };
+    let sel = format!("[{attr}=\"{}\"]", css_attr_escape(cmd.get(2)?));
+    let mut out = vec![cmd.get(3).cloned().unwrap_or_else(|| "click".into()), sel];
+    out.extend(cmd.iter().skip(4).filter(|a| !a.starts_with("--")).cloned());
+    Some(out)
+}
+
+struct AgentBrowser<'a> {
+    root_dir: &'a Path,
+    short_id: &'a str,
+    session: &'a str,
+    ws_url: &'a str,
+}
+
+type BatchResults = Vec<std::result::Result<serde_json::Value, String>>;
+
+impl AgentBrowser<'_> {
+    fn cmd(&self) -> std::process::Command {
+        let mut c = agent_browser_cmd_for_short_id_in(self.root_dir, self.short_id);
+        c.args(["--session", self.session, "--cdp", self.ws_url, "--input-mode", "human"]);
+        c
+    }
+
+    fn reconnect(&self) {
+        let _ = ensure_agent_browser_connected_in(self.root_dir, self.short_id, self.ws_url);
+    }
+
+    /// One command line, reconnecting once if the daemon lost the session.
+    fn run(&self, args: &[String]) -> Result<std::process::Output> {
+        let run_once = || self.cmd().args(args).output().context("Failed to execute agent-browser");
+        let mut out = run_once()?;
+        if !out.status.success() && should_reconnect_agent_session(&out.stderr, &out.stdout) {
+            self.reconnect();
+            out = run_once()?;
+        }
+        Ok(out)
+    }
+
+    /// Commands in one daemon round trip (`batch --json` fed on stdin), with per-command results.
+    fn batch(&self, cmds: &[crate::human::AbCmd], bail: bool) -> Result<(std::process::Output, BatchResults)> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = self
+            .cmd()
+            .args(["--json", "batch"])
+            .args(bail.then_some("--bail"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to execute agent-browser")?;
+        child
+            .stdin
+            .take()
+            .context("agent-browser stdin")?
+            .write_all(&serde_json::to_vec(cmds)?)?;
+        let out = child.wait_with_output()?;
+        let results = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| match r.get("success").and_then(|v| v.as_bool()) {
+                Some(true) => Ok(r.get("result").cloned().unwrap_or_default()),
+                _ => Err(r.get("error").and_then(|v| v.as_str()).unwrap_or("failed").to_string()),
+            })
+            .collect();
+        Ok((out, results))
+    }
+
+    /// Read-only queries; safe to retry after a reconnect. Missing entries are failures.
+    fn query(&self, cmds: &[crate::human::AbCmd]) -> Result<BatchResults> {
+        let (out, mut res) = self.batch(cmds, false)?;
+        if res.iter().all(|r| r.is_err()) && should_reconnect_agent_session(&out.stderr, &out.stdout) {
+            self.reconnect();
+            res = self.batch(cmds, false)?.1;
+        }
+        res.resize_with(cmds.len(), || Err("no result".into()));
+        Ok(res)
+    }
+
+    /// Plays a plan, stopping at the first failing step (its error becomes stderr).
+    fn act(&self, plan: &[crate::human::AbCmd]) -> Result<std::process::Output> {
+        let (mut out, res) = self.batch(plan, true)?;
+        if let Some(Err(e)) = res.iter().find(|r| r.is_err()) {
+            out.stderr = e.clone().into_bytes();
+        }
+        out.stdout = if out.status.success() { b"\xE2\x9C\x93 Done\n".to_vec() } else { Vec::new() };
+        Ok(out)
+    }
+
+    /// Box `[x, y, w, h]` of `sel` once it sits inside the viewport, wheel-scrolling there the way
+    /// a reader would. `None` = not rendered/found (callers let agent-browser report it).
+    /// shortcut: `get box` is frame-local, so refs inside cross-origin iframes get aimed at the wrong
+    /// spot; upgrade by adding the frame's offset once agent-browser exposes it.
+    fn locate(&self, sel: &str, seed: u32, nonce: u64) -> Result<Option<[f64; 4]>> {
+        let probe = [
+            vec!["get".to_string(), "box".into(), sel.into()],
+            vec!["eval".to_string(), "[innerWidth,innerHeight]".into()],
+        ];
+        let measure = || -> Result<Option<([f64; 4], f64, f64)>> {
+            let res = self.query(&probe)?;
+            let (Ok(b), Ok(v)) = (&res[0], &res[1]) else {
+                return Ok(None);
+            };
+            let n = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64());
+            let vp = v.get("result").and_then(|r| r.as_array());
+            let vp = |i: usize| vp.and_then(|a| a.get(i)).and_then(|x| x.as_f64());
+            Ok(match (n(b, "x"), n(b, "y"), n(b, "width"), n(b, "height"), vp(0), vp(1)) {
+                (Some(x), Some(y), Some(w), Some(h), Some(vw), Some(vh)) if w >= 1.0 && h >= 1.0 => {
+                    Some(([x, y, w, h], vw, vh))
+                }
+                _ => None,
+            })
+        };
+        // Centre on screen is enough: a target at the very top can't be scrolled any lower.
+        let inside = |[x, y, w, h]: [f64; 4], vw: f64, vh: f64| {
+            (0.0..vw).contains(&(x + w / 2.0)) && (4.0..=vh - 4.0).contains(&(y + h / 2.0))
+        };
+        let mut prev_cy = f64::NAN;
+        for burst in 0..12u64 {
+            let Some((b, vw, vh)) = measure()? else {
+                return Ok(None);
+            };
+            if inside(b, vw, vh) {
+                return Ok(Some(b));
+            }
+            let cy = b[1] + b[3] / 2.0;
+            let cx = b[0] + b[2] / 2.0;
+            // Wheel can't reach it (sideways, nested scroller, fixed layer): use the page's own scroll.
+            if !(0.0..vw).contains(&cx) || (cy - prev_cy).abs() < 2.0 {
+                break;
+            }
+            prev_cy = cy;
+            let target = vh * (0.3 + (nonce.wrapping_add(burst) % 30) as f64 / 100.0);
+            let dy = (cy - target).clamp(-vh * 1.2, vh * 1.2) as i32;
+            let mut plan = crate::human::wheel_plan(seed, nonce ^ burst, 0, dy);
+            plan.push(crate::human::pause(seed, nonce ^ burst, 200, 450));
+            if !self.act(&plan)?.status.success() {
+                break;
+            }
+        }
+        self.run(&["scrollintoview".into(), sel.into()])?;
+        Ok(measure()?.filter(|&(b, vw, vh)| inside(b, vw, vh)).map(|(b, ..)| b))
+    }
+
+    fn human(&self, cmd: &[String]) -> Result<std::process::Output> {
+        use crate::human::{aim_point, approach_plan, click_plan, erase_plan, pause, type_plan, wheel_plan};
+        let seed = u32::from_str_radix(self.short_id, 16).unwrap_or(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        let op = cmd[0].as_str();
+        match op {
+            // shortcut: find role/text/label keeps agent-browser's own (instant) input; resolving them
+            // here needs a snapshot that would renumber the caller's @refs. Flows resolve them first.
+            "find" => {
+                return match find_as_selector_cmd(cmd) {
+                    Some(c) => self.human(&c),
+                    None => self.run(cmd),
+                };
+            }
+            "press" | "key" => {
+                let mut plan = vec![pause(seed, nonce, 150, 500)];
+                plan.push([&["press".to_string()], &cmd[1..]].concat());
+                return self.act(&plan);
+            }
+            "keyboard" => return self.act(&type_plan(seed, nonce, &cmd[2..].join(" "))),
+            "scroll" => {
+                let mut pos = cmd[1..].iter().filter(|a| !a.starts_with("--"));
+                let dir = pos.next().map(String::as_str).unwrap_or("down");
+                let px = pos.next().and_then(|a| a.parse::<f64>().ok()).unwrap_or(300.0) as i32;
+                let (dx, dy) = match dir {
+                    "up" => (0, -px),
+                    "down" => (0, px),
+                    "left" => (-px, 0),
+                    "right" => (px, 0),
+                    _ => return self.run(cmd),
+                };
+                let mut plan = Vec::new();
+                if let Some(sel) = cmd.iter().position(|a| a == "--selector").and_then(|i| cmd.get(i + 1)) {
+                    let Some([x, y, w, h]) = self.locate(sel, seed, nonce)? else {
+                        return self.run(cmd);
+                    };
+                    let (ax, ay) = aim_point(seed, nonce, x, y, w, h);
+                    plan.extend(approach_plan(seed, nonce, ax, ay));
+                }
+                plan.extend(wheel_plan(seed, nonce, dx, dy));
+                return self.act(&plan);
+            }
+            _ => {}
+        }
+
+        let Some(sel) = cmd.get(1).filter(|a| !a.starts_with("--")).map(String::as_str) else {
+            return self.run(cmd);
+        };
+        let Some([x, y, w, h]) = self.locate(sel, seed, nonce)? else {
+            return self.run(cmd);
+        };
+        let (ax, ay) = aim_point(seed, nonce, x, y, w, h);
+        match op {
+            "scrollintoview" | "scrollinto" => self.act(&[pause(seed, nonce, 150, 400)]),
+            "hover" => self.act(&approach_plan(seed, nonce, ax, ay)),
+            "click" if cmd.len() == 2 => self.act(&click_plan(seed, nonce, ax, ay)),
+            "check" | "uncheck" => {
+                let want = op == "check";
+                let is_checked = |this: &Self| -> Result<Option<bool>> {
+                    Ok(this.query(&[s(&["is", "checked", sel])])?[0]
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v.get("checked").and_then(|c| c.as_bool())))
+                };
+                if is_checked(self)? == Some(want) {
+                    return self.act(&[pause(seed, nonce, 150, 400)]);
+                }
+                let out = self.act(&click_plan(seed, nonce, ax, ay))?;
+                // Hidden native input behind a styled label: let agent-browser finish the toggle.
+                if !out.status.success() || is_checked(self)? != Some(want) {
+                    return self.run(cmd);
+                }
+                Ok(out)
+            }
+            "fill" | "type" => {
+                let Some(text) = cmd.get(2) else {
+                    return self.run(cmd);
+                };
+                let mut plan = click_plan(seed, nonce, ax, ay);
+                if op == "fill" || cmd.iter().any(|a| a == "--clear") {
+                    let current = self.query(&[s(&["get", "value", sel])])?[0]
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(str::to_string))
+                        .unwrap_or_default();
+                    plan.extend(erase_plan(seed, nonce, &current));
+                    let out = self.act(&plan)?;
+                    if !out.status.success() {
+                        return Ok(out);
+                    }
+                    let left = self.query(&[s(&["get", "value", sel])])?[0]
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v.get("value").and_then(|x| x.as_str()).map(|x| !x.is_empty()));
+                    if left == Some(true) {
+                        // shortcut: soft-wrapped text can outlast the caret walk; clear via the DOM then.
+                        let out = self.run(&s(&["fill", sel, ""]))?;
+                        if !out.status.success() {
+                            return Ok(out);
+                        }
+                    }
+                    plan = Vec::new();
+                }
+                plan.push(pause(seed, nonce ^ 1, 150, 400));
+                plan.extend(type_plan(seed, nonce, text));
+                self.act(&plan)
+            }
+            // dblclick, select, click --new-tab…: approach by hand, then let agent-browser do the rest.
+            _ => {
+                let out = self.act(&approach_plan(seed, nonce, ax, ay))?;
+                if !out.status.success() {
+                    return Ok(out);
+                }
+                self.run(cmd)
+            }
+        }
+    }
 }
 
 pub fn build_locator_candidate_commands(
@@ -1769,9 +2074,9 @@ pub fn execute_single_flow_step_with(
         let candidates =
             build_locator_candidate_commands(&step.op, &loc, sub_value.as_deref(), &sub_extra);
 
-        if candidates.is_empty()
-            && (loc.starts_with("role:") || loc.starts_with("text:") || loc.starts_with("label:"))
-        {
+        // Resolve role/text/label to a snapshot @ref first so the step runs as human input;
+        // `find` (agent-browser's instant input) is only the fallback.
+        if loc.starts_with("role:") || loc.starts_with("text:") || loc.starts_with("label:") {
             match runner.exec(&[
                 "snapshot".to_string(),
                 "-i".to_string(),

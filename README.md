@@ -403,6 +403,8 @@ Resuming with `--from-step` skips earlier `--out` steps, so pass those values wi
 
 > **Stealth Guardrails:** `bon-login agent` automatically blocks any `agent-browser` command or flag that invokes CDP `Emulation.*` (`set viewport`, `set device`, `set geo`, `set media`, `set headers`, `--user-agent`, `--proxy`), ensuring your C++ fingerprint remains 100% intact. It also blocks `read <url>`, `read --llms` and `read --require-md`, which fetch over agent-browser's own HTTP client from your real IP instead of the profile proxy; use `open <url>` then plain `read`.
 
+> **Human Input:** every interaction sent through `bon-login agent`, `flow run` and the UI's flow runner is replayed as real, trusted input with human timing instead of agent-browser's instant/JS path: `click` = curved approach to an off-centre point + press/hold/release; `fill`/`type` = click into the field, caret-to-end + Backspace per character, then per-key `keydown/keyup` with a per-profile typing rhythm (non-US characters are committed like an IME); `scroll`/off-screen targets = momentum-shaped wheel ticks; `hover`, `check`/`uncheck`, `press` and `keyboard type` likewise. `find role|text|label` keeps agent-browser's own input (flows resolve those to snapshot refs first), and raw `agent-browser` commands copied from the UI bypass this layer.
+
 ---
 
 ## Local HTTP Control API
