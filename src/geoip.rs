@@ -123,7 +123,11 @@ fn build_geo_info(
 ) -> Result<GeoInfo> {
     let ip = ip.trim().to_string();
     let country_code = country_code.trim().to_ascii_uppercase();
-    let timezone = timezone.trim().to_string();
+    // Some providers report the legacy ICT zone (Asia/Bangkok) for Vietnam; sites expect Asia/Ho_Chi_Minh.
+    let timezone = match (country_code.as_str(), timezone.trim()) {
+        ("VN", "Asia/Bangkok" | "Asia/Saigon") => "Asia/Ho_Chi_Minh".to_string(),
+        (_, tz) => tz.to_string(),
+    };
     if ip.is_empty() || country_code.is_empty() || timezone.is_empty() {
         bail!("Incomplete GeoIP fields (ip='{ip}', country='{country_code}', tz='{timezone}')");
     }
