@@ -732,16 +732,16 @@ pub fn build_chromium_args_with_extensions(
             .unwrap_or("en-US,en;q=0.9")
             .to_string()
     };
-    let first_accept = raw_accept_lang
-        .split([',', ';'])
-        .next()
-        .unwrap_or("")
-        .trim();
-    let accept_lang = if first_accept.eq_ignore_ascii_case(&icu_locale) {
-        raw_accept_lang
-    } else {
-        format!("{icu_locale},{raw_accept_lang}")
-    };
+    // `--accept-lang` feeds navigator.languages verbatim, so q-values and duplicates would leak as a lie;
+    // Chromium derives the Accept-Language header q-values itself.
+    let mut tags: Vec<&str> = Vec::new();
+    for t in std::iter::once(icu_locale.as_str()).chain(raw_accept_lang.split(',')) {
+        let t = t.split(';').next().unwrap_or("").trim();
+        if !t.is_empty() && !tags.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+            tags.push(t);
+        }
+    }
+    let accept_lang = tags.join(",");
 
     // Note: Do not pass `--fingerprint-brand-version` or `--fingerprint-platform-version` so
     // `adryfish/fingerprint-chromium` 148 selects its authentic seed-matched Client Hints versions
@@ -4002,7 +4002,7 @@ mod tests {
             args.contains(&"--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1".to_string())
         );
         assert!(args.contains(&"--lang=vi".to_string()));
-        assert!(args.contains(&"--accept-lang=vi,vi-VN,vi,en-US;q=0.9,en;q=0.8".to_string()));
+        assert!(args.contains(&"--accept-lang=vi,vi-VN,en-US,en".to_string()));
         assert!(args.contains(&"-AppleLanguages".to_string()));
         assert!(args.contains(&"<array><string>vi-VN</string></array>".to_string()));
         assert_eq!(chromium_icu_locale("zh-CN"), "zh-CN");
